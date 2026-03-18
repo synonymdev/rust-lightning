@@ -2104,6 +2104,23 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		self.inner.lock().unwrap().get_latest_update_id()
 	}
 
+	/// Forces the monitor's `latest_update_id` to the given value.
+	///
+	/// This is used to resync a stale monitor with the `ChannelManager` when accepting stale
+	/// channel monitors on startup (see [`ChannelManagerReadArgs::accept_stale_channel_monitors`]).
+	///
+	/// # Safety
+	///
+	/// This skips the normal sequential `update_id` validation. Only use when deliberately
+	/// accepting a stale monitor, e.g. after a migration overwrote a newer monitor with older data.
+	/// The monitor's commitment state will remain stale until the next real channel update
+	/// (e.g. triggered by a fee update round-trip).
+	///
+	/// [`ChannelManagerReadArgs::accept_stale_channel_monitors`]: crate::ln::channelmanager::ChannelManagerReadArgs::accept_stale_channel_monitors
+	pub fn force_set_latest_update_id(&self, update_id: u64) {
+		self.inner.lock().unwrap().latest_update_id = update_id;
+	}
+
 	/// Gets the funding transaction outpoint of the channel this ChannelMonitor is monitoring for.
 	pub fn get_funding_txo(&self) -> OutPoint {
 		self.inner.lock().unwrap().get_funding_txo()

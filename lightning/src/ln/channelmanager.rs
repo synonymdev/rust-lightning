@@ -16628,6 +16628,19 @@ pub struct ChannelManagerReadArgs<
 	/// This is not exported to bindings users because we have no HashMap bindings
 	pub channel_monitors:
 		HashMap<ChannelId, &'a ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>>,
+
+	/// If set to `true`, stale channel monitors will be accepted on startup instead of returning
+	/// [`DecodeError::DangerousValue`]. When a stale monitor is detected, its `update_id` will be
+	/// force-synced to match the `ChannelManager`'s expected value. The monitor's commitment state
+	/// remains stale until the next real channel update (e.g. a fee update round-trip).
+	///
+	/// Use this for recovery after monitor data was overwritten by a migration or backup restore.
+	/// The caller should trigger a commitment round-trip after startup (e.g. via `update_fee`)
+	/// to heal the monitor's commitment state and recover revocation secrets via the derivation
+	/// tree.
+	///
+	/// Default: `false`.
+	pub accept_stale_channel_monitors: bool,
 }
 
 impl<
@@ -16676,6 +16689,7 @@ where
 			channel_monitors: hash_map_from_iter(
 				channel_monitors.drain(..).map(|monitor| (monitor.channel_id(), monitor)),
 			),
+			accept_stale_channel_monitors: false,
 		}
 	}
 }
@@ -17351,20 +17365,30 @@ where
 					if funded_chan.get_latest_unblocked_monitor_update_id()
 						> max_in_flight_update_id
 					{
-						// If the channel is ahead of the monitor, return DangerousValue:
-						log_error!(logger, "A ChannelMonitor is stale compared to the current ChannelManager! This indicates a potentially-critical violation of the chain::Watch API!");
-						log_error!(logger, " The ChannelMonitor for channel {} is at update_id {} with update_id through {} in-flight",
-							chan_id, monitor.get_latest_update_id(), max_in_flight_update_id);
-						log_error!(
-							logger,
-							" but the ChannelManager is at update_id {}.",
-							funded_chan.get_latest_unblocked_monitor_update_id()
-						);
-						log_error!(logger, " The chain::Watch API *requires* that monitors are persisted durably before returning,");
-						log_error!(logger, " client applications must ensure that ChannelMonitor data is always available and the latest to avoid funds loss!");
-						log_error!(logger, " Without the latest ChannelMonitor we cannot continue without risking funds.");
-						log_error!(logger, " Please ensure the chain::Watch API requirements are met and file a bug report at https://github.com/lightningdevkit/rust-lightning");
-						return Err(DecodeError::DangerousValue);
+						if args.accept_stale_channel_monitors {
+							let target_id = funded_chan.get_latest_unblocked_monitor_update_id();
+							log_warn!(logger,
+								"Accepting stale ChannelMonitor for channel {}: monitor at update_id {} \
+								 but ChannelManager at {}. Forcing update_id sync. Monitor state will \
+								 self-heal on next channel update.",
+								chan_id, monitor.get_latest_update_id(), target_id
+							);
+							monitor.force_set_latest_update_id(target_id);
+						} else {
+							log_error!(logger, "A ChannelMonitor is stale compared to the current ChannelManager! This indicates a potentially-critical violation of the chain::Watch API!");
+							log_error!(logger, " The ChannelMonitor for channel {} is at update_id {} with update_id through {} in-flight",
+								chan_id, monitor.get_latest_update_id(), max_in_flight_update_id);
+							log_error!(
+								logger,
+								" but the ChannelManager is at update_id {}.",
+								funded_chan.get_latest_unblocked_monitor_update_id()
+							);
+							log_error!(logger, " The chain::Watch API *requires* that monitors are persisted durably before returning,");
+							log_error!(logger, " client applications must ensure that ChannelMonitor data is always available and the latest to avoid funds loss!");
+							log_error!(logger, " Without the latest ChannelMonitor we cannot continue without risking funds.");
+							log_error!(logger, " Please ensure the chain::Watch API requirements are met and file a bug report at https://github.com/lightningdevkit/rust-lightning");
+							return Err(DecodeError::DangerousValue);
+						}
 					}
 				} else {
 					// We shouldn't have persisted (or read) any unfunded channel types so none should have been
