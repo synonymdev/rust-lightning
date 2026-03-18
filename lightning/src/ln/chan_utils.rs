@@ -468,6 +468,9 @@ impl CounterpartyCommitmentSecrets {
 		let pos = Self::place_secret(idx);
 		for i in 0..pos {
 			let (old_secret, old_idx) = self.old_secrets[i as usize];
+			if old_idx == 1 << 48 {
+				continue; // Uninitialized slot — no real secret to validate against
+			}
 			if Self::derive_secret(secret, pos, old_idx) != old_secret {
 				return Err(());
 			}
