@@ -2104,6 +2104,33 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		self.inner.lock().unwrap().get_latest_update_id()
 	}
 
+	/// Forces the monitor's `latest_update_id` to the given value.
+	///
+	/// This is used to resync a stale monitor with the `ChannelManager` when accepting stale
+	/// channel monitors on startup (see [`ChannelManagerReadArgs::accept_stale_channel_monitors`]).
+	///
+	/// # Safety
+	///
+	/// This skips the normal sequential `update_id` validation. Only use when deliberately
+	/// accepting a stale monitor, e.g. after a migration overwrote a newer monitor with older data.
+	/// The monitor's commitment state will remain stale until the next real channel update
+	/// (e.g. triggered by a fee update round-trip).
+	///
+	/// [`ChannelManagerReadArgs::accept_stale_channel_monitors`]: crate::ln::channelmanager::ChannelManagerReadArgs::accept_stale_channel_monitors
+	pub fn force_set_latest_update_id(&self, update_id: u64) {
+		let mut inner = self.inner.lock().unwrap();
+		inner.latest_update_id = update_id;
+		// Reset the counterparty commitment secrets store so that new secrets
+		// from healing round-trips can build a fresh, consistent derivation tree.
+		// The stale secrets would fail cross-tree validation against new secrets
+		// (the old and new indices occupy different subtrees in the BOLT-3 tree).
+		// Losing the old secrets means we cannot punish revoked commitments from
+		// before the stale point, but the monitor lacks commitment transaction data
+		// for the gap period regardless — the stale secrets provide no actionable
+		// security benefit.
+		inner.commitment_secrets = CounterpartyCommitmentSecrets::new();
+	}
+
 	/// Gets the funding transaction outpoint of the channel this ChannelMonitor is monitoring for.
 	pub fn get_funding_txo(&self) -> OutPoint {
 		self.inner.lock().unwrap().get_funding_txo()

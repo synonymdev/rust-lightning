@@ -908,6 +908,7 @@ impl<'a, 'b, 'c> Drop for Node<'a, 'b, 'c> {
 						tx_broadcaster: &broadcaster,
 						logger: &self.logger,
 						channel_monitors,
+						accept_stale_channel_monitors: false,
 					},
 				)
 				.unwrap();
@@ -1361,6 +1362,7 @@ pub fn _reload_node<'a, 'b, 'c>(
 				tx_broadcaster: node.tx_broadcaster,
 				logger: node.logger,
 				channel_monitors,
+				accept_stale_channel_monitors: false,
 			},
 		)
 		.unwrap()
