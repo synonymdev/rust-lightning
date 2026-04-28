@@ -549,6 +549,90 @@ impl ChannelLiquidities {
 	fn get_mut(&mut self, short_channel_id: &u64) -> Option<&mut ChannelLiquidity> {
 		self.0.get_mut(short_channel_id)
 	}
+
+	/// Produces a read-only [`ChannelLiquidityDiagnostic`] view of every entry, sorted by
+	/// `short_channel_id` for deterministic output.
+	///
+	/// Intended for offline inspection of serialized scorer files (e.g. via
+	/// `Readable::read`) without requiring access to the private liquidity / history
+	/// internals. Each entry corresponds to one short-channel-id; directional
+	/// interpretation requires a `NetworkGraph`.
+	pub fn diagnostics(&self) -> Vec<ChannelLiquidityDiagnostic> {
+		let mut out: Vec<ChannelLiquidityDiagnostic> = self
+			.0
+			.iter()
+			.map(|(scid, liq)| ChannelLiquidityDiagnostic::from_internal(*scid, liq))
+			.collect();
+		out.sort_by_key(|d| d.scid);
+		out
+	}
+}
+
+/// Read-only diagnostic view of a single [`ChannelLiquidities`] entry.
+///
+/// Exposed for offline inspection of scorer/score files. Field semantics mirror
+/// LDK's `ProbabilisticScorer` internals — see [`ChannelLiquidities::diagnostics`].
+///
+/// `min_liquidity_offset_msat` / `max_liquidity_offset_msat` are non-directional
+/// offsets relative to the channel's node ordering. Resolving them into directional
+/// `min_liquidity_sat` / `max_liquidity_sat` requires a `NetworkGraph` (capacity +
+/// node-id ordering), which this diagnostic does not include.
+///
+/// `min_history_buckets` / `max_history_buckets` are the raw 32-bucket weight arrays
+/// used by [`ProbabilisticScorer`]'s historical liquidity tracker. Each bucket value
+/// is a 16-bit fixed-point number with a 5-bit fractional part (`32` = 1.0).
+///
+/// `total_valid_points_tracked` is the LDK-internal scalar weight summarizing the
+/// historical bucket distribution; it is **not** an integer payment count.
+#[derive(Clone, Debug)]
+pub struct ChannelLiquidityDiagnostic {
+	/// The short channel id of this entry.
+	pub scid: u64,
+	/// Lower channel liquidity bound, as a non-directional offset from zero (msat).
+	pub min_liquidity_offset_msat: u64,
+	/// Upper channel liquidity bound, as a non-directional offset from the effective
+	/// channel capacity (msat).
+	pub max_liquidity_offset_msat: u64,
+	/// Seconds since the unix epoch when either liquidity bound was last modified.
+	pub last_updated_secs: u64,
+	/// Seconds since the unix epoch when the historical liquidity buckets were last
+	/// modified.
+	pub offset_history_last_updated_secs: u64,
+	/// Seconds since the unix epoch when the liquidity bounds were last updated with
+	/// new payment information (ignoring decays).
+	pub last_datapoint_time_secs: u64,
+	/// Whether either of the historical bucket arrays is non-zero. A `true` value
+	/// indicates probe-derived history; combined with bucket weights it lets callers
+	/// distinguish history-rich entries from synthetically-seeded ones with empty
+	/// buckets.
+	pub has_history: bool,
+	/// LDK's internal scalar weight summarizing the historical bucket distribution.
+	/// Stored as `f64` because LDK uses it directly when dividing bucket weights in
+	/// scoring. **Not** an integer count of observations.
+	pub total_valid_points_tracked: f64,
+	/// Raw min-side historical bucket weights (32 buckets).
+	pub min_history_buckets: [u16; 32],
+	/// Raw max-side historical bucket weights (32 buckets).
+	pub max_history_buckets: [u16; 32],
+}
+
+impl ChannelLiquidityDiagnostic {
+	fn from_internal(scid: u64, liq: &ChannelLiquidity) -> Self {
+		let min_history = liq.liquidity_history.writeable_min_offset_history();
+		let max_history = liq.liquidity_history.writeable_max_offset_history();
+		Self {
+			scid,
+			min_liquidity_offset_msat: liq.min_liquidity_offset_msat,
+			max_liquidity_offset_msat: liq.max_liquidity_offset_msat,
+			last_updated_secs: liq.last_updated.as_secs(),
+			offset_history_last_updated_secs: liq.offset_history_last_updated.as_secs(),
+			last_datapoint_time_secs: liq.last_datapoint_time.as_secs(),
+			has_history: liq.liquidity_history.has_datapoints(),
+			total_valid_points_tracked: liq.liquidity_history.total_valid_points_tracked(),
+			min_history_buckets: *min_history.buckets(),
+			max_history_buckets: *max_history.buckets(),
+		}
+	}
 }
 
 impl Readable for ChannelLiquidities {
@@ -1035,6 +1119,14 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Logger> ProbabilisticScorer<G, L> {
 				log_debug!(self.logger, "No network graph entry for SCID {}", scid);
 			}
 		}
+	}
+
+	/// Returns a read-only diagnostic view of every channel-liquidity entry in this scorer.
+	///
+	/// Wraps [`ChannelLiquidities::diagnostics`] for callers that hold a [`ProbabilisticScorer`]
+	/// directly. See [`ChannelLiquidityDiagnostic`] for field semantics.
+	pub fn diagnostics(&self) -> Vec<ChannelLiquidityDiagnostic> {
+		self.channel_liquidities.diagnostics()
 	}
 
 	/// Query the estimated minimum and maximum liquidity available for sending a payment over the
@@ -2061,6 +2153,12 @@ mod bucketed_history {
 		buckets: [u16; 32],
 	}
 
+	impl HistoricalBucketRangeTracker {
+		pub(super) fn buckets(&self) -> &[u16; 32] {
+			&self.buckets
+		}
+	}
+
 	/// Buckets are stored in fixed point numbers with a 5 bit fractional part. Thus, the value
 	/// "one" is 32, or this constant.
 	pub const BUCKET_FIXED_POINT_ONE: u16 = 32;
@@ -2166,6 +2264,10 @@ mod bucketed_history {
 		pub(super) fn has_datapoints(&self) -> bool {
 			self.min_liquidity_offset_history.buckets != [0; 32] ||
 				self.max_liquidity_offset_history.buckets != [0; 32]
+		}
+
+		pub(super) fn total_valid_points_tracked(&self) -> f64 {
+			self.total_valid_points_tracked
 		}
 
 		pub(super) fn decay_buckets(&mut self, half_lives: f64) {
@@ -2611,7 +2713,7 @@ mod tests {
 	use crate::routing::scoring::{
 		ChannelLiquidities, ChannelUsage, CombinedScorer, ScoreLookUp, ScoreUpdate,
 	};
-	use crate::util::ser::{ReadableArgs, Writeable};
+	use crate::util::ser::{Readable, ReadableArgs, Writeable};
 	use crate::util::test_utils::{self, TestLogger};
 
 	use crate::io;
@@ -4296,6 +4398,87 @@ mod tests {
 		// Once we've gotten halfway through the day our penalty is 1/4 the configured value.
 		scorer.time_passed(Duration::from_secs(86400/2 + 1));
 		assert_eq!(scorer.channel_penalty_msat(&candidate, usage, &params), 250_000);
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn diagnostics_distinguishes_history_populated_from_empty() {
+		// Verifies ChannelLiquidities::diagnostics / ProbabilisticScorer::diagnostics:
+		// (a) returns one entry per channel-liquidity record, sorted by SCID,
+		// (b) has_history / bucket weights reflect whether probe-style updates have been recorded,
+		// (c) survives a Writeable -> Readable round-trip.
+		let logger = TestLogger::new();
+		let last_updated = Duration::from_secs(1_700_000_000);
+		let offset_history_last_updated = Duration::from_secs(1_700_000_000);
+		let last_datapoint_time = Duration::ZERO;
+		let network_graph = network_graph(&logger);
+		let decay_params = ProbabilisticScoringDecayParameters::default();
+		let mut scorer = ProbabilisticScorer::new(decay_params, &network_graph, &logger)
+			.with_channel(42,
+				ChannelLiquidity {
+					min_liquidity_offset_msat: 100, max_liquidity_offset_msat: 200,
+					last_updated, offset_history_last_updated, last_datapoint_time,
+					liquidity_history: HistoricalLiquidityTracker::new(),
+				})
+			.with_channel(43,
+				ChannelLiquidity {
+					min_liquidity_offset_msat: 0, max_liquidity_offset_msat: 0,
+					last_updated, offset_history_last_updated, last_datapoint_time,
+					liquidity_history: HistoricalLiquidityTracker::new(),
+				});
+
+		let source = source_node_id();
+		let target = target_node_id();
+
+		// Populate historical buckets for channel 42 by simulating a probe-style failure.
+		// failed_at_channel internally calls update_history_buckets, which is what
+		// payment_path_failed uses in production.
+		scorer.channel_liquidities.get_mut(&42).unwrap()
+			.as_directed_mut(&source, &target, 1_000_000)
+			.failed_at_channel(150_000, Duration::from_secs(1_700_000_001),
+				format_args!("test channel 42"), &logger);
+
+		let diags = scorer.diagnostics();
+		assert_eq!(diags.len(), 2);
+		// Sorted by scid.
+		assert_eq!(diags[0].scid, 42);
+		assert_eq!(diags[1].scid, 43);
+		// Channel 42 was probed -> has_history true and non-zero bucket weight.
+		assert!(diags[0].has_history);
+		assert!(diags[0].total_valid_points_tracked > 0.0);
+		assert!(diags[0].min_history_buckets.iter().any(|b| *b != 0)
+			|| diags[0].max_history_buckets.iter().any(|b| *b != 0));
+		// Channel 43 was never probed -> empty history, zero weight, all-zero buckets.
+		assert!(!diags[1].has_history);
+		assert_eq!(diags[1].total_valid_points_tracked, 0.0);
+		assert_eq!(diags[1].min_history_buckets, [0u16; 32]);
+		assert_eq!(diags[1].max_history_buckets, [0u16; 32]);
+
+		// Writeable -> Readable round-trip: diagnostics() on the deserialized scorer
+		// should report the same shape (scid set + history populated/empty distinction).
+		let mut buf = Vec::new();
+		scorer.write(&mut buf).expect("scorer write");
+		let logger2 = TestLogger::new();
+		let read_args = (ProbabilisticScoringDecayParameters::default(), &network_graph, &logger2);
+		let scorer2: ProbabilisticScorer<&NetworkGraph<&TestLogger>, &TestLogger> =
+			ReadableArgs::read(&mut io::Cursor::new(&buf), read_args).expect("scorer read");
+		let diags2 = scorer2.diagnostics();
+		assert_eq!(diags2.len(), 2);
+		assert_eq!(diags2[0].scid, 42);
+		assert_eq!(diags2[1].scid, 43);
+		assert!(diags2[0].has_history);
+		assert!(!diags2[1].has_history);
+
+		// ChannelLiquidities::diagnostics is also reachable on a standalone instance read
+		// from the served-scorer wire format.
+		let mut buf2 = Vec::new();
+		scorer.channel_liquidities.write(&mut buf2).expect("liquidities write");
+		let liquidities: ChannelLiquidities =
+			Readable::read(&mut io::Cursor::new(&buf2)).expect("liquidities read");
+		let diags3 = liquidities.diagnostics();
+		assert_eq!(diags3.len(), 2);
+		assert!(diags3.iter().any(|d| d.scid == 42 && d.has_history));
+		assert!(diags3.iter().any(|d| d.scid == 43 && !d.has_history));
 	}
 }
 
