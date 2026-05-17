@@ -548,6 +548,14 @@ impl ChannelLiquidities {
 		self.0.insert(short_channel_id, liquidity)
 	}
 
+	/// Removes a single channel-liquidity entry by short channel id.
+	///
+	/// This is useful for offline tools that need to filter decoded scorer files before
+	/// merging or re-serializing them.
+	pub fn remove(&mut self, short_channel_id: u64) -> bool {
+		self.0.remove(&short_channel_id).is_some()
+	}
+
 	fn iter(&self) -> impl Iterator<Item = (&u64, &ChannelLiquidity)> {
 		self.0.iter()
 	}
@@ -4468,6 +4476,36 @@ mod tests {
 		assert_eq!(merged.min_liquidity_offset_msat, 300);
 		assert_eq!(merged.max_liquidity_offset_msat, 700);
 		assert!(diagnostics.iter().any(|diag| diag.scid == 44));
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn channel_liquidities_remove_drops_selected_entry() {
+		let last_updated = Duration::ZERO;
+		let mut liquidities = ChannelLiquidities::new();
+		liquidities.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 100,
+			max_liquidity_offset_msat: 300,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+		liquidities.insert(43, ChannelLiquidity {
+			min_liquidity_offset_msat: 10,
+			max_liquidity_offset_msat: 30,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+
+		assert!(liquidities.remove(42));
+		assert!(!liquidities.remove(44));
+
+		let diagnostics = liquidities.diagnostics();
+		assert_eq!(diagnostics.len(), 1);
+		assert_eq!(diagnostics[0].scid, 43);
 	}
 
 	#[test]
