@@ -1445,6 +1445,10 @@ impl ChannelLiquidity {
 
 		// Merge historical liquidity data.
 		self.liquidity_history.merge(&other.liquidity_history);
+		self.last_updated = cmp::max(self.last_updated, other.last_updated);
+		self.offset_history_last_updated =
+			cmp::max(self.offset_history_last_updated, other.offset_history_last_updated);
+		self.last_datapoint_time = cmp::max(self.last_datapoint_time, other.last_datapoint_time);
 	}
 
 	/// Returns a view of the channel liquidity directed from `source` to `target` assuming
@@ -4580,6 +4584,47 @@ mod tests {
 		let inserted = diagnostics.iter().find(|diag| diag.scid == 44).unwrap();
 		assert_eq!(inserted.min_liquidity_offset_msat, 20);
 		assert_eq!(inserted.max_liquidity_offset_msat, 40);
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn channel_liquidities_merge_without_decay_combines_newest_timestamps() {
+		let old_timestamp = Duration::from_secs(1);
+		let newer_timestamp = Duration::from_secs(1_000_000);
+		let mut first = ChannelLiquidities::new();
+		first.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 100,
+			max_liquidity_offset_msat: 300,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: old_timestamp,
+			offset_history_last_updated: old_timestamp,
+			last_datapoint_time: old_timestamp,
+		});
+
+		let mut second = ChannelLiquidities::new();
+		second.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 300,
+			max_liquidity_offset_msat: 700,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: newer_timestamp,
+			offset_history_last_updated: newer_timestamp,
+			last_datapoint_time: newer_timestamp,
+		});
+
+		first.merge_without_decay(second, |existing, other| {
+			assert_eq!(existing.scid, 42);
+			assert_eq!(other.scid, 42);
+			ChannelLiquidityMergeAction::Combine
+		});
+
+		let diagnostics = first.diagnostics();
+		assert_eq!(diagnostics.len(), 1);
+		let merged = &diagnostics[0];
+		assert_eq!(merged.min_liquidity_offset_msat, 200);
+		assert_eq!(merged.max_liquidity_offset_msat, 500);
+		assert_eq!(merged.last_updated_secs, newer_timestamp.as_secs());
+		assert_eq!(merged.offset_history_last_updated_secs, newer_timestamp.as_secs());
+		assert_eq!(merged.last_datapoint_time_secs, newer_timestamp.as_secs());
 	}
 
 	#[test]
