@@ -638,6 +638,48 @@ impl ChannelLiquidities {
 		}
 	}
 
+	/// Merge another set of channel liquidities into this one without decaying either side.
+	///
+	/// Entries present in only one set are preserved exactly as serialized. For duplicate short
+	/// channel ids, `merge_action` is called with diagnostic views of the existing and incoming
+	/// entries and decides whether to keep the existing value, replace it with the incoming value,
+	/// or combine both entries using LDK's per-channel merge logic.
+	///
+	/// This is intended for offline overlay tooling that needs to preserve a trusted baseline
+	/// scorer file while replacing or inserting an explicit set of selected channels from another
+	/// scorer file. Use [`Self::merge_with`] when both inputs should first be normalized to a
+	/// shared timestamp.
+	pub fn merge_without_decay<F>(&mut self, other: Self, mut merge_action: F)
+	where
+		F: FnMut(
+			&ChannelLiquidityDiagnostic,
+			&ChannelLiquidityDiagnostic,
+		) -> ChannelLiquidityMergeAction,
+	{
+		for (scid, other_liquidity) in other.0 {
+			match self.0.entry(scid) {
+				Entry::Occupied(mut entry) => {
+					let existing_diagnostic =
+						ChannelLiquidityDiagnostic::from_internal(scid, entry.get());
+					let other_diagnostic =
+						ChannelLiquidityDiagnostic::from_internal(scid, &other_liquidity);
+					match merge_action(&existing_diagnostic, &other_diagnostic) {
+						ChannelLiquidityMergeAction::KeepExisting => {},
+						ChannelLiquidityMergeAction::ReplaceWithOther => {
+							_ = entry.insert(other_liquidity);
+						},
+						ChannelLiquidityMergeAction::Combine => {
+							entry.get_mut().merge(&other_liquidity);
+						},
+					}
+				},
+				Entry::Vacant(entry) => {
+					entry.insert(other_liquidity);
+				},
+			}
+		}
+	}
+
 	/// Produces a read-only [`ChannelLiquidityDiagnostic`] view of every entry, sorted by
 	/// `short_channel_id` for deterministic output.
 	///
@@ -4476,6 +4518,68 @@ mod tests {
 		assert_eq!(merged.min_liquidity_offset_msat, 300);
 		assert_eq!(merged.max_liquidity_offset_msat, 700);
 		assert!(diagnostics.iter().any(|diag| diag.scid == 44));
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn channel_liquidities_merge_without_decay_preserves_unselected_baseline_entries() {
+		let old_timestamp = Duration::from_secs(1);
+		let newer_timestamp = Duration::from_secs(1_000_000);
+		let mut first = ChannelLiquidities::new();
+		first.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 100,
+			max_liquidity_offset_msat: 300,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: old_timestamp,
+			offset_history_last_updated: old_timestamp,
+			last_datapoint_time: old_timestamp,
+		});
+		first.insert(43, ChannelLiquidity {
+			min_liquidity_offset_msat: 50_000,
+			max_liquidity_offset_msat: 75_000,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: old_timestamp,
+			offset_history_last_updated: old_timestamp,
+			last_datapoint_time: old_timestamp,
+		});
+
+		let mut second = ChannelLiquidities::new();
+		second.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 200,
+			max_liquidity_offset_msat: 700,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: newer_timestamp,
+			offset_history_last_updated: newer_timestamp,
+			last_datapoint_time: newer_timestamp,
+		});
+		second.insert(44, ChannelLiquidity {
+			min_liquidity_offset_msat: 20,
+			max_liquidity_offset_msat: 40,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: newer_timestamp,
+			offset_history_last_updated: newer_timestamp,
+			last_datapoint_time: newer_timestamp,
+		});
+
+		first.merge_without_decay(second, |existing, other| {
+			assert_eq!(existing.scid, 42);
+			assert_eq!(other.scid, 42);
+			ChannelLiquidityMergeAction::ReplaceWithOther
+		});
+
+		let diagnostics = first.diagnostics();
+		assert_eq!(diagnostics.len(), 3);
+		let replaced = diagnostics.iter().find(|diag| diag.scid == 42).unwrap();
+		assert_eq!(replaced.min_liquidity_offset_msat, 200);
+		assert_eq!(replaced.max_liquidity_offset_msat, 700);
+		assert_eq!(replaced.last_updated_secs, newer_timestamp.as_secs());
+		let untouched = diagnostics.iter().find(|diag| diag.scid == 43).unwrap();
+		assert_eq!(untouched.min_liquidity_offset_msat, 50_000);
+		assert_eq!(untouched.max_liquidity_offset_msat, 75_000);
+		assert_eq!(untouched.last_updated_secs, old_timestamp.as_secs());
+		let inserted = diagnostics.iter().find(|diag| diag.scid == 44).unwrap();
+		assert_eq!(inserted.min_liquidity_offset_msat, 20);
+		assert_eq!(inserted.max_liquidity_offset_msat, 40);
 	}
 
 	#[test]
