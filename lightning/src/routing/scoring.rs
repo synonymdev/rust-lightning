@@ -2081,6 +2081,7 @@ impl<G: Deref<Target = NetworkGraph<L>> + Clone, L: Logger + Clone> CombinedScor
 		external_scores.time_passed(duration_since_epoch, self.local_only_scorer.decay_params);
 
 		let local_scores = &self.local_only_scorer.channel_liquidities;
+		self.scorer.channel_liquidities = local_scores.clone();
 
 		// For each channel, merge the external liquidity information with the isolated local liquidity information.
 		for (scid, mut liquidity) in external_scores.0 {
@@ -4655,6 +4656,40 @@ mod tests {
 		let diagnostics = liquidities.diagnostics();
 		assert_eq!(diagnostics.len(), 1);
 		assert_eq!(diagnostics[0].scid, 43);
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn combined_scorer_scores_exports_decayed_local_only_entries() {
+		let logger = TestLogger::new();
+		let network_graph = network_graph(&logger);
+		let last_updated = Duration::ZERO;
+		let merge_timestamp = Duration::from_secs(10);
+		let scorer = ProbabilisticScorer::new(
+			ProbabilisticScoringDecayParameters::default(),
+			&network_graph,
+			&logger,
+		).with_channel(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 100,
+			max_liquidity_offset_msat: 300,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+		let mut combined_scorer = CombinedScorer::new(scorer);
+
+		combined_scorer.merge(ChannelLiquidities::new(), merge_timestamp);
+
+		let exported_diagnostics = combined_scorer.scores().diagnostics();
+		let local_diagnostics = combined_scorer.local_only_scorer.scores().diagnostics();
+		assert_eq!(exported_diagnostics.len(), 1);
+		assert_eq!(local_diagnostics.len(), 1);
+		assert_eq!(exported_diagnostics[0].scid, 42);
+		assert_eq!(exported_diagnostics[0].min_liquidity_offset_msat, local_diagnostics[0].min_liquidity_offset_msat);
+		assert_eq!(exported_diagnostics[0].max_liquidity_offset_msat, local_diagnostics[0].max_liquidity_offset_msat);
+		assert_eq!(exported_diagnostics[0].last_updated_secs, merge_timestamp.as_secs());
+		assert_eq!(exported_diagnostics[0].last_updated_secs, local_diagnostics[0].last_updated_secs);
 	}
 
 	#[test]
