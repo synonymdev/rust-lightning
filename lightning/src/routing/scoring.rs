@@ -492,6 +492,17 @@ pub struct ProbabilisticScorer<G: Deref<Target = NetworkGraph<L>>, L: Logger> {
 #[derive(Clone)]
 pub struct ChannelLiquidities(HashMap<u64, ChannelLiquidity>);
 
+/// The action to take when two [`ChannelLiquidities`] contain the same short channel id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelLiquidityMergeAction {
+	/// Keep the existing entry from the left-hand [`ChannelLiquidities`].
+	KeepExisting,
+	/// Replace the existing entry with the entry from the right-hand [`ChannelLiquidities`].
+	ReplaceWithOther,
+	/// Combine both entries using LDK's per-channel merge logic.
+	Combine,
+}
+
 impl ChannelLiquidities {
 	fn new() -> Self {
 		Self(new_hash_map())
@@ -537,6 +548,14 @@ impl ChannelLiquidities {
 		self.0.insert(short_channel_id, liquidity)
 	}
 
+	/// Removes a single channel-liquidity entry by short channel id.
+	///
+	/// This is useful for offline tools that need to filter decoded scorer files before
+	/// merging or re-serializing them.
+	pub fn remove(&mut self, short_channel_id: u64) -> bool {
+		self.0.remove(&short_channel_id).is_some()
+	}
+
 	fn iter(&self) -> impl Iterator<Item = (&u64, &ChannelLiquidity)> {
 		self.0.iter()
 	}
@@ -548,6 +567,117 @@ impl ChannelLiquidities {
 	#[cfg(test)]
 	fn get_mut(&mut self, short_channel_id: &u64) -> Option<&mut ChannelLiquidity> {
 		self.0.get_mut(short_channel_id)
+	}
+
+	/// Merge another set of channel liquidities into this one.
+	///
+	/// Both sets are first decayed to `duration_since_epoch` using the given `decay_params`,
+	/// matching the normalization performed by [`CombinedScorer::merge`]. Entries present in
+	/// both sets are combined using LDK's per-channel merge logic; entries present in only one
+	/// set are preserved. Use [`Self::merge_with`] if duplicate entries should be resolved with a
+	/// custom policy instead.
+	///
+	/// This is primarily useful for offline tooling that reads multiple serialized scorer files,
+	/// merges them, and writes a new serialized [`ChannelLiquidities`] file.
+	pub fn merge(
+		&mut self, other: Self, duration_since_epoch: Duration,
+		decay_params: ProbabilisticScoringDecayParameters,
+	) {
+		self.merge_with(other, duration_since_epoch, decay_params, |_existing, _other| {
+			ChannelLiquidityMergeAction::Combine
+		});
+	}
+
+	/// Merge another set of channel liquidities into this one, resolving duplicate entries with
+	/// `merge_action`.
+	///
+	/// Both sets are first decayed to `duration_since_epoch` using the given `decay_params`,
+	/// matching the normalization performed by [`CombinedScorer::merge`]. Entries present in only
+	/// one set are preserved. For duplicate short channel ids, `merge_action` is called with
+	/// diagnostic views of the existing and incoming entries and decides whether to keep the
+	/// existing value, replace it with the incoming value, or combine both entries using LDK's
+	/// per-channel merge logic.
+	///
+	/// This lets offline tooling apply deterministic source-aware policies such as preferring the
+	/// entry with richer historical data, preferring the newer datapoint, or preserving a trusted
+	/// source for known-good channels while still writing a regular serialized [`ChannelLiquidities`]
+	/// file.
+	pub fn merge_with<F>(
+		&mut self, mut other: Self, duration_since_epoch: Duration,
+		decay_params: ProbabilisticScoringDecayParameters, mut merge_action: F,
+	) where
+		F: FnMut(
+			&ChannelLiquidityDiagnostic,
+			&ChannelLiquidityDiagnostic,
+		) -> ChannelLiquidityMergeAction,
+	{
+		self.time_passed(duration_since_epoch, decay_params);
+		other.time_passed(duration_since_epoch, decay_params);
+
+		for (scid, other_liquidity) in other.0 {
+			match self.0.entry(scid) {
+				Entry::Occupied(mut entry) => {
+					let existing_diagnostic =
+						ChannelLiquidityDiagnostic::from_internal(scid, entry.get());
+					let other_diagnostic =
+						ChannelLiquidityDiagnostic::from_internal(scid, &other_liquidity);
+					match merge_action(&existing_diagnostic, &other_diagnostic) {
+						ChannelLiquidityMergeAction::KeepExisting => {},
+						ChannelLiquidityMergeAction::ReplaceWithOther => {
+							_ = entry.insert(other_liquidity);
+						},
+						ChannelLiquidityMergeAction::Combine => {
+							entry.get_mut().merge(&other_liquidity);
+						},
+					}
+				},
+				Entry::Vacant(entry) => {
+					entry.insert(other_liquidity);
+				},
+			}
+		}
+	}
+
+	/// Merge another set of channel liquidities into this one without decaying either side.
+	///
+	/// Entries present in only one set are preserved exactly as serialized. For duplicate short
+	/// channel ids, `merge_action` is called with diagnostic views of the existing and incoming
+	/// entries and decides whether to keep the existing value, replace it with the incoming value,
+	/// or combine both entries using LDK's per-channel merge logic.
+	///
+	/// This is intended for offline overlay tooling that needs to preserve a trusted baseline
+	/// scorer file while replacing or inserting an explicit set of selected channels from another
+	/// scorer file. Use [`Self::merge_with`] when both inputs should first be normalized to a
+	/// shared timestamp.
+	pub fn merge_without_decay<F>(&mut self, other: Self, mut merge_action: F)
+	where
+		F: FnMut(
+			&ChannelLiquidityDiagnostic,
+			&ChannelLiquidityDiagnostic,
+		) -> ChannelLiquidityMergeAction,
+	{
+		for (scid, other_liquidity) in other.0 {
+			match self.0.entry(scid) {
+				Entry::Occupied(mut entry) => {
+					let existing_diagnostic =
+						ChannelLiquidityDiagnostic::from_internal(scid, entry.get());
+					let other_diagnostic =
+						ChannelLiquidityDiagnostic::from_internal(scid, &other_liquidity);
+					match merge_action(&existing_diagnostic, &other_diagnostic) {
+						ChannelLiquidityMergeAction::KeepExisting => {},
+						ChannelLiquidityMergeAction::ReplaceWithOther => {
+							_ = entry.insert(other_liquidity);
+						},
+						ChannelLiquidityMergeAction::Combine => {
+							entry.get_mut().merge(&other_liquidity);
+						},
+					}
+				},
+				Entry::Vacant(entry) => {
+					entry.insert(other_liquidity);
+				},
+			}
+		}
 	}
 
 	/// Produces a read-only [`ChannelLiquidityDiagnostic`] view of every entry, sorted by
@@ -1315,6 +1445,10 @@ impl ChannelLiquidity {
 
 		// Merge historical liquidity data.
 		self.liquidity_history.merge(&other.liquidity_history);
+		self.last_updated = cmp::max(self.last_updated, other.last_updated);
+		self.offset_history_last_updated =
+			cmp::max(self.offset_history_last_updated, other.offset_history_last_updated);
+		self.last_datapoint_time = cmp::max(self.last_datapoint_time, other.last_datapoint_time);
 	}
 
 	/// Returns a view of the channel liquidity directed from `source` to `target` assuming
@@ -1947,6 +2081,7 @@ impl<G: Deref<Target = NetworkGraph<L>> + Clone, L: Logger + Clone> CombinedScor
 		external_scores.time_passed(duration_since_epoch, self.local_only_scorer.decay_params);
 
 		let local_scores = &self.local_only_scorer.channel_liquidities;
+		self.scorer.channel_liquidities = local_scores.clone();
 
 		// For each channel, merge the external liquidity information with the isolated local liquidity information.
 		for (scid, mut liquidity) in external_scores.0 {
@@ -1960,6 +2095,16 @@ impl<G: Deref<Target = NetworkGraph<L>> + Clone, L: Logger + Clone> CombinedScor
 	/// Overwrite the scorer state with the given external scores.
 	pub fn set_scores(&mut self, external_scores: ChannelLiquidities) {
 		self.scorer.set_scores(external_scores);
+	}
+
+	/// Returns the current combined scoring state.
+	///
+	/// Unlike this type's [`Writeable`] implementation, which intentionally persists only the
+	/// local scorer, this exposes the in-memory scorer that includes any external scores merged
+	/// through [`Self::merge`] or installed through [`Self::set_scores`]. This lets offline tools
+	/// serialize the combined view explicitly via [`ChannelLiquidities::write`].
+	pub fn scores(&self) -> &ChannelLiquidities {
+		self.scorer.scores()
 	}
 }
 
@@ -2711,7 +2856,8 @@ mod tests {
 		BlindedTail, CandidateRouteHop, Path, PublicHopCandidate, RouteHop,
 	};
 	use crate::routing::scoring::{
-		ChannelLiquidities, ChannelUsage, CombinedScorer, ScoreLookUp, ScoreUpdate,
+		ChannelLiquidities, ChannelLiquidityMergeAction, ChannelUsage, CombinedScorer, ScoreLookUp,
+		ScoreUpdate,
 	};
 	use crate::util::ser::{Readable, ReadableArgs, Writeable};
 	use crate::util::test_utils::{self, TestLogger};
@@ -4278,6 +4424,275 @@ mod tests {
 	}
 
 	#[test]
+	#[rustfmt::skip]
+	fn channel_liquidities_merge_preserves_unique_entries_and_averages_overlaps() {
+		let last_updated = Duration::ZERO;
+		let mut first = ChannelLiquidities::new();
+		first.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 100,
+			max_liquidity_offset_msat: 300,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+		first.insert(43, ChannelLiquidity {
+			min_liquidity_offset_msat: 10,
+			max_liquidity_offset_msat: 30,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+
+		let mut second = ChannelLiquidities::new();
+		second.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 300,
+			max_liquidity_offset_msat: 700,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+		second.insert(44, ChannelLiquidity {
+			min_liquidity_offset_msat: 20,
+			max_liquidity_offset_msat: 40,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+
+		first.merge(second, Duration::ZERO, ProbabilisticScoringDecayParameters::zero_penalty());
+
+		let diagnostics = first.diagnostics();
+		assert_eq!(diagnostics.len(), 3);
+		let merged = diagnostics.iter().find(|diag| diag.scid == 42).unwrap();
+		assert_eq!(merged.min_liquidity_offset_msat, 200);
+		assert_eq!(merged.max_liquidity_offset_msat, 500);
+		assert!(diagnostics.iter().any(|diag| diag.scid == 43));
+		assert!(diagnostics.iter().any(|diag| diag.scid == 44));
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn channel_liquidities_merge_with_can_choose_overlap_winner() {
+		let last_updated = Duration::ZERO;
+		let mut first = ChannelLiquidities::new();
+		first.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 100,
+			max_liquidity_offset_msat: 300,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+
+		let mut second = ChannelLiquidities::new();
+		second.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 300,
+			max_liquidity_offset_msat: 700,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+		second.insert(44, ChannelLiquidity {
+			min_liquidity_offset_msat: 20,
+			max_liquidity_offset_msat: 40,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+
+		first.merge_with(
+			second,
+			Duration::ZERO,
+			ProbabilisticScoringDecayParameters::zero_penalty(),
+			|existing, other| {
+				assert_eq!(existing.scid, 42);
+				assert_eq!(other.scid, 42);
+				ChannelLiquidityMergeAction::ReplaceWithOther
+			},
+		);
+
+		let diagnostics = first.diagnostics();
+		assert_eq!(diagnostics.len(), 2);
+		let merged = diagnostics.iter().find(|diag| diag.scid == 42).unwrap();
+		assert_eq!(merged.min_liquidity_offset_msat, 300);
+		assert_eq!(merged.max_liquidity_offset_msat, 700);
+		assert!(diagnostics.iter().any(|diag| diag.scid == 44));
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn channel_liquidities_merge_without_decay_preserves_unselected_baseline_entries() {
+		let old_timestamp = Duration::from_secs(1);
+		let newer_timestamp = Duration::from_secs(1_000_000);
+		let mut first = ChannelLiquidities::new();
+		first.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 100,
+			max_liquidity_offset_msat: 300,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: old_timestamp,
+			offset_history_last_updated: old_timestamp,
+			last_datapoint_time: old_timestamp,
+		});
+		first.insert(43, ChannelLiquidity {
+			min_liquidity_offset_msat: 50_000,
+			max_liquidity_offset_msat: 75_000,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: old_timestamp,
+			offset_history_last_updated: old_timestamp,
+			last_datapoint_time: old_timestamp,
+		});
+
+		let mut second = ChannelLiquidities::new();
+		second.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 200,
+			max_liquidity_offset_msat: 700,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: newer_timestamp,
+			offset_history_last_updated: newer_timestamp,
+			last_datapoint_time: newer_timestamp,
+		});
+		second.insert(44, ChannelLiquidity {
+			min_liquidity_offset_msat: 20,
+			max_liquidity_offset_msat: 40,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: newer_timestamp,
+			offset_history_last_updated: newer_timestamp,
+			last_datapoint_time: newer_timestamp,
+		});
+
+		first.merge_without_decay(second, |existing, other| {
+			assert_eq!(existing.scid, 42);
+			assert_eq!(other.scid, 42);
+			ChannelLiquidityMergeAction::ReplaceWithOther
+		});
+
+		let diagnostics = first.diagnostics();
+		assert_eq!(diagnostics.len(), 3);
+		let replaced = diagnostics.iter().find(|diag| diag.scid == 42).unwrap();
+		assert_eq!(replaced.min_liquidity_offset_msat, 200);
+		assert_eq!(replaced.max_liquidity_offset_msat, 700);
+		assert_eq!(replaced.last_updated_secs, newer_timestamp.as_secs());
+		let untouched = diagnostics.iter().find(|diag| diag.scid == 43).unwrap();
+		assert_eq!(untouched.min_liquidity_offset_msat, 50_000);
+		assert_eq!(untouched.max_liquidity_offset_msat, 75_000);
+		assert_eq!(untouched.last_updated_secs, old_timestamp.as_secs());
+		let inserted = diagnostics.iter().find(|diag| diag.scid == 44).unwrap();
+		assert_eq!(inserted.min_liquidity_offset_msat, 20);
+		assert_eq!(inserted.max_liquidity_offset_msat, 40);
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn channel_liquidities_merge_without_decay_combines_newest_timestamps() {
+		let old_timestamp = Duration::from_secs(1);
+		let newer_timestamp = Duration::from_secs(1_000_000);
+		let mut first = ChannelLiquidities::new();
+		first.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 100,
+			max_liquidity_offset_msat: 300,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: old_timestamp,
+			offset_history_last_updated: old_timestamp,
+			last_datapoint_time: old_timestamp,
+		});
+
+		let mut second = ChannelLiquidities::new();
+		second.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 300,
+			max_liquidity_offset_msat: 700,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated: newer_timestamp,
+			offset_history_last_updated: newer_timestamp,
+			last_datapoint_time: newer_timestamp,
+		});
+
+		first.merge_without_decay(second, |existing, other| {
+			assert_eq!(existing.scid, 42);
+			assert_eq!(other.scid, 42);
+			ChannelLiquidityMergeAction::Combine
+		});
+
+		let diagnostics = first.diagnostics();
+		assert_eq!(diagnostics.len(), 1);
+		let merged = &diagnostics[0];
+		assert_eq!(merged.min_liquidity_offset_msat, 200);
+		assert_eq!(merged.max_liquidity_offset_msat, 500);
+		assert_eq!(merged.last_updated_secs, newer_timestamp.as_secs());
+		assert_eq!(merged.offset_history_last_updated_secs, newer_timestamp.as_secs());
+		assert_eq!(merged.last_datapoint_time_secs, newer_timestamp.as_secs());
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn channel_liquidities_remove_drops_selected_entry() {
+		let last_updated = Duration::ZERO;
+		let mut liquidities = ChannelLiquidities::new();
+		liquidities.insert(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 100,
+			max_liquidity_offset_msat: 300,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+		liquidities.insert(43, ChannelLiquidity {
+			min_liquidity_offset_msat: 10,
+			max_liquidity_offset_msat: 30,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+
+		assert!(liquidities.remove(42));
+		assert!(!liquidities.remove(44));
+
+		let diagnostics = liquidities.diagnostics();
+		assert_eq!(diagnostics.len(), 1);
+		assert_eq!(diagnostics[0].scid, 43);
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn combined_scorer_scores_exports_decayed_local_only_entries() {
+		let logger = TestLogger::new();
+		let network_graph = network_graph(&logger);
+		let last_updated = Duration::ZERO;
+		let merge_timestamp = Duration::from_secs(10);
+		let scorer = ProbabilisticScorer::new(
+			ProbabilisticScoringDecayParameters::default(),
+			&network_graph,
+			&logger,
+		).with_channel(42, ChannelLiquidity {
+			min_liquidity_offset_msat: 100,
+			max_liquidity_offset_msat: 300,
+			liquidity_history: HistoricalLiquidityTracker::new(),
+			last_updated,
+			offset_history_last_updated: last_updated,
+			last_datapoint_time: last_updated,
+		});
+		let mut combined_scorer = CombinedScorer::new(scorer);
+
+		combined_scorer.merge(ChannelLiquidities::new(), merge_timestamp);
+
+		let exported_diagnostics = combined_scorer.scores().diagnostics();
+		let local_diagnostics = combined_scorer.local_only_scorer.scores().diagnostics();
+		assert_eq!(exported_diagnostics.len(), 1);
+		assert_eq!(local_diagnostics.len(), 1);
+		assert_eq!(exported_diagnostics[0].scid, 42);
+		assert_eq!(exported_diagnostics[0].min_liquidity_offset_msat, local_diagnostics[0].min_liquidity_offset_msat);
+		assert_eq!(exported_diagnostics[0].max_liquidity_offset_msat, local_diagnostics[0].max_liquidity_offset_msat);
+		assert_eq!(exported_diagnostics[0].last_updated_secs, merge_timestamp.as_secs());
+		assert_eq!(exported_diagnostics[0].last_updated_secs, local_diagnostics[0].last_updated_secs);
+	}
+
+	#[test]
 	fn combined_scorer() {
 		let logger = TestLogger::new();
 		let network_graph = network_graph(&logger);
@@ -4341,6 +4756,21 @@ mod tests {
 		let liquidity_range =
 			combined_scorer.scorer.estimated_channel_liquidity_range(42, &target_node_id());
 		assert_eq!(liquidity_range.unwrap(), (0, 300));
+
+		let mut serialized_scores = Vec::new();
+		combined_scorer.scores().write(&mut serialized_scores).unwrap();
+		let exported_scores: ChannelLiquidities =
+			Readable::read(&mut io::Cursor::new(&serialized_scores)).unwrap();
+		let mut scorer_from_export = ProbabilisticScorer::new(
+			ProbabilisticScoringDecayParameters::default(),
+			&network_graph,
+			&logger,
+		);
+		scorer_from_export.set_scores(exported_scores);
+		assert_eq!(
+			scorer_from_export.estimated_channel_liquidity_range(42, &target_node_id()).unwrap(),
+			(0, 300)
+		);
 
 		// Now set (overwrite) the scorer state with the external data which should lead to an even greater liquidity
 		// range. Just the success from the external source is now considered.
