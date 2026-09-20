@@ -8,7 +8,7 @@ use crate::types::payment::{PaymentHash, PaymentSecret};
 use crate::util::config::UserConfig;
 use crate::util::ser::Writeable;
 
-fn anchor_config() -> UserConfig {
+pub(super) fn anchor_config() -> UserConfig {
 	let mut config = test_default_channel_config();
 	config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
 	config.manually_accept_inbound_channels = true;
@@ -33,7 +33,7 @@ fn verify(
 	)
 }
 
-fn offer_voucher(
+pub(super) fn offer_voucher(
 	sender: &Node, receiver: &Node, amount_msat: u64,
 ) -> (msgs::CommitmentUpdate, FFORVoucher, PaymentSecret) {
 	let (mut route, payment_hash, _, payment_secret) =
@@ -189,6 +189,9 @@ fn ffor_checks_complete_book_claim_material_and_stale_snapshots() {
 	let mut invalid = snapshot(&nodes[1], channel_id);
 	invalid.holder.counterparty_htlc_sigs[0] = invalid.holder.counterparty_sig;
 	assert_eq!(check(&book, &invalid), Err(FFORCommitmentError::InvalidClaimMaterial));
+	let mut invalid_funding = snapshot(&nodes[1], channel_id);
+	invalid_funding.holder.counterparty_sig = invalid_funding.holder.counterparty_htlc_sigs[0];
+	assert_eq!(check(&book, &invalid_funding), Err(FFORCommitmentError::InvalidClaimMaterial));
 	let mut wrong_id = snapshot(&nodes[1], channel_id);
 	wrong_id.update_id -= 1;
 	assert_eq!(check(&book, &wrong_id), Err(FFORCommitmentError::MonitorMismatch));
@@ -454,4 +457,524 @@ fn ffor_rejects_pending_fee_updates() {
 	assert!(
 		verify(&nodes[1], &nodes[0], channel_id, FFORSettlementParty::Counterparty, &book).is_ok()
 	);
+}
+
+const RECEIVER_EPOCH: [u8; 32] = [91; 32];
+
+pub(super) fn register_book(
+	receiver: &Node, sender: &Node, channel_id: ChannelId, book: &[FFORVoucher],
+) {
+	receiver
+		.node
+		.register_ffor_receiver_book(
+			&channel_id,
+			&sender.node.get_our_node_id(),
+			RECEIVER_EPOCH,
+			book,
+		)
+		.unwrap();
+}
+
+fn receiver_status(receiver: &Node, sender: &Node, channel_id: ChannelId) -> FFORReceiverStatus {
+	let monitor = snapshot(receiver, channel_id);
+	receiver
+		.node
+		.ffor_receiver_book_status(&channel_id, &sender.node.get_our_node_id(), &monitor)
+		.unwrap()
+}
+
+pub(super) fn deliver_parked_voucher(
+	sender: &Node, receiver: &Node, update: msgs::CommitmentUpdate,
+) {
+	for add in update.update_add_htlcs.iter() {
+		receiver.node.handle_update_add_htlc(sender.node.get_our_node_id(), add);
+	}
+	commitment_signed_dance!(receiver, sender, update.commitment_signed, false);
+	expect_and_process_pending_htlcs(receiver, false);
+	assert!(receiver.node.get_and_clear_pending_events().is_empty());
+}
+
+fn drain_voucher_failures(sender: &Node, receiver: &Node, hashes: &[PaymentHash]) {
+	let update = get_htlc_update_msgs!(receiver, sender.node.get_our_node_id());
+	check_added_monitors(receiver, 1);
+	assert_eq!(
+		update.update_fail_htlcs.len() + update.update_fail_malformed_htlcs.len(),
+		hashes.len()
+	);
+	assert!(update.update_add_htlcs.is_empty());
+	assert!(update.update_fulfill_htlcs.is_empty());
+	for fail in update.update_fail_htlcs.iter() {
+		sender.node.handle_update_fail_htlc(receiver.node.get_our_node_id(), fail);
+	}
+	for fail in update.update_fail_malformed_htlcs.iter() {
+		sender.node.handle_update_fail_malformed_htlc(receiver.node.get_our_node_id(), fail);
+	}
+	commitment_signed_dance!(sender, receiver, update.commitment_signed, false);
+	for hash in hashes {
+		expect_payment_failed!(sender, *hash, false);
+	}
+	assert!(receiver.node.get_and_clear_pending_events().is_empty());
+}
+
+#[test]
+fn ffor_parking_proves_both_views_and_abort_restores_ordinary_receiving() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let config = anchor_config();
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	let (update, voucher, _) = offer_voucher(&nodes[0], &nodes[1], 2_000_000);
+	register_book(&nodes[1], &nodes[0], channel_id, &[voucher]);
+	assert_eq!(
+		receiver_status(&nodes[1], &nodes[0], channel_id),
+		FFORReceiverStatus::Registered { parked_vouchers: 0, total_vouchers: 1 }
+	);
+	deliver_parked_voucher(&nodes[0], &nodes[1], update);
+	assert!(matches!(
+		receiver_status(&nodes[1], &nodes[0], channel_id),
+		FFORReceiverStatus::Parked { .. }
+	));
+	assert_eq!(
+		nodes[1].node.abort_ffor_receiver_book(
+			&channel_id,
+			&nodes[0].node.get_our_node_id(),
+			[0; 32],
+		),
+		Err(FFORReceiverError::UnknownEpoch)
+	);
+	nodes[1]
+		.node
+		.abort_ffor_receiver_book(&channel_id, &nodes[0].node.get_our_node_id(), RECEIVER_EPOCH)
+		.unwrap();
+	assert_eq!(
+		receiver_status(&nodes[1], &nodes[0], channel_id),
+		FFORReceiverStatus::Aborting { reason: FFORReceiverAbortReason::Requested }
+	);
+	drain_voucher_failures(&nodes[0], &nodes[1], &[voucher.payment_hash]);
+	assert_eq!(
+		receiver_status(&nodes[1], &nodes[0], channel_id),
+		FFORReceiverStatus::Aborted { reason: FFORReceiverAbortReason::Requested }
+	);
+	for epoch in [RECEIVER_EPOCH, [92; 32]] {
+		assert_eq!(
+			nodes[1].node.register_ffor_receiver_book(
+				&channel_id,
+				&nodes[0].node.get_our_node_id(),
+				epoch,
+				&[voucher],
+			),
+			Err(FFORReceiverError::AlreadyRegistered)
+		);
+	}
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+}
+
+#[test]
+fn ffor_parking_requires_empty_connected_channel_and_exact_next_id() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let config = anchor_config();
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	let voucher = FFORVoucher {
+		htlc_id: 1,
+		payment_hash: PaymentHash([1; 32]),
+		amount_msat: 2_000_000,
+		cltv_expiry: 200,
+	};
+	let register = |voucher| {
+		nodes[1].node.register_ffor_receiver_book(
+			&channel_id,
+			&nodes[0].node.get_our_node_id(),
+			RECEIVER_EPOCH,
+			&[voucher],
+		)
+	};
+	assert_eq!(register(voucher), Err(FFORCommitmentError::InvalidVoucherBook.into()));
+	nodes[1].node.peer_disconnected(nodes[0].node.get_our_node_id());
+	nodes[0].node.peer_disconnected(nodes[1].node.get_our_node_id());
+	assert_eq!(
+		register(FFORVoucher { htlc_id: 0, ..voucher }),
+		Err(FFORCommitmentError::ChannelUnavailable.into())
+	);
+	pump_ffor_reconnection(&nodes[0], &nodes[1]);
+	commit_voucher(&nodes[0], &nodes[1], 2_000_000);
+	assert_eq!(register(voucher), Err(FFORCommitmentError::InvalidVoucherBook.into()));
+}
+
+#[test]
+fn ffor_parking_mismatches_abort_without_payment_events() {
+	for mutation in 0..5 {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let config = anchor_config();
+		let node_chanmgrs =
+			create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+		let (mut update, voucher, _) = offer_voucher(&nodes[0], &nodes[1], 2_000_000);
+		let mut expected = voucher;
+		match mutation {
+			0 => expected.amount_msat += 1,
+			1 => expected.payment_hash = PaymentHash([42; 32]),
+			2 => expected.cltv_expiry += 1,
+			3 => update.update_add_htlcs[0].hold_htlc = Some(()),
+			_ => update.update_add_htlcs[0].skimmed_fee_msat = Some(1),
+		}
+		register_book(&nodes[1], &nodes[0], channel_id, &[expected]);
+		deliver_parked_voucher(&nodes[0], &nodes[1], update);
+		assert_eq!(
+			receiver_status(&nodes[1], &nodes[0], channel_id),
+			FFORReceiverStatus::Aborting { reason: FFORReceiverAbortReason::VoucherMismatch }
+		);
+		drain_voucher_failures(&nodes[0], &nodes[1], &[voucher.payment_hash]);
+		assert_eq!(
+			receiver_status(&nodes[1], &nodes[0], channel_id),
+			FFORReceiverStatus::Aborted { reason: FFORReceiverAbortReason::VoucherMismatch }
+		);
+		send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+	}
+}
+
+#[test]
+fn ffor_parking_partial_book_never_reports_parked() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let config = anchor_config();
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	let (update, voucher, _) = offer_voucher(&nodes[0], &nodes[1], 2_000_000);
+	let second = FFORVoucher { htlc_id: 1, payment_hash: PaymentHash([2; 32]), ..voucher };
+	register_book(&nodes[1], &nodes[0], channel_id, &[voucher, second]);
+	deliver_parked_voucher(&nodes[0], &nodes[1], update);
+	assert_eq!(
+		receiver_status(&nodes[1], &nodes[0], channel_id),
+		FFORReceiverStatus::Registered { parked_vouchers: 1, total_vouchers: 2 }
+	);
+	nodes[1]
+		.node
+		.abort_ffor_receiver_book(&channel_id, &nodes[0].node.get_our_node_id(), RECEIVER_EPOCH)
+		.unwrap();
+	drain_voucher_failures(&nodes[0], &nodes[1], &[voucher.payment_hash]);
+	// An unused voucher slot must not prevent an ordinary payment after the abort drains.
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+}
+
+/// Complete real peer messages, deferred adds, and failure commitment rounds after a crash.
+fn pump_ffor_reconnection<'a, 'b, 'c>(sender: &Node<'a, 'b, 'c>, receiver: &Node<'a, 'b, 'c>) {
+	connect_nodes(sender, receiver);
+	for _ in 0..20 {
+		let mut progressed = false;
+		for (from, to) in [(sender, receiver), (receiver, sender)] {
+			for event in from.node.get_and_clear_pending_msg_events() {
+				progressed = true;
+				let from_id = from.node.get_our_node_id();
+				match event {
+					MessageSendEvent::SendChannelReestablish { msg, .. } => {
+						to.node.handle_channel_reestablish(from_id, &msg)
+					},
+					MessageSendEvent::SendChannelReady { msg, .. } => {
+						to.node.handle_channel_ready(from_id, &msg)
+					},
+					MessageSendEvent::SendRevokeAndACK { msg, .. } => {
+						to.node.handle_revoke_and_ack(from_id, &msg)
+					},
+					MessageSendEvent::SendAnnouncementSignatures { msg, .. } => {
+						to.node.handle_announcement_signatures(from_id, &msg)
+					},
+					MessageSendEvent::UpdateHTLCs { updates, .. } => {
+						assert!(updates.update_fulfill_htlcs.is_empty());
+						assert!(updates.update_fee.is_none());
+						for add in updates.update_add_htlcs {
+							to.node.handle_update_add_htlc(from_id, &add);
+						}
+						for fail in updates.update_fail_htlcs {
+							to.node.handle_update_fail_htlc(from_id, &fail);
+						}
+						for fail in updates.update_fail_malformed_htlcs {
+							to.node.handle_update_fail_malformed_htlc(from_id, &fail);
+						}
+						to.node.handle_commitment_signed_batch_test(
+							from_id,
+							&updates.commitment_signed,
+						);
+					},
+					MessageSendEvent::BroadcastChannelAnnouncement { .. }
+					| MessageSendEvent::BroadcastChannelUpdate { .. }
+					| MessageSendEvent::SendChannelUpdate { .. } => {},
+					other => panic!("Unexpected peer event during voucher unwind: {:?}", other),
+				}
+			}
+			if from.node.needs_pending_htlc_processing() {
+				from.node.process_pending_htlc_forwards();
+				progressed = true;
+			}
+			from.chain_monitor.added_monitors.lock().unwrap().clear();
+		}
+		assert!(receiver.node.get_and_clear_pending_events().is_empty());
+		if !progressed {
+			return;
+		}
+	}
+	panic!("Voucher unwind did not converge");
+}
+
+#[test]
+fn ffor_parking_crash_boundaries_preserve_identity_and_drain_stock_htlcs() {
+	// Registration, uncommitted add, first commitment, both commitments before interception,
+	// parked, explicit abort, failure commitment sent, and fully drained tombstone.
+	for crash_at in 0..8 {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let (persister, chain_monitor);
+		let config = anchor_config();
+		let node_chanmgrs =
+			create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config.clone())]);
+		let reloaded;
+		let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+		let sender_id = nodes[0].node.get_our_node_id();
+		let receiver_id = nodes[1].node.get_our_node_id();
+		let (update, voucher, _) = offer_voucher(&nodes[0], &nodes[1], 2_000_000);
+		register_book(&nodes[1], &nodes[0], channel_id, &[voucher]);
+		if crash_at >= 1 {
+			nodes[1].node.handle_update_add_htlc(sender_id, &update.update_add_htlcs[0]);
+		}
+		if crash_at == 2 {
+			nodes[1].node.handle_commitment_signed_batch_test(sender_id, &update.commitment_signed);
+			check_added_monitors(&nodes[1], 1);
+			let _undelivered = get_revoke_commit_msgs!(&nodes[1], sender_id);
+		}
+		if crash_at >= 3 {
+			commitment_signed_dance!(&nodes[1], &nodes[0], update.commitment_signed, false);
+		}
+		if crash_at >= 4 {
+			expect_and_process_pending_htlcs(&nodes[1], false);
+			assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+		}
+		if crash_at >= 5 {
+			nodes[1]
+				.node
+				.abort_ffor_receiver_book(&channel_id, &sender_id, RECEIVER_EPOCH)
+				.unwrap();
+		}
+		if crash_at == 6 {
+			let _undelivered = get_htlc_update_msgs!(&nodes[1], sender_id);
+			check_added_monitors(&nodes[1], 1);
+		}
+		if crash_at == 7 {
+			drain_voucher_failures(&nodes[0], &nodes[1], &[voucher.payment_hash]);
+		}
+		let monitor_encoded = get_monitor!(nodes[1], channel_id).encode();
+		let manager_encoded = nodes[1].node.encode();
+		nodes[0].node.peer_disconnected(receiver_id);
+		reload_node!(
+			nodes[1],
+			config,
+			&manager_encoded,
+			&[&monitor_encoded],
+			persister,
+			chain_monitor,
+			reloaded
+		);
+		assert_eq!(
+			nodes[1].node.register_ffor_receiver_book(
+				&channel_id,
+				&sender_id,
+				RECEIVER_EPOCH,
+				&[voucher]
+			),
+			Err(FFORReceiverError::AlreadyRegistered)
+		);
+		pump_ffor_reconnection(&nodes[0], &nodes[1]);
+		assert_eq!(
+			receiver_status(&nodes[1], &nodes[0], channel_id),
+			FFORReceiverStatus::Aborted {
+				reason: if crash_at >= 5 {
+					FFORReceiverAbortReason::Requested
+				} else {
+					FFORReceiverAbortReason::Restarted
+				},
+			},
+			"crash checkpoint {}",
+			crash_at
+		);
+		if crash_at != 7 {
+			expect_payment_failed!(&nodes[0], voucher.payment_hash, false);
+		}
+		// Both stock commitment sets have drained. The one-registration tombstone remains.
+		assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+		send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+	}
+}
+
+#[test]
+fn ffor_parking_serialization_requires_the_channel_compatibility_fence() {
+	use crate::ln::channel::FundedChannel;
+	use crate::types::features::ChannelTypeFeatures;
+	use crate::util::ser::ReadableArgs;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let config = anchor_config();
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	let serialize_channel = || {
+		let peers = nodes[1].node.per_peer_state.read().unwrap();
+		let peer = peers.get(&nodes[0].node.get_our_node_id()).unwrap().lock().unwrap();
+		peer.channel_by_id.get(&channel_id).unwrap().as_funded().unwrap().encode()
+	};
+	let ordinary = serialize_channel();
+	let voucher = FFORVoucher {
+		htlc_id: 0,
+		payment_hash: PaymentHash([1; 32]),
+		amount_msat: 2_000_000,
+		cltv_expiry: 200,
+	};
+	register_book(&nodes[1], &nodes[0], channel_id, &[voucher]);
+	let registered = serialize_channel();
+	let features = ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies();
+	let read_channel = |bytes: &[u8]| {
+		FundedChannel::read(
+			&mut &bytes[..],
+			(&nodes[1].keys_manager, &nodes[1].keys_manager, &features),
+		)
+	};
+	assert!(read_channel(&ordinary).is_ok());
+	assert!(read_channel(&registered).is_ok());
+	// This deliberately simple book contains no 0xfdfffe sequence itself, so the last occurrence
+	// is the channel's required type. Model a reader that does not recognize that even type.
+	let mut unknown = registered.clone();
+	let offset = unknown.windows(3).rposition(|bytes| bytes == [0xfd, 0xff, 0xfe]).unwrap();
+	unknown[offset + 2] = 0xfc;
+	assert!(matches!(read_channel(&unknown), Err(msgs::DecodeError::UnknownRequiredFeature)));
+	if let Ok(directory) = std::env::var("FFOR_LEGACY_FIXTURE_DIR") {
+		std::fs::write(std::path::Path::new(&directory).join("ordinary-channel.bin"), &ordinary)
+			.unwrap();
+		std::fs::write(
+			std::path::Path::new(&directory).join("registered-channel.bin"),
+			&registered,
+		)
+		.unwrap();
+	}
+}
+
+#[test]
+fn ffor_parking_waits_for_both_rounds_and_monitor_completion() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let config = anchor_config();
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	let sender_id = nodes[0].node.get_our_node_id();
+	let receiver_id = nodes[1].node.get_our_node_id();
+	let (update, voucher, _) = offer_voucher(&nodes[0], &nodes[1], 2_000_000);
+	register_book(&nodes[1], &nodes[0], channel_id, &[voucher]);
+	let assert_unparked = || {
+		assert_eq!(
+			receiver_status(&nodes[1], &nodes[0], channel_id),
+			FFORReceiverStatus::Registered { parked_vouchers: 0, total_vouchers: 1 }
+		);
+		assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+	};
+	nodes[1].node.handle_update_add_htlc(sender_id, &update.update_add_htlcs[0]);
+	assert_unparked();
+	nodes[1].node.handle_commitment_signed_batch_test(sender_id, &update.commitment_signed);
+	check_added_monitors(&nodes[1], 1);
+	let (revoke, commitment) = get_revoke_commit_msgs!(&nodes[1], sender_id);
+	assert_unparked();
+	nodes[0].node.handle_revoke_and_ack(receiver_id, &revoke);
+	check_added_monitors(&nodes[0], 1);
+	nodes[0].node.handle_commitment_signed_batch_test(receiver_id, &commitment);
+	check_added_monitors(&nodes[0], 1);
+	let revoke = get_event_msg!(&nodes[0], MessageSendEvent::SendRevokeAndACK, receiver_id);
+	assert_unparked();
+	chanmon_cfgs[1].persister.set_update_ret(ChannelMonitorUpdateStatus::InProgress);
+	nodes[1].node.handle_revoke_and_ack(sender_id, &revoke);
+	check_added_monitors(&nodes[1], 1);
+	assert_unparked();
+	chanmon_cfgs[1].persister.set_update_ret(ChannelMonitorUpdateStatus::Completed);
+	let update_id = get_monitor!(nodes[1], channel_id).get_latest_update_id();
+	nodes[1].chain_monitor.chain_monitor.channel_monitor_updated(channel_id, update_id).unwrap();
+	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+	assert!(matches!(
+		receiver_status(&nodes[1], &nodes[0], channel_id),
+		FFORReceiverStatus::Parked { .. }
+	));
+}
+
+#[test]
+fn ffor_parking_multiple_rounds_and_extra_add_abort_the_entire_book() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let config = anchor_config();
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	let (first_update, first, _) = offer_voucher(&nodes[0], &nodes[1], 2_000_000);
+	let (mut route, second_hash, _, secret) =
+		get_route_and_payment_hash!(&nodes[0], &nodes[1], 3_000_000);
+	route.paths[0].hops[0].cltv_expiry_delta = 144;
+	let second = FFORVoucher {
+		htlc_id: first.htlc_id + 1,
+		payment_hash: second_hash,
+		amount_msat: 3_000_000,
+		..first
+	};
+	register_book(&nodes[1], &nodes[0], channel_id, &[first, second]);
+	deliver_parked_voucher(&nodes[0], &nodes[1], first_update);
+	assert_eq!(
+		receiver_status(&nodes[1], &nodes[0], channel_id),
+		FFORReceiverStatus::Registered { parked_vouchers: 1, total_vouchers: 2 }
+	);
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			second_hash,
+			RecipientOnionFields::secret_only(secret),
+			PaymentId(second_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+	let second_update = get_htlc_update_msgs!(&nodes[0], nodes[1].node.get_our_node_id());
+	deliver_parked_voucher(&nodes[0], &nodes[1], second_update);
+	assert!(matches!(
+		receiver_status(&nodes[1], &nodes[0], channel_id),
+		FFORReceiverStatus::Parked { .. }
+	));
+	let (extra, _, _) = offer_voucher(&nodes[0], &nodes[1], 1_000_000);
+	nodes[1]
+		.node
+		.handle_update_add_htlc(nodes[0].node.get_our_node_id(), &extra.update_add_htlcs[0]);
+	// Abort queues the older, committed vouchers even while this extra add is still in flight.
+	// Use the same real message pump after disconnect to exercise their combined unwind safely.
+	nodes[1].node.handle_commitment_signed_batch_test(
+		nodes[0].node.get_our_node_id(),
+		&extra.commitment_signed,
+	);
+	nodes[0].node.peer_disconnected(nodes[1].node.get_our_node_id());
+	nodes[1].node.peer_disconnected(nodes[0].node.get_our_node_id());
+	pump_ffor_reconnection(&nodes[0], &nodes[1]);
+	assert_eq!(
+		receiver_status(&nodes[1], &nodes[0], channel_id),
+		FFORReceiverStatus::Aborted { reason: FFORReceiverAbortReason::VoucherMismatch }
+	);
+	let events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(
+		events
+			.iter()
+			.filter(|event| matches!(event, crate::events::Event::PaymentFailed { .. }))
+			.count(),
+		3
+	);
+	assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
 }

@@ -2974,6 +2974,8 @@ where
 	holding_cell_update_fee: Option<u32>,
 	next_holder_htlc_id: u64,
 	pub(super) next_counterparty_htlc_id: u64,
+	// Required serialized compatibility fence whenever experimental voucher parking is used.
+	ffor_receiver_book: Option<ffor::FFORReceiverBook>,
 	pub(super) feerate_per_kw: u32,
 
 	/// The timestamp set on our latest `channel_update` message for this channel. It is updated
@@ -3649,6 +3651,7 @@ where
 			holding_cell_update_fee: None,
 			next_holder_htlc_id: 0,
 			next_counterparty_htlc_id: 0,
+			ffor_receiver_book: None,
 			update_time_counter: 1,
 
 			resend_order: RAACommitmentOrder::CommitmentFirst,
@@ -3887,6 +3890,7 @@ where
 			holding_cell_update_fee: None,
 			next_holder_htlc_id: 0,
 			next_counterparty_htlc_id: 0,
+			ffor_receiver_book: None,
 			update_time_counter: 1,
 
 			resend_order: RAACommitmentOrder::CommitmentFirst,
@@ -7788,6 +7792,7 @@ where
 			.try_for_each(|funding| self.context.validate_update_add_htlc(funding, msg, fee_estimator))?;
 
 		// Now update local state:
+		self.ffor_record_update_add(msg);
 		self.context.next_counterparty_htlc_id += 1;
 		self.context.pending_inbound_htlcs.push(InboundHTLCOutput {
 			htlc_id: msg.htlc_id,
@@ -9281,6 +9286,10 @@ where
 		assert!(!matches!(self.context.channel_state, ChannelState::ShutdownComplete));
 		if !self.context.can_resume_on_reconnect() {
 			return Err(())
+		}
+
+		if let Some(book) = self.context.ffor_receiver_book.as_mut() {
+			book.abort(crate::ln::ffor::FFORReceiverAbortReason::Disconnected);
 		}
 
 		// We only clear `peer_disconnected` if we were able to reestablish the channel. We always
@@ -14930,6 +14939,8 @@ where
 			(65, self.quiescent_action, option), // Added in 0.2
 			(67, pending_outbound_held_htlc_flags, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags, optional_vec), // Added in 0.2
+			// Experimental required field: old readers must refuse the entire parked channel.
+			(65534, self.context.ffor_receiver_book, option),
 		});
 
 		Ok(())
@@ -15297,6 +15308,7 @@ where
 
 		let mut pending_outbound_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
 		let mut holding_cell_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
+		let mut ffor_receiver_book: Option<ffor::FFORReceiverBook> = None;
 
 		read_tlv_fields!(reader, {
 			(0, announcement_sigs, option),
@@ -15344,7 +15356,12 @@ where
 			(65, quiescent_action, upgradable_option), // Added in 0.2
 			(67, pending_outbound_held_htlc_flags_opt, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags_opt, optional_vec), // Added in 0.2
+			(65534, ffor_receiver_book, option),
 		});
+
+		if let Some(book) = ffor_receiver_book.as_mut() {
+			book.restored(&pending_inbound_htlcs)?;
+		}
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
 
@@ -15673,6 +15690,7 @@ where
 				holding_cell_update_fee,
 				next_holder_htlc_id,
 				next_counterparty_htlc_id,
+				ffor_receiver_book,
 				update_time_counter,
 				feerate_per_kw,
 

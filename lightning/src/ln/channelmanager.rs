@@ -66,8 +66,8 @@ use crate::ln::channel::{
 };
 use crate::ln::channel_state::ChannelDetails;
 use crate::ln::ffor::{
-	FFORCommitmentError, FFORMonitorSnapshot, FFORSettlementParty, FFORVoucher,
-	FFORVoucherCommitments,
+	FFORCommitmentError, FFORMonitorSnapshot, FFORReceiverError, FFORReceiverStatus,
+	FFORSettlementParty, FFORVoucher, FFORVoucherCommitments,
 };
 use crate::ln::funding::SpliceContribution;
 use crate::ln::inbound_payment;
@@ -4300,6 +4300,89 @@ where
 		channel.ffor_voucher_commitments(settlement_party, vouchers, monitor, &self.logger)
 	}
 
+	/// Register an authenticated Variant D voucher book for experimental receiver-side parking.
+	///
+	/// The channel must be connected, synchronized, empty, and use a supported anchor channel type.
+	/// The first voucher must use the peer's exact next incoming HTLC ID. Matching vouchers are kept
+	/// out of ordinary payment processing, including `PaymentClaimable` and forwarding events.
+	/// The caller is responsible for authenticating the epoch and persisting the manager before
+	/// instructing the peer to send vouchers. This method requests persistence but does not await it.
+	///
+	/// This is a private experimental protocol boundary, with no feature advertisement or activation.
+	/// It does not freeze commitment updates or authorize invoices. Disconnects and restarts abort
+	/// the registration and fail its vouchers using the ordinary channel commitment protocol.
+	/// Only one registration is supported for the lifetime of a channel, even after abort. Its
+	/// permanent tombstone prevents epoch reuse until a future durable epoch-history design exists.
+	/// Serialized channels using this API require a reader that understands voucher parking.
+	pub fn register_ffor_receiver_book(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		vouchers: &[FFORVoucher],
+	) -> Result<(), FFORReceiverError> {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let mut peer = per_peer_state
+			.get(counterparty_node_id)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?
+			.lock()
+			.unwrap();
+		let channel = peer
+			.channel_by_id
+			.get_mut(channel_id)
+			.and_then(Channel::as_funded_mut)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
+		channel.register_ffor_receiver_book(epoch_id, vouchers)
+	}
+
+	/// Inspect an experimental receiver registration. `Parked` requires the complete two-view
+	/// commitment proof, including completed monitor updates and valid holder claim signatures.
+	///
+	/// Obtain `monitor` from [`ChannelMonitor::ffor_commitment_snapshot`] and release its monitor
+	/// lock before calling this method, just as for [`Self::ffor_voucher_commitments`]. The result
+	/// does not freeze the channel or establish durable activation. It never authorizes an invoice.
+	pub fn ffor_receiver_book_status(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+		monitor: &FFORMonitorSnapshot,
+	) -> Result<FFORReceiverStatus, FFORReceiverError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer = per_peer_state
+			.get(counterparty_node_id)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?
+			.lock()
+			.unwrap();
+		let channel = peer
+			.channel_by_id
+			.get(channel_id)
+			.and_then(Channel::as_funded)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
+		channel.ffor_receiver_book_status(monitor, &self.logger)
+	}
+
+	/// Irreversibly abort an experimental receiver registration and unwind its stock voucher HTLCs.
+	///
+	/// Continue normal event and peer-message processing until status is `Aborted`. HTLCs in partial
+	/// commitment rounds are failed only after those rounds finish. A disconnect or restart retains
+	/// the abort and resumes the unwind on reconnection. Ordinary payments can proceed after drain,
+	/// but further FFOR registrations on this channel remain refused, including a different epoch.
+	pub fn abort_ffor_receiver_book(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+	) -> Result<(), FFORReceiverError> {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let mut peer = per_peer_state
+			.get(counterparty_node_id)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?
+			.lock()
+			.unwrap();
+		let channel = peer
+			.channel_by_id
+			.get_mut(channel_id)
+			.and_then(Channel::as_funded_mut)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
+		channel.abort_ffor_receiver_book(epoch_id)?;
+		channel.ffor_queue_aborted_vouchers(&self.logger);
+		Ok(())
+	}
+
 	/// Gets the list of channels we have with a given counterparty, in random order.
 	pub fn list_channels_with_counterparty(
 		&self, counterparty_node_id: &PublicKey,
@@ -6974,6 +7057,31 @@ where
 			let mut htlc_forwards = Vec::new();
 			let mut htlc_fails = Vec::new();
 			for update_add_htlc in &update_add_htlcs {
+				let is_voucher = self.do_funded_channel_callback(incoming_scid_alias, |chan| {
+					chan.ffor_owns_received_htlc(update_add_htlc.htlc_id)
+				});
+				if is_voucher == Some(true) {
+					// Voucher identity belongs to the channel. Do not decode its payload into an
+					// ordinary payment, even after abort or restart. Only derive unwind material.
+					match crate::ln::ffor::voucher_failure(update_add_htlc, &*self.node_signer) {
+						Ok(failure) => {
+							self.do_funded_channel_callback(incoming_scid_alias, |chan| {
+								chan.ffor_park_received_htlc(
+									update_add_htlc.htlc_id,
+									failure.clone(),
+								);
+							});
+						},
+						Err(()) => {
+							// A temporarily unavailable signer cannot turn a voucher into a payment.
+							self.push_decode_update_add_htlcs((
+								incoming_scid_alias,
+								vec![update_add_htlc.clone()],
+							));
+						},
+					}
+					continue;
+				}
 				let (next_hop, next_packet_details_opt) =
 					match decode_incoming_update_add_htlc_onion(
 						&update_add_htlc,
@@ -12233,6 +12341,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						}) {
 						let counterparty_node_id = chan.context.get_counterparty_node_id();
 						let funding_txo = chan.funding.get_funding_txo();
+						chan.ffor_queue_aborted_vouchers(&self.logger);
 						let (monitor_opt, holding_cell_failed_htlcs) = chan
 							.maybe_free_holding_cell_htlcs(
 								&self.fee_estimator,
@@ -17234,6 +17343,13 @@ where
 			(21, async_receive_offer_cache, (default_value, async_receive_offer_cache)),
 		});
 		let mut decode_update_add_htlcs = decode_update_add_htlcs.unwrap_or_else(|| new_hash_map());
+		for peer in per_peer_state.values() {
+			for channel in peer.lock().unwrap().channel_by_id.values().filter_map(Channel::as_funded) {
+				let deferred_adds = decode_update_add_htlcs.get(&channel.context.outbound_scid_alias())
+					.map(Vec::as_slice).unwrap_or(&[]);
+				channel.ffor_validate_unwind_material(deferred_adds)?;
+			}
+		}
 		let peer_storage_dir: Vec<(PublicKey, Vec<u8>)> = peer_storage_dir.unwrap_or_else(Vec::new);
 		if fake_scid_rand_bytes.is_none() {
 			fake_scid_rand_bytes = Some(args.entropy_source.get_secure_random_bytes());
