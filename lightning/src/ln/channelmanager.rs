@@ -65,6 +65,10 @@ use crate::ln::channel::{
 	WithChannelContext,
 };
 use crate::ln::channel_state::ChannelDetails;
+use crate::ln::ffor::{
+	FFORCommitmentError, FFORMonitorSnapshot, FFORSettlementParty, FFORVoucher,
+	FFORVoucherCommitments,
+};
 use crate::ln::funding::SpliceContribution;
 use crate::ln::inbound_payment;
 use crate::ln::interactivetxs::InteractiveTxMessageSend;
@@ -4260,6 +4264,40 @@ where
 		// internal/external nomenclature, but that's ok cause that's probably what the user
 		// really wanted anyway.
 		self.list_funded_channels_with_filter(|&(_, _, ref channel)| channel.context().is_live())
+	}
+
+	/// Verifies that both current commitments contain exactly the supplied Variant D voucher book.
+	///
+	/// Vouchers must be in slot order, with consecutive settlement-peer HTLC IDs, unique hashes and
+	/// a uniform expiry. Both commitment rounds must be complete, with no other HTLCs, trimmed
+	/// vouchers, pending fee updates, signer operations, monitor persistence, or splices. The method
+	/// rebuilds both transactions and verifies the monitor's holder commitment and HTLC signatures.
+	///
+	/// Obtain `monitor` from [`ChannelMonitor::ffor_commitment_snapshot`] and release any monitor
+	/// guard before calling this method. Stale update IDs or transaction identities are rejected.
+	/// Completed persistence relies on the application's correct [`Watch`] implementation.
+	///
+	/// This is a read-only, point-in-time check. It does not authenticate the supplied book, park
+	/// HTLCs, freeze the channel, or activate an epoch. It never authorizes invoice exposure or
+	/// preimage release. Future durable activation must recheck state while serializing channel
+	/// updates under the same authority.
+	pub fn ffor_voucher_commitments(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+		settlement_party: FFORSettlementParty, vouchers: &[FFORVoucher],
+		monitor: &FFORMonitorSnapshot,
+	) -> Result<FFORVoucherCommitments, FFORCommitmentError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer = per_peer_state
+			.get(counterparty_node_id)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?
+			.lock()
+			.unwrap();
+		let channel = peer
+			.channel_by_id
+			.get(channel_id)
+			.and_then(Channel::as_funded)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
+		channel.ffor_voucher_commitments(settlement_party, vouchers, monitor, &self.logger)
 	}
 
 	/// Gets the list of channels we have with a given counterparty, in random order.

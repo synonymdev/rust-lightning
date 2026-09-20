@@ -99,6 +99,8 @@ use core::{cmp, fmt, mem};
 
 use super::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
 
+mod ffor;
+
 #[cfg(any(test, feature = "_test_utils"))]
 #[allow(unused)]
 pub struct ChannelValueStat {

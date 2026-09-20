@@ -56,6 +56,7 @@ use crate::ln::channel_keys::{
 	RevocationKey,
 };
 use crate::ln::channelmanager::{HTLCSource, PaymentClaimDetails, SentHTLCId};
+use crate::ln::ffor::{FFORCommitmentError, FFORMonitorSnapshot};
 use crate::ln::msgs::DecodeError;
 use crate::ln::types::ChannelId;
 use crate::sign::{
@@ -2102,6 +2103,45 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// Note that for channels closed prior to LDK 0.1, this may return [`u64::MAX`].
 	pub fn get_latest_update_id(&self) -> u64 {
 		self.inner.lock().unwrap().get_latest_update_id()
+	}
+
+	/// Captures canonical commitment identities and signed claim material for FFOR verification.
+	///
+	/// Release any [`ChainMonitor::get_monitor`] guard before passing the result to
+	/// [`ChannelManager::ffor_voucher_commitments`], so no monitor lock is held while acquiring the
+	/// manager's channel lock. The manager rejects snapshots that do not match its current state.
+	/// This snapshot alone neither proves completed persistence nor activates offline receiving.
+	///
+	/// [`ChainMonitor::get_monitor`]: crate::chain::chainmonitor::ChainMonitor::get_monitor
+	/// [`ChannelManager::ffor_voucher_commitments`]: crate::ln::channelmanager::ChannelManager::ffor_voucher_commitments
+	pub fn ffor_commitment_snapshot(&self) -> Result<FFORMonitorSnapshot, FFORCommitmentError> {
+		let inner = self.inner.lock().unwrap();
+		if inner.funding_spend_seen || inner.lockdown_from_offchain || inner.holder_tx_signed {
+			return Err(FFORCommitmentError::ChannelUnavailable);
+		}
+		if !inner.pending_funding.is_empty() {
+			return Err(FFORCommitmentError::PendingUpdates);
+		}
+		let counterparty_txid = inner
+			.funding
+			.current_counterparty_commitment_txid
+			.ok_or(FFORCommitmentError::MonitorMismatch)?;
+		let htlcs = inner
+			.funding
+			.counterparty_claimable_outpoints
+			.get(&counterparty_txid)
+			.ok_or(FFORCommitmentError::MonitorMismatch)?;
+		Ok(FFORMonitorSnapshot {
+			channel_id: inner.channel_id(),
+			funding_txo: inner.get_funding_txo(),
+			update_id: inner.latest_update_id,
+			holder: inner.funding.current_holder_commitment_tx.clone(),
+			holder_number: inner.current_holder_commitment_number,
+			counterparty_txid,
+			counterparty_number: inner.current_counterparty_commitment_number,
+			counterparty_htlcs: htlcs.iter().map(|(htlc, _)| htlc.clone()).collect(),
+			revoked_through: inner.commitment_secrets.get_min_seen_secret(),
+		})
 	}
 
 	/// Gets the funding transaction outpoint of the channel this ChannelMonitor is monitoring for.
