@@ -124,7 +124,7 @@ impl FFORRecoveryRegistry {
 		}) {
 			return Err(FFORRecoveryError::ConflictingRecord);
 		}
-		let header_bytes = if self.version() == REQUEST_VERSION { 0 } else { 2 };
+		let header_bytes = if self.version() >= REQUEST_VERSION { 0 } else { 2 };
 		self.check_capacity(pending.encoded_bytes + header_bytes, pending.reserved_bytes())?;
 		Ok(FFORRequestInsertion { registry: self, entry: pending, header_bytes })
 	}
@@ -152,6 +152,7 @@ impl FFORRecoveryRegistry {
 			canonical_book: authenticated.canonical_book().to_vec(),
 			activation: None,
 			request: Some(request.clone()),
+			witnesses: None,
 		})?;
 		// Both forms were charged the full record allowance before Init. Promotion cannot increase
 		// total used plus reserved bytes, and the borrowed permit prevents a conflicting insertion.

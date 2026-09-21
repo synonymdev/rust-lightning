@@ -11,6 +11,7 @@ use lightning_ffor::wire::{Activate, Tlv};
 
 mod aborted;
 mod close;
+pub(in crate::ln::ffor_recovery) mod witness;
 
 // Synthetic transaction identities exercise archive authentication only. Real monitor and
 // channel evidence are exercised by the manager tests; these values never activate a channel.
@@ -353,6 +354,7 @@ fn ffor_activation_archive_reserves_maximum_ack_through_competing_admission_and_
 	let (extra_setup, extra_activation) = evidence_for_identity(91, true);
 	let extra = crate::ln::ffor_recovery::Entry::new(crate::ln::ffor_recovery::StoredSetup {
 		request: None,
+		witnesses: None,
 		canonical_book: extra_setup.validate_recovery().unwrap().canonical_book().to_vec(),
 		setup: extra_setup,
 		activation: Some(extra_activation),

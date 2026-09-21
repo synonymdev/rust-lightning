@@ -37,6 +37,9 @@ pub use context::{FFORReceiverActiveContext, FFORReceiverRecoveryContext};
 mod witness;
 pub use witness::{decrypt_ffor_witness_record, FFORWitnessDecryptionError, FFORWitnessReceipt};
 
+mod provision;
+pub use provision::{FFORReceiverWitnessRegistration, FFORRegisteredWitness};
+
 /// Which channel participant offers every voucher HTLC in the book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FFORSettlementParty {
@@ -155,6 +158,8 @@ pub enum FFORReceiverError {
 	RecoveryUnavailable,
 	/// The node signer could not supply an authentic signature for the prepared transition.
 	SignerUnavailable,
+	/// Witness selection or exact manifest bytes differ from the native epoch or registration.
+	InvalidWitnessRegistration,
 }
 
 impl From<FFORCommitmentError> for FFORReceiverError {
@@ -173,6 +178,7 @@ impl fmt::Display for FFORReceiverError {
 			Self::PersistenceUnavailable => f.write_str("FFOR persistence revision exhausted"),
 			Self::RecoveryUnavailable => f.write_str("FFOR recovery record cannot be retained"),
 			Self::SignerUnavailable => f.write_str("FFOR node signature unavailable"),
+			Self::InvalidWitnessRegistration => f.write_str("invalid FFOR witness registration"),
 		}
 	}
 }

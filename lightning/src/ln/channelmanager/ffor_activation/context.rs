@@ -157,6 +157,18 @@ where
 	pub(in crate::ln::channelmanager) fn ffor_active_context_locked(
 		&self, channel: &FundedChannel<SP>, recovery: &FFORRecoveryRegistry, key: &FFORRecoveryKey,
 	) -> Result<FFORReceiverActiveContext, FFORReceiverError> {
+		let context = self.ffor_active_state_locked(channel, recovery, key)?;
+		let runtime = self.ffor_activation.lock().unwrap();
+		let requirement = &runtime.get(key)?.requirement;
+		if !self.ffor_persistence.lock().unwrap().is_complete(requirement) {
+			return Err(FFORCommitmentError::PendingUpdates.into());
+		}
+		Ok(FFORReceiverActiveContext { recovery: context, requirement: requirement.clone() })
+	}
+
+	pub(super) fn ffor_active_state_locked(
+		&self, channel: &FundedChannel<SP>, recovery: &FFORRecoveryRegistry, key: &FFORRecoveryKey,
+	) -> Result<FFORReceiverRecoveryContext, FFORReceiverError> {
 		channel
 			.ffor_validate_receiver_identity(self.our_network_pubkey, self.chain_hash)
 			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
@@ -191,12 +203,7 @@ where
 			) {
 			return Err(FFORCommitmentError::PendingUpdates.into());
 		}
-		let runtime = self.ffor_activation.lock().unwrap();
-		let requirement = &runtime.get(key)?.requirement;
-		if !self.ffor_persistence.lock().unwrap().is_complete(requirement) {
-			return Err(FFORCommitmentError::PendingUpdates.into());
-		}
-		Ok(FFORReceiverActiveContext { recovery: context, requirement: requirement.clone() })
+		Ok(context)
 	}
 }
 

@@ -25,7 +25,15 @@ fn sign(message: &mut FFORMessage, node: &Node) {
 }
 
 /// Reserve two actual outgoing payment hashes before delivering either voucher to the receiver.
-pub(super) fn park_two(sender: &Node, receiver: &Node, id: ChannelId) -> ([FFORVoucher; 2], PaymentPreimage) {
+pub(super) fn park_two(
+	sender: &Node, receiver: &Node, id: ChannelId,
+) -> ([FFORVoucher; 2], PaymentPreimage) {
+	park_two_with_witnesses(sender, receiver, id, None)
+}
+
+pub(super) fn park_two_with_witnesses(
+	sender: &Node, receiver: &Node, id: ChannelId, witnesses: Option<Vec<PublicKey>>,
+) -> ([FFORVoucher; 2], PaymentPreimage) {
 	let preimage = PaymentPreimage([*receiver.network_payment_count.as_ref().borrow(); 32]);
 	let (first, voucher, _) = offer_voucher(sender, receiver, 2_000_000);
 	let (mut route, hash, _, secret) = get_route_and_payment_hash!(sender, receiver, 2_000_000);
@@ -34,6 +42,7 @@ pub(super) fn park_two(sender: &Node, receiver: &Node, id: ChannelId) -> ([FFORV
 		FFORVoucher { htlc_id: voucher.htlc_id + 1, payment_hash: hash, ..voucher };
 	let (mut init, mut accept) = ffor_setup_test_messages(sender, receiver, id, voucher);
 	if let Payload::Init(terms) = &mut init.payload {
+		terms.witness_peers = witnesses;
 		terms.budget_msat += second_voucher.amount_msat;
 		terms.amounts_msat.push(second_voucher.amount_msat);
 	} else {

@@ -13,6 +13,7 @@ mod close;
 mod context;
 mod driver;
 mod reestablish;
+mod witness;
 
 struct RuntimeEntry {
 	key: FFORRecoveryKey,

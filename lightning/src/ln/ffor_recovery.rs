@@ -6,6 +6,7 @@
 
 mod request;
 use request::PendingRequest;
+mod witness;
 
 mod activation;
 pub(crate) use activation::{FFORReceiverActivation, FFORReceiverCloseRecord};
@@ -16,7 +17,9 @@ use bitcoin::secp256k1::PublicKey;
 
 use crate::io;
 use crate::ln::channel::{FFORReceiverFencePhase, FFORReceiverSetup};
-use crate::ln::ffor::{FFORMonitorRecoveryIdentity, FFORReceiverAbortReason};
+use crate::ln::ffor::{
+	FFORMonitorRecoveryIdentity, FFORReceiverAbortReason, FFORReceiverWitnessRegistration,
+};
 use crate::ln::msgs::DecodeError;
 use crate::ln::types::ChannelId;
 use crate::util::ser::{FixedLengthReader, Readable, Writeable, Writer};
@@ -28,6 +31,8 @@ const ACTIVATION_VERSION: u8 = 1;
 const ABORTED_ACTIVATION_VERSION: u8 = 2;
 const CLOSE_VERSION: u8 = 3;
 const REQUEST_VERSION: u8 = 4;
+// Earlier readers must not forget protected application key and manifest ownership.
+const WITNESS_VERSION: u8 = 5;
 const MAX_RECORDS: usize = 64;
 const MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
 // Two maximum wire messages, a 483-slot canonical book, and fixed admission fields fit here.
@@ -61,6 +66,7 @@ struct StoredSetup {
 	canonical_book: Vec<u8>,
 	activation: Option<FFORReceiverActivation>,
 	request: Option<crate::ln::channel::FFORReceiverRequest>,
+	witnesses: Option<FFORReceiverWitnessRegistration>,
 }
 
 impl_writeable_tlv_based!(StoredSetup, {
@@ -68,6 +74,7 @@ impl_writeable_tlv_based!(StoredSetup, {
 	(2, canonical_book, required_vec),
 	(4, activation, option),
 	(6, request, option),
+	(8, witnesses, option),
 });
 
 struct Entry {
@@ -96,6 +103,15 @@ impl Entry {
 					.validate(&record.setup, hash)
 					.map_err(|_| FFORRecoveryError::InvalidRecord)?;
 			}
+		}
+		if let Some(witnesses) = record.witnesses.as_ref() {
+			let context = record
+				.activation
+				.as_ref()
+				.ok_or(FFORRecoveryError::InvalidRecord)?
+				.receiver_context(&record.setup)
+				.map_err(|_| FFORRecoveryError::InvalidRecord)?;
+			witnesses.validate(&context).map_err(|_| FFORRecoveryError::InvalidRecord)?;
 		}
 		let header = authenticated.header();
 		let encoded_bytes = record.serialized_length();
@@ -375,6 +391,7 @@ impl FFORRecoveryRegistry {
 			canonical_book: authenticated.canonical_book().to_vec(),
 			activation: None,
 			request: None,
+			witnesses: None,
 		})?;
 		if self.pending_requests.iter().any(|pending| {
 			pending.key.channel_id == entry.key.channel_id
@@ -408,11 +425,13 @@ impl FFORRecoveryRegistry {
 			epoch_id: authenticated.header().epoch_id,
 		};
 		let request = self.get_request(&key).cloned();
+		let witnesses = self.get_witnesses(&key).cloned();
 		let entry = Entry::new(StoredSetup {
 			setup: setup.clone(),
 			canonical_book: authenticated.canonical_book().to_vec(),
 			activation: Some(activation.clone()),
 			request,
+			witnesses,
 		})?;
 		let index = self
 			.entries
@@ -427,10 +446,18 @@ impl FFORRecoveryRegistry {
 			} {
 			return Err(FFORRecoveryError::ConflictingRecord);
 		}
+		self.prepare_replacement(index, entry, 0)
+	}
+
+	fn prepare_replacement(
+		&mut self, index: usize, entry: Entry, header_growth: usize,
+	) -> Result<FFORRecoveryUpgrade<'_>, FFORRecoveryError> {
+		let existing = &self.entries[index];
 		let total_bytes = self
 			.encoded_bytes
 			.checked_sub(existing.encoded_bytes)
 			.and_then(|bytes| bytes.checked_add(entry.encoded_bytes))
+			.and_then(|bytes| bytes.checked_add(header_growth))
 			.ok_or(FFORRecoveryError::CapacityExceeded)?;
 		let reserved_transition_bytes = self
 			.reserved_transition_bytes
@@ -453,6 +480,9 @@ impl FFORRecoveryRegistry {
 	}
 
 	fn version(&self) -> u8 {
+		if self.entries.iter().any(|entry| entry.record.witnesses.is_some()) {
+			return WITNESS_VERSION;
+		}
 		if !self.pending_requests.is_empty()
 			|| self.entries.iter().any(|entry| entry.record.request.is_some())
 		{
@@ -508,7 +538,7 @@ impl Writeable for FFORRecoveryRegistry {
 			(entry.encoded_bytes as u32).write(writer)?;
 			entry.record.write(writer)?;
 		}
-		if self.version() == REQUEST_VERSION {
+		if self.version() >= REQUEST_VERSION {
 			(self.pending_requests.len() as u16).write(writer)?;
 			for entry in &self.pending_requests {
 				(entry.encoded_bytes as u32).write(writer)?;
@@ -527,6 +557,7 @@ impl Readable for FFORRecoveryRegistry {
 			&& version != ABORTED_ACTIVATION_VERSION
 			&& version != CLOSE_VERSION
 			&& version != REQUEST_VERSION
+			&& version != WITNESS_VERSION
 		{
 			return Err(DecodeError::UnknownRequiredFeature);
 		}
@@ -535,7 +566,7 @@ impl Readable for FFORRecoveryRegistry {
 			return Err(DecodeError::InvalidValue);
 		}
 		let mut registry = Self::new();
-		if version == REQUEST_VERSION {
+		if version >= REQUEST_VERSION {
 			registry.encoded_bytes += 2;
 		}
 		for _ in 0..count {
@@ -566,7 +597,7 @@ impl Readable for FFORRecoveryRegistry {
 			registry.reserved_transition_bytes += entry.reserved_transition_bytes();
 			registry.entries.push(entry);
 		}
-		if version == REQUEST_VERSION {
+		if version >= REQUEST_VERSION {
 			let count = u16::read(reader)? as usize;
 			if registry.entries.len() + count > MAX_RECORDS {
 				return Err(DecodeError::InvalidValue);
@@ -612,3 +643,6 @@ impl Readable for FFORRecoveryRegistry {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+pub(crate) use activation::tests::witness::manifests as ffor_test_witness_manifests;

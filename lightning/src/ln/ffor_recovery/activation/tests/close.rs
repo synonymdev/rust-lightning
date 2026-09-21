@@ -64,7 +64,7 @@ fn close_ack(
 	)
 }
 
-fn phases(maximum: bool) -> (FFORReceiverSetup, Vec<FFORReceiverActivation>) {
+pub(super) fn phases(maximum: bool) -> (FFORReceiverSetup, Vec<FFORReceiverActivation>) {
 	let (setup, activating) = evidence(maximum);
 	let active =
 		activating.with_ack(&setup, &acknowledgement(&setup, &activating, maximum)).unwrap();

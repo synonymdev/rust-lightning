@@ -255,6 +255,28 @@ not authorize later work; the future driver must recheck under its transition lo
 A retained Active phase can outlive the settlement deadline, so neither context grants
 provisioning permission or invoice readiness.
 
+Native witness registration now retains one immutable selection of one through four
+witnesses before provisioning. The protected application store must first reserve
+its recovery keys, exact signed manifests and receipt capacity. Registration compares
+those manifests to the actual Active epoch, acknowledgement, frozen pair and current
+settlement deadline. It stores compact public parameters, signatures and exact manifest
+digests, reconstructing the canonical book from native history during validation.
+Witness restrictions, separate mailbox/fetch identities and distinct fetch/encryption
+keys are enforced. Exact retries retain the same selection and persistence requirement;
+changed manifests or keys are refused. Required archive field 8 and schema 5 prevent
+older readers from forgetting this ownership, including after channel removal.
+
+Provision release requires a newly captured Active context after registration
+persistence. The manager holds the actual settlement channel, archive, current height
+and persistence locks while validating the exact typed Provision and invoking its
+bounded enqueue callback. The callback must atomically check the authenticated witness
+transport token and capacity, perform no I/O and acquire no native or store locks.
+Settlement-peer connectivity is unnecessary. Backpressure permits exact request retry;
+queue acceptance proves neither delivery nor witness acknowledgement. Restore requires
+a fresh manager write and rejects an earlier instance's context. Historical registration
+metadata remains inspectable after close or force-close, so missing sidecar keys cannot
+be treated as permission to create a replacement selection. No invoice authority follows.
+
 These are consistency checks, not an authenticated storage envelope. Arbitrarily
 deleting a mismatching add's ownership record after abort can make its nonreserved
 hash indistinguishable from an ordinary post-abort payment. No valid writer creates
@@ -367,6 +389,14 @@ Native witness tests use four pinned Beignet records to compare ECDH, HKDF, plai
 preimages; they reject signed ciphertext, ephemeral-key, AAD, manifest and plaintext-term
 substitution. The shared crate separately covers all six reference scenarios and arbitrary
 body bytes. These tests do not exercise production witness transport or key storage.
+
+Eight witness-registration tests cover both funders, missing acknowledgements, pending
+manager and monitor writes, exact/reordered retries, stale manager contexts, disconnected
+settlement peers, deadline crossings, conflicting reconnects and close refusal. Archive
+checks cover compact four-witness ownership for a 483-slot book, remaining terminal
+capacity, corrupted metadata, key reuse, missing required evidence and version downgrade.
+An opt-in test exporter produces a real Active manager and stock monitor using a public
+Node wallet seed for downstream integration tests; normal test runs do not write fixtures.
 
 ## Next boundary
 
