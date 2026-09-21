@@ -14207,6 +14207,7 @@ where
 					});
 					debug_assert!(peer_state.is_connected, "A disconnected peer cannot disconnect");
 					peer_state.is_connected = false;
+					self.ffor_activation.lock().unwrap().invalidate_witness_attempts(counterparty_node_id);
 					peer_state.ffor_connection = None;
 					peer_state.ok_to_remove(true)
 				} else { debug_assert!(false, "Unconnected peer disconnected"); true }
@@ -14293,6 +14294,7 @@ where
 
 						debug_assert!(!peer_state.is_connected, "A peer shouldn't be connected twice");
 						peer_state.is_connected = true;
+						self.ffor_activation.lock().unwrap().invalidate_witness_attempts(counterparty_node_id);
 						peer_state.ffor_connection = Some(Arc::new(()));
 					},
 				}

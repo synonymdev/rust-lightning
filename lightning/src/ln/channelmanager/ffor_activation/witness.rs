@@ -76,7 +76,11 @@ where
 			if existing != &registration {
 				return Err(FFORReceiverError::InvalidWitnessRegistration);
 			}
-			return Ok(self.ffor_activation.lock().unwrap().get(&key)?.requirement.clone());
+			if recovery.get_witness_acks(&key).is_some() {
+				return Ok(self.ffor_activation.lock().unwrap().get(&key)?.requirement.clone());
+			}
+			// A legacy registration must reserve compact ACK capacity before the new authenticated
+			// attempt path sends anything. Exact retries cannot skip this checked upgrade.
 		}
 		// Initial registration cannot convert a merely observed or unpersisted Active phase into
 		// authority. Its exact compact evidence and all later close reservations must fit first.
@@ -181,7 +185,7 @@ where
 		Ok(enqueue(provision).is_ok())
 	}
 
-	fn validate_ffor_witness_context(
+	pub(super) fn validate_ffor_witness_context(
 		provided: &FFORReceiverRecoveryContext, current: &FFORReceiverRecoveryContext, height: u32,
 	) -> Result<(), FFORReceiverError> {
 		if provided.context_digest() != current.context_digest()

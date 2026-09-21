@@ -180,6 +180,13 @@ impl FFORRecoveryRegistry {
 			canonical_book: previous.record.canonical_book.clone(),
 			activation: previous.record.activation.clone(),
 			request: previous.record.request.clone(),
+			witness_acks: Some(
+				previous
+					.record
+					.witness_acks
+					.clone()
+					.unwrap_or_else(|| FFORReceiverWitnessAcknowledgements::empty(&witnesses)),
+			),
 			witnesses: Some(witnesses),
 		})?;
 		let header_growth = if self.version() < REQUEST_VERSION { 2 } else { 0 };

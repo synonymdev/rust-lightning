@@ -355,6 +355,7 @@ fn ffor_activation_archive_reserves_maximum_ack_through_competing_admission_and_
 	let extra = crate::ln::ffor_recovery::Entry::new(crate::ln::ffor_recovery::StoredSetup {
 		request: None,
 		witnesses: None,
+		witness_acks: None,
 		canonical_book: extra_setup.validate_recovery().unwrap().canonical_book().to_vec(),
 		setup: extra_setup,
 		activation: Some(extra_activation),

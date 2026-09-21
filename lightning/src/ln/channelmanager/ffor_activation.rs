@@ -15,6 +15,7 @@ mod driver;
 mod receipt;
 mod reestablish;
 mod witness;
+mod witness_ack;
 
 struct RuntimeEntry {
 	key: FFORRecoveryKey,
@@ -27,11 +28,12 @@ struct RuntimeEntry {
 /// Bounded by the retained registry's keys. No bytes or phase authority are copied here.
 pub(super) struct FFORReceiverRuntime {
 	entries: Vec<RuntimeEntry>,
+	witness_attempts: Vec<witness_ack::WitnessAttempt>,
 }
 
 impl FFORReceiverRuntime {
 	pub(super) fn new() -> Self {
-		Self { entries: Vec::new() }
+		Self { entries: Vec::new(), witness_attempts: Vec::new() }
 	}
 
 	pub(super) fn restored(

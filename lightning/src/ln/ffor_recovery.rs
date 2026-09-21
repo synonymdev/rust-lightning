@@ -7,6 +7,7 @@
 mod request;
 use request::PendingRequest;
 mod witness;
+mod witness_ack;
 
 mod activation;
 pub(crate) use activation::{FFORReceiverActivation, FFORReceiverCloseRecord};
@@ -18,7 +19,8 @@ use bitcoin::secp256k1::PublicKey;
 use crate::io;
 use crate::ln::channel::{FFORReceiverFencePhase, FFORReceiverSetup};
 use crate::ln::ffor::{
-	FFORMonitorRecoveryIdentity, FFORReceiverAbortReason, FFORReceiverWitnessRegistration,
+	FFORMonitorRecoveryIdentity, FFORReceiverAbortReason, FFORReceiverWitnessAcknowledgements,
+	FFORReceiverWitnessRegistration,
 };
 use crate::ln::msgs::DecodeError;
 use crate::ln::types::ChannelId;
@@ -33,6 +35,7 @@ const CLOSE_VERSION: u8 = 3;
 const REQUEST_VERSION: u8 = 4;
 // Earlier readers must not forget protected application key and manifest ownership.
 const WITNESS_VERSION: u8 = 5;
+const WITNESS_ACK_VERSION: u8 = 6;
 const MAX_RECORDS: usize = 64;
 const MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
 // Two maximum wire messages, a 483-slot canonical book, and fixed admission fields fit here.
@@ -67,6 +70,7 @@ struct StoredSetup {
 	activation: Option<FFORReceiverActivation>,
 	request: Option<crate::ln::channel::FFORReceiverRequest>,
 	witnesses: Option<FFORReceiverWitnessRegistration>,
+	witness_acks: Option<FFORReceiverWitnessAcknowledgements>,
 }
 
 impl_writeable_tlv_based!(StoredSetup, {
@@ -75,6 +79,7 @@ impl_writeable_tlv_based!(StoredSetup, {
 	(4, activation, option),
 	(6, request, option),
 	(8, witnesses, option),
+	(10, witness_acks, option),
 });
 
 struct Entry {
@@ -112,6 +117,9 @@ impl Entry {
 				.receiver_context(&record.setup)
 				.map_err(|_| FFORRecoveryError::InvalidRecord)?;
 			witnesses.validate(&context).map_err(|_| FFORRecoveryError::InvalidRecord)?;
+		}
+		if let Some(acks) = record.witness_acks.as_ref() {
+			acks.validate(record.witnesses.as_ref().ok_or(FFORRecoveryError::InvalidRecord)?)?;
 		}
 		let header = authenticated.header();
 		let encoded_bytes = record.serialized_length();
@@ -392,6 +400,7 @@ impl FFORRecoveryRegistry {
 			activation: None,
 			request: None,
 			witnesses: None,
+			witness_acks: None,
 		})?;
 		if self.pending_requests.iter().any(|pending| {
 			pending.key.channel_id == entry.key.channel_id
@@ -432,6 +441,7 @@ impl FFORRecoveryRegistry {
 			activation: Some(activation.clone()),
 			request,
 			witnesses,
+			witness_acks: self.get_witness_acks(&key).cloned(),
 		})?;
 		let index = self
 			.entries
@@ -480,6 +490,9 @@ impl FFORRecoveryRegistry {
 	}
 
 	fn version(&self) -> u8 {
+		if self.entries.iter().any(|entry| entry.record.witness_acks.is_some()) {
+			return WITNESS_ACK_VERSION;
+		}
 		if self.entries.iter().any(|entry| entry.record.witnesses.is_some()) {
 			return WITNESS_VERSION;
 		}
@@ -558,6 +571,7 @@ impl Readable for FFORRecoveryRegistry {
 			&& version != CLOSE_VERSION
 			&& version != REQUEST_VERSION
 			&& version != WITNESS_VERSION
+			&& version != WITNESS_ACK_VERSION
 		{
 			return Err(DecodeError::UnknownRequiredFeature);
 		}

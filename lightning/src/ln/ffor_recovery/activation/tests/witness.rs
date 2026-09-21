@@ -1,6 +1,8 @@
 use super::*;
 use crate::ln::ffor::{FFORReceiverRecoveryContext, FFORReceiverWitnessRegistration};
 use crate::ln::ffor_recovery::{Entry, StoredSetup, WITNESS_VERSION};
+
+mod ack;
 use bitcoin::secp256k1::{Message as SecpMessage, PublicKey, Secp256k1, SecretKey};
 use lightning_ffor::witness::{ManifestParameters, SignedManifest, UnsignedManifest};
 
@@ -58,7 +60,7 @@ fn ffor_witness_archive_bounds_maximum_book_and_reserves_terminal_transitions() 
 		assert!(registry.encoded_bytes + registry.reserved_transition_bytes <= reserved);
 		assert_eq!(registry.get_witnesses(&key(&setup)), Some(&metadata));
 		let bytes = registry.encode();
-		assert_eq!(bytes[0], WITNESS_VERSION);
+		assert_eq!(bytes[0], crate::ln::ffor_recovery::WITNESS_ACK_VERSION);
 		assert_eq!(bytes.len(), registry.encoded_bytes);
 		let restored = FFORRecoveryRegistry::read(&mut &bytes[..]).unwrap();
 		assert_eq!(restored.get_witnesses(&key(&setup)), Some(&metadata));
@@ -78,6 +80,7 @@ fn ffor_witness_archive_reauthenticates_compact_metadata_and_required_fence() {
 		activation: Some(phases[1].clone()),
 		request: None,
 		witnesses: Some(metadata.clone()),
+		witness_acks: None,
 	};
 	for mutation in 0..9 {
 		let mut damaged = record();

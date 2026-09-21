@@ -41,6 +41,10 @@ pub use receipt::{FFORWitnessMonitorSnapshot, FFORWitnessReceiptProgress};
 
 mod provision;
 pub use provision::{FFORReceiverWitnessRegistration, FFORRegisteredWitness};
+mod witness_ack;
+pub use witness_ack::{
+	FFORReceiverWitnessAcknowledgements, FFORWitnessAcknowledgement, FFORWitnessProvisionAttempt,
+};
 
 /// Which channel participant offers every voucher HTLC in the book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

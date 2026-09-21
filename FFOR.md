@@ -284,6 +284,30 @@ a fresh manager write and rejects an earlier instance's context. Historical regi
 metadata remains inspectable after close or force-close, so missing sidecar keys cannot
 be treated as permission to create a replacement selection. No invoice authority follows.
 
+The stronger provisioning path stages an opaque attempt against the actual native
+witness connection, exact registered manifest and request ID. Release rechecks the
+current Active state and completed persistence, then marks the attempt sent only after
+its paired transport callback accepts the bounded enqueue. Already sent retries do not
+invoke the callback again. Disconnect and connection replacement invalidate attempts;
+restore never recovers transient send authority. The manager retains at most 64 attempts
+and request-ID tombstones without eviction until the corresponding witness disconnects.
+
+Only a positive ACK correlated to a native sent attempt can enter native history.
+The application first confirms its own protected ACK write, then passes the response
+from the same authenticated connection to native retention. Native preserves its first
+valid promise for each selected witness and returns a new persistence requirement.
+Native and application history may retain different first request IDs after a crash
+and fresh retry; both must bind the same epoch, manifest and witness with adequate
+retention. Neither promise may be silently replaced to make their transport IDs match.
+
+Required archive field 10 and schema 6 reserve a fixed 373 bytes for up to four native
+promises before the stronger provisioning path is available. Filling a promise cannot
+grow storage or enclosing length prefixes. Legacy witness registration needs an explicit
+capacity-checked upgrade and successful write. Restore validates the complete record,
+rejects noncanonical padding and imposes a fresh persistence barrier. Historical ACK
+metadata survives close and removal but supplies no invoice or payment readiness.
+The earlier observational Provision release cannot establish native sent correlation.
+
 `ChannelMonitor::ffor_witness_receipt_snapshot` captures opaque evidence for one verified
 receipt. The caller must drop its monitor guard before passing that snapshot, the receipt
 and its historical context to `import_ffor_receiver_witness_receipt`. The manager checks
@@ -331,7 +355,7 @@ required before requesting a signature.
 
 ## Validation
 
-The current focused native suite passes 145 tests. Native no-default-features and
+The current focused native suite passes 156 tests. Native no-default-features and
 documentation builds with broken intra-doc links denied also pass.
 
 The FFOR tests exercise real two-node commitment rounds, both funding directions,
@@ -432,6 +456,14 @@ checks cover compact four-witness ownership for a 483-slot book, remaining termi
 capacity, corrupted metadata, key reuse, missing required evidence and version downgrade.
 An opt-in test exporter produces a real Active manager and stock monitor using a public
 Node wallet seed for downstream integration tests; normal test runs do not write fixtures.
+
+Nine native ACK tests cover both funders, unsent requests, backpressure, wrong witness,
+request and retention, refusal tombstones, connection replacement, failed persistence,
+exact retries, independent first promises, restoration and archive-only history. They
+also check offline settlement-peer operation, current deadlines, fixed storage through
+all terminal phases with a maximum book, legacy quota refusal and malformed archives.
+A previous field-layout reader rejects the new required ACK field; schema downgrade is
+also refused. These checks do not exercise a production witness or invoice issuance.
 
 Seven receipt-import integration tests exercise both funders, delayed monitor persistence,
 idempotent retries, crash recovery from a failed write using the prior durable monitor,

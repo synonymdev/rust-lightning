@@ -10,6 +10,8 @@ use lightning_ffor::witness::{ManifestParameters, UnsignedManifest};
 
 const EPOCH: [u8; 32] = [81; 32];
 
+mod ack;
+
 fn persist(node: &TestChannelManager) -> Vec<u8> {
 	let token = node.capture_ffor_persistence();
 	let bytes = node.encode();
@@ -376,6 +378,11 @@ fn ffor_witness_release_waits_for_owned_preimage_monitor_and_refuses_close() {
 	persist(receiver.node);
 	let active = receiver.node.capture_ffor_receiver_active_context(&id, &peer, EPOCH).unwrap();
 	let provision = Provision::new([1; 16], selected[0].1.clone());
+	let witness_connection = ack::connect(receiver, selected[0].0);
+	let attempt = receiver
+		.node
+		.stage_ffor_receiver_witness_provision(&context, &witness_connection, &provision)
+		.unwrap();
 	chanmon_cfgs[1].persister.set_update_ret(ChannelMonitorUpdateStatus::InProgress);
 	let update = claim_ffor_preimage_for_test(sender, receiver, id, vouchers[0].htlc_id, preimage);
 	check_added_monitors(receiver, 1);
@@ -386,6 +393,12 @@ fn ffor_witness_release_waits_for_owned_preimage_monitor_and_refuses_close() {
 		))
 		.is_err());
 	assert!(receiver.node.register_ffor_receiver_witnesses(&context, &selected).is_err());
+	assert!(receiver
+		.node
+		.release_ffor_receiver_witness_attempt(&active, &attempt, &provision, |_| panic!(
+			"pending monitor sent attempt"
+		))
+		.is_err());
 	chanmon_cfgs[1].persister.set_update_ret(ChannelMonitorUpdateStatus::Completed);
 	receiver.chain_monitor.chain_monitor.channel_monitor_updated(id, update).unwrap();
 	receiver.node.get_and_clear_pending_msg_events();
@@ -394,6 +407,12 @@ fn ffor_witness_release_waits_for_owned_preimage_monitor_and_refuses_close() {
 		.release_ffor_receiver_witness_provision(&active, &selected[0].0, &provision, |_| Ok(()))
 		.unwrap());
 	receiver.node.prepare_ffor_receiver_close(&id, &peer, EPOCH).unwrap();
+	assert!(receiver
+		.node
+		.release_ffor_receiver_witness_attempt(&active, &attempt, &provision, |_| panic!(
+			"closing sent attempt"
+		))
+		.is_err());
 	assert!(receiver
 		.node
 		.release_ffor_receiver_witness_provision(&active, &selected[0].0, &provision, |_| panic!(
