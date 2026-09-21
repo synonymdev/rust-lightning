@@ -26,7 +26,7 @@ where
 		let has_drain = book.drain.is_some();
 		// A historical receipt can arrive after a failure was already committed. The stock FFOR
 		// drain claim hook preserves that outcome while retaining preimage knowledge. A historical
-		// tombstone without a drain needs the monitor-only fallback below.
+		// terminal book without a drain needs the monitor-only fallback below.
 		let htlc =
 			self.context.pending_inbound_htlcs.iter().find(|htlc| htlc.htlc_id == voucher.htlc_id);
 		if let Some(htlc) = htlc {
@@ -59,6 +59,42 @@ where
 		if monitor_knows_preimage {
 			return Ok(None);
 		}
+		self.ffor_monitor_only_preimage_update(preimage).map(Some)
+	}
+
+	/// Protect a preimage of an archived terminal epoch that this channel's current book no longer
+	/// owns. Every voucher of that epoch was already resolved, so no stock claim is possible; only
+	/// the original monitor gains the preimage. The manager has matched the epoch, funding output
+	/// and witness selection against the archive before calling. A live HTLC of the current epoch
+	/// with the same payment hash keeps stock ownership and refuses this path.
+	pub(crate) fn ffor_import_historical_receipt_preimage(
+		&mut self, voucher: &FFORVoucher, preimage: PaymentPreimage, monitor_knows_preimage: bool,
+	) -> Result<Option<ChannelMonitorUpdate>, FFORReceiverError> {
+		let hash = PaymentHash(Sha256::hash(&preimage.0).to_byte_array());
+		if hash != voucher.payment_hash
+			|| self
+				.context
+				.ffor_receiver_book
+				.as_ref()
+				.map_or(true, |book| book.vouchers.contains(voucher))
+		{
+			return Err(FFORReceiverError::InvalidWitnessReceipt);
+		}
+		if self.pending_splice.is_some() || self.context.interactive_tx_signing_session.is_some() {
+			return Err(FFORCommitmentError::PendingUpdates.into());
+		}
+		if self.context.pending_inbound_htlcs.iter().any(|htlc| htlc.payment_hash == hash) {
+			return Err(FFORCommitmentError::PendingUpdates.into());
+		}
+		if monitor_knows_preimage {
+			return Ok(None);
+		}
+		self.ffor_monitor_only_preimage_update(preimage).map(Some)
+	}
+
+	fn ffor_monitor_only_preimage_update(
+		&mut self, preimage: PaymentPreimage,
+	) -> Result<ChannelMonitorUpdate, FFORReceiverError> {
 		// Match the stock claim helper's priority insertion: preimage protection must not wait
 		// behind a commitment update blocked by another channel or a signer.
 		self.context.latest_monitor_update_id = self
@@ -75,13 +111,13 @@ where
 			pending.update.update_id += 1;
 		}
 		self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new());
-		Ok(Some(ChannelMonitorUpdate {
+		Ok(ChannelMonitorUpdate {
 			update_id,
 			updates: vec![ChannelMonitorUpdateStep::PaymentPreimage {
 				payment_preimage: preimage,
 				payment_info: None,
 			}],
 			channel_id: Some(self.context.channel_id()),
-		}))
+		})
 	}
 }

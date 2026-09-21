@@ -4334,8 +4334,8 @@ where
 	/// This is a private experimental protocol boundary, with no feature advertisement or activation.
 	/// It does not freeze commitment updates or authorize invoices. Disconnects and restarts abort
 	/// the registration and fail its vouchers using the ordinary channel commitment protocol.
-	/// Only one registration is supported for the lifetime of a channel, even after abort. Its
-	/// permanent tombstone prevents epoch reuse until a future durable epoch-history design exists.
+	/// A raw book is never archived, so it can neither replace an earlier epoch nor be replaced
+	/// by a later one: the channel keeps this registration for its lifetime, even after abort.
 	/// Serialized channels using this API require a reader that understands voucher parking.
 	pub fn register_ffor_receiver_book(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
@@ -4375,8 +4375,12 @@ where
 	/// pre-init admission with `prepare_ffor_receiver` and process Accept synchronously with
 	/// `handle_ffor_receiver_message`. This retains setup evidence but does not activate or freeze
 	/// the channel, or authorize an invoice.
-	/// The same abort, restart and one-registration limits as [`Self::register_ffor_receiver_book`]
-	/// apply. Raw-book registration does not supply the authenticated evidence retained here.
+	/// The same abort and restart behaviour as [`Self::register_ffor_receiver_book`] applies. A
+	/// channel whose previous authenticated epoch is terminal in both the channel and the archive,
+	/// with that terminal write completed, may register a later epoch; the earlier epoch's
+	/// archive record is retained. Any other existing registration is refused with
+	/// [`FFORReceiverError::AlreadyRegistered`]. Raw-book registration does not supply the
+	/// authenticated evidence retained here.
 	pub fn register_ffor_receiver_setup(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, init_wire: &[u8],
 		accept_wire: &[u8], claim_margin_blocks: u32,
@@ -4389,11 +4393,18 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?
 			.lock()
 			.unwrap();
-		let channel = peer
+		let peer_state = &mut *peer;
+		let in_flight = peer_state
+			.in_flight_monitor_updates
+			.get(channel_id)
+			.map_or(false, |(_, updates)| !updates.is_empty());
+		let channel = peer_state
 			.channel_by_id
 			.get_mut(channel_id)
 			.and_then(Channel::as_funded_mut)
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
+		let mut recovery = self.ffor_recovery.lock().unwrap();
+		self.check_ffor_epoch_reuse(channel, &recovery, in_flight)?;
 		let setup = channel.prepare_ffor_receiver_setup(
 			init_wire,
 			accept_wire,
@@ -4402,7 +4413,6 @@ where
 			current_height,
 			claim_margin_blocks,
 		)?;
-		let mut recovery = self.ffor_recovery.lock().unwrap();
 		let insertion =
 			recovery.prepare_insert(&setup).map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
 		let requirement = self
@@ -4514,8 +4524,9 @@ where
 	///
 	/// Continue normal event and peer-message processing until status is `Aborted`. HTLCs in partial
 	/// commitment rounds are failed only after those rounds finish. A disconnect or restart retains
-	/// the abort and resumes the unwind on reconnection. Ordinary payments can proceed after drain,
-	/// but further FFOR registrations on this channel remain refused, including a different epoch.
+	/// the abort and resumes the unwind on reconnection. Ordinary payments can proceed after drain.
+	/// A further registration on this channel is refused unless the archive retains a terminal
+	/// record for this epoch; an abort before activation never creates one.
 	/// If STFU was sent, abort requests a peer disconnect to end both sides' quiescence. Reconnect
 	/// and continue message processing to drain; failures are not sent while the peer is quiescent.
 	pub fn abort_ffor_receiver_book(
@@ -9231,7 +9242,8 @@ where
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCPreviousHopData, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -9269,7 +9281,8 @@ where
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCClaimSource, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -17208,7 +17221,8 @@ where
 			)?;
 			channel.ffor_validate_receiver_identity(our_network_pubkey, chain_hash)?;
 			if let Some(request) = channel.ffor_receiver_request() {
-				ffor_channel_requests.push(request.clone());
+				ffor_channel_requests
+					.push((request.clone(), channel.ffor_receiver_predecessor_epoch()));
 			}
 			if let Some(setup) = channel.ffor_receiver_setup_record()? {
 				ffor_channel_setups.push((
@@ -17218,6 +17232,7 @@ where
 					channel.ffor_receiver_drain_binding(),
 					channel.ffor_receiver_closed_completion_hash(),
 					channel.ffor_receiver_drain_activation_hash(),
+					channel.ffor_receiver_predecessor_epoch(),
 				));
 			}
 			let logger = WithChannelContext::from(&args.logger, &channel.context, None);
@@ -17622,12 +17637,23 @@ where
 		let mut ffor_persistence = FFORPersistenceBarrier::new();
 		let ffor_activation = FFORReceiverRuntime::restored(&ffor_recovery, &mut ffor_persistence)?;
 		ffor_recovery.validate_identity(our_network_pubkey, chain_hash)?;
-		for request in &ffor_channel_requests {
+		for (request, predecessor) in &ffor_channel_requests {
 			if !ffor_recovery.contains_request(request) {
 				return Err(DecodeError::InvalidValue);
 			}
+			// A later epoch's pre-init gate must also retain its replaced epoch's terminal record.
+			let header = request.validate_recovery()?.header;
+			ffor_recovery.validate_channel_predecessor(
+				crate::ln::ffor_recovery::FFORRecoveryKey {
+					channel_id: ChannelId(header.channel_id),
+					epoch_id: header.epoch_id,
+				},
+				*predecessor,
+			)?;
 		}
-		for (setup, fence, abort_reason, drain, completion, drain_hash) in &ffor_channel_setups {
+		for (setup, fence, abort_reason, drain, completion, drain_hash, predecessor) in
+			&ffor_channel_setups
+		{
 			ffor_recovery.validate_channel_lifecycle(
 				setup,
 				*fence,
@@ -17635,6 +17661,7 @@ where
 				drain.clone(),
 				*completion,
 				*drain_hash,
+				*predecessor,
 			)?;
 		}
 		for channel_id in ffor_recovery.activation_channels() {
@@ -18574,7 +18601,8 @@ where
 			if let Some(peer) = per_peer_state.get(&monitor.get_counterparty_node_id()) {
 				let mut peer = peer.lock().unwrap();
 				if peer.closed_channel_monitor_update_ids.contains_key(channel_id) {
-					peer.closed_channel_monitor_funding.insert(*channel_id, monitor.get_funding_txo());
+					peer.closed_channel_monitor_funding
+						.insert(*channel_id, monitor.get_funding_txo());
 				}
 			}
 		}

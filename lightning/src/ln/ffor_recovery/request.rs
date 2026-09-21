@@ -118,9 +118,11 @@ impl FFORRecoveryRegistry {
 				|| (entry.record.chain_hash() == request.chain_hash()
 					&& entry.record.funding_txo() == request.funding_txo())
 		}) || self.entries.iter().any(|entry| {
-			entry.key.channel_id == pending.key.channel_id
-				|| (entry.record.setup.chain_hash() == request.chain_hash()
-					&& entry.record.setup.funding_txo() == request.funding_txo())
+			// Earlier epochs of this channel must be Closed or aborted in the archive.
+			!entry.is_terminal()
+				&& (entry.key.channel_id == pending.key.channel_id
+					|| (entry.record.setup.chain_hash() == request.chain_hash()
+						&& entry.record.setup.funding_txo() == request.funding_txo()))
 		}) {
 			return Err(FFORRecoveryError::ConflictingRecord);
 		}

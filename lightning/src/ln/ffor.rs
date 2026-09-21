@@ -159,7 +159,8 @@ pub enum FFORReceiverStatus {
 pub enum FFORReceiverError {
 	/// The channel or supplied commitment evidence does not meet the required conditions.
 	ChannelState(FFORCommitmentError),
-	/// This channel already has a registration, including a permanently retained aborted one.
+	/// This channel already has a registration that is not terminal in both the channel and the
+	/// archive, or the request would register the same epoch again.
 	AlreadyRegistered,
 	/// This channel has no receiver registration.
 	NotRegistered,

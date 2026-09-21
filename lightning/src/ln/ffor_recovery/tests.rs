@@ -150,6 +150,15 @@ fn decode(bytes: &[u8]) -> Result<FFORRecoveryRegistry, DecodeError> {
 	FFORRecoveryRegistry::read(&mut &bytes[..])
 }
 
+/// Insert unrelated fixture setups until the record count limit is reached.
+pub(crate) fn fill_registry(registry: &mut FFORRecoveryRegistry) {
+	let mut identity = 1u8;
+	while registry.entries.len() + registry.pending_requests.len() < MAX_RECORDS {
+		registry.prepare_insert(&fixture(identity, false).record()).unwrap().commit();
+		identity += 1;
+	}
+}
+
 pub(crate) fn full_registry() -> FFORRecoveryRegistry {
 	let mut registry = FFORRecoveryRegistry::new();
 	for identity in 1..=MAX_RECORDS {

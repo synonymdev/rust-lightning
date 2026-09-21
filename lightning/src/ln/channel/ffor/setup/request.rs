@@ -143,8 +143,12 @@ where
 		&self, init_wire: &[u8], receiver: PublicKey, chain_hash: ChainHash, current_height: u32,
 		claim_margin_blocks: u32, local_request_id: [u8; 32],
 	) -> Result<FFORReceiverRequest, FFORReceiverError> {
-		if self.context.ffor_receiver_book.is_some() {
-			return Err(FFORReceiverError::AlreadyRegistered);
+		// A terminal previous epoch may be replaced by a different epoch only; the manager
+		// verifies its archive record. The same epoch is never registered twice.
+		if let Some(previous) = self.ffor_receiver_reusable_epoch()? {
+			if Message::decode(init_wire).map_or(true, |init| init.header.epoch_id == previous) {
+				return Err(FFORReceiverError::AlreadyRegistered);
+			}
 		}
 		self.check_ffor_synchronized()?;
 		if !self.context.is_connected()
@@ -203,17 +207,11 @@ where
 			return Err(invalid_setup());
 		}
 		let epoch_id = request.validate_recovery().map_err(|_| invalid_setup())?.header.epoch_id;
-		self.context.ffor_receiver_book = Some(FFORReceiverBook {
-			epoch_id,
-			vouchers: Vec::new(),
-			received: Vec::new(),
-			abort_reason: None,
-			setup: None,
-			fence: None,
-			drain: None,
-			request: Some(request),
-			request_gate_released: None,
-		});
+		if self.context.ffor_receiver_book.is_some() {
+			return self.ffor_replace_terminal_book(epoch_id, Vec::new(), Some(request));
+		}
+		self.context.ffor_receiver_book =
+			Some(FFORReceiverBook::new(epoch_id, Vec::new(), Some(request), None));
 		Ok(())
 	}
 

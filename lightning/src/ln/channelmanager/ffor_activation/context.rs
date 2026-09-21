@@ -184,6 +184,7 @@ where
 				channel.ffor_receiver_drain_binding(),
 				channel.ffor_receiver_closed_completion_hash(),
 				channel.ffor_receiver_drain_activation_hash(),
+				channel.ffor_receiver_predecessor_epoch(),
 			)
 			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
 		let activation = recovery.get_activation(key).ok_or(FFORReceiverError::NotRegistered)?;

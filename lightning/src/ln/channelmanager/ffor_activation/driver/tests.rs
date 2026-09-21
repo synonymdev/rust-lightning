@@ -21,8 +21,11 @@ macro_rules! fixture {
 }
 
 fn parameters(voucher: &FFORVoucher) -> FFORReceiverParameters {
+	parameters_with_id(voucher, [91; 32])
+}
+fn parameters_with_id(voucher: &FFORVoucher, local_request_id: [u8; 32]) -> FFORReceiverParameters {
 	FFORReceiverParameters {
-		local_request_id: [91; 32],
+		local_request_id,
 		amounts_msat: vec![voucher.amount_msat],
 		minimum_payment_msat: voucher.amount_msat,
 		settlement_deadline: voucher.cltv_expiry - 20,

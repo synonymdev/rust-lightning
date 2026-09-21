@@ -33,6 +33,9 @@ pub(super) struct FFORReceiverBook {
 	drain: Option<FFORReceiverDrain>,
 	request: Option<FFORReceiverRequest>,
 	request_gate_released: Option<bool>,
+	// The terminal epoch this book replaced on the same channel. Restore requires its archived
+	// terminal record; the archive never drops the replaced epoch's history.
+	predecessor_epoch_id: Option<[u8; 32]>,
 }
 
 struct FFORReceivedVoucher {
@@ -54,14 +57,53 @@ impl_writeable_tlv_based!(FFORReceiverBook, {
 	(8, setup, option),
 	// A reader without the mutation fence must refuse this channel.
 	(10, fence, option),
-	// Older readers must not discard drain ownership or a completed epoch tombstone.
+	// Older readers must not discard drain ownership or a completed epoch's terminal record.
 	(12, drain, option),
 	// Pre-init interception must never be discarded by older readers.
 	(14, request, option),
 	(16, request_gate_released, option),
+	// A reader that ignores the predecessor could restore a later epoch without its history.
+	(18, predecessor_epoch_id, option),
 });
 
 impl FFORReceiverBook {
+	fn new(
+		epoch_id: [u8; 32], vouchers: Vec<FFORVoucher>, request: Option<FFORReceiverRequest>,
+		predecessor_epoch_id: Option<[u8; 32]>,
+	) -> Self {
+		Self {
+			epoch_id,
+			vouchers,
+			received: Vec::new(),
+			abort_reason: None,
+			setup: None,
+			fence: None,
+			drain: None,
+			request,
+			request_gate_released: None,
+			predecessor_epoch_id,
+		}
+	}
+
+	/// The channel-local terminal shape that permits a later epoch on this channel: an
+	/// authenticated setup whose drain reached Closed with its retained completion hash, or an
+	/// aborted setup without a drain, in either case without a fence or a pending pre-init gate.
+	/// The manager must still match this shape against the archive's terminal record and its
+	/// completed write before replacing the book. Raw books without a setup are never reusable.
+	fn is_terminal_for_reuse(&self) -> bool {
+		if self.fence.is_some() || self.setup.is_none() || self.vouchers.is_empty() {
+			return false;
+		}
+		if self.request.is_some() && self.request_gate_released != Some(true) {
+			return false;
+		}
+		match (self.abort_reason, self.drain.is_some()) {
+			(None, true) => self.is_closed_with_completion(),
+			(Some(_), false) => true,
+			_ => false,
+		}
+	}
+
 	pub(super) fn abort(&mut self, reason: FFORReceiverAbortReason) {
 		if self.fence.is_none() && !self.is_closed() {
 			self.abort_reason.get_or_insert(reason);
@@ -73,6 +115,7 @@ impl FFORReceiverBook {
 	) -> Result<(), DecodeError> {
 		if self.request_gate_released == Some(false)
 			|| (self.request_gate_released.is_some() && self.request.is_none())
+			|| self.predecessor_epoch_id == Some(self.epoch_id)
 		{
 			return Err(DecodeError::InvalidValue);
 		}
@@ -174,6 +217,13 @@ where
 		if self.context.ffor_receiver_book.is_some() {
 			return Err(FFORReceiverError::AlreadyRegistered);
 		}
+		self.ffor_check_book_admission(vouchers)?;
+		self.context.ffor_receiver_book =
+			Some(FFORReceiverBook::new(epoch_id, vouchers.to_vec(), None, None));
+		Ok(())
+	}
+
+	fn ffor_check_book_admission(&self, vouchers: &[FFORVoucher]) -> Result<(), FFORReceiverError> {
 		self.check_ffor_synchronized()?;
 		if !self.context.is_connected() {
 			return Err(FFORCommitmentError::ChannelUnavailable.into());
@@ -185,18 +235,79 @@ where
 		{
 			return Err(FFORCommitmentError::InvalidVoucherBook.into());
 		}
-		self.context.ffor_receiver_book = Some(FFORReceiverBook {
-			epoch_id,
-			vouchers: vouchers.to_vec(),
-			received: Vec::new(),
-			abort_reason: None,
-			setup: None,
-			fence: None,
-			drain: None,
-			request: None,
-			request_gate_released: None,
-		});
 		Ok(())
+	}
+
+	/// Replace a terminal book with a later authenticated epoch. The manager calls this only
+	/// under its archive, runtime and persistence locks after verifying the archived terminal
+	/// record of the epoch returned by [`Self::ffor_receiver_reusable_epoch`].
+	pub(super) fn ffor_replace_terminal_book(
+		&mut self, epoch_id: [u8; 32], vouchers: Vec<FFORVoucher>,
+		request: Option<FFORReceiverRequest>,
+	) -> Result<(), FFORReceiverError> {
+		let predecessor =
+			self.ffor_receiver_reusable_epoch()?.ok_or(FFORReceiverError::NotRegistered)?;
+		if predecessor == epoch_id {
+			return Err(FFORReceiverError::AlreadyRegistered);
+		}
+		if !vouchers.is_empty() {
+			self.ffor_check_book_admission(&vouchers)?;
+		}
+		self.context.ffor_receiver_book =
+			Some(FFORReceiverBook::new(epoch_id, vouchers, request, Some(predecessor)));
+		Ok(())
+	}
+
+	/// The channel-local reuse precondition. `Ok(None)` means this channel has no registration.
+	/// `Ok(Some(epoch))` names a terminal previous epoch: its book is Closed with a retained
+	/// completion hash or aborted without a drain, the fence is gone, no owned inbound HTLC is
+	/// pending, no owned preimage is waiting for monitor persistence and the channel has no
+	/// splice or quiescence in progress. The archive record, the terminal transition's completed
+	/// manager write and the remaining admission checks belong to the caller. Any other
+	/// registration refuses with [`FFORReceiverError::AlreadyRegistered`].
+	pub(crate) fn ffor_receiver_reusable_epoch(
+		&self,
+	) -> Result<Option<[u8; 32]>, FFORReceiverError> {
+		let book = match self.context.ffor_receiver_book.as_ref() {
+			Some(book) => book,
+			None => return Ok(None),
+		};
+		let context = &self.context;
+		let owned_pending =
+			context.pending_inbound_htlcs.iter().any(|htlc| book.owns(htlc.htlc_id));
+		let owned_claim = context.holding_cell_htlc_updates.iter().any(|update| {
+			matches!(update, HTLCUpdateAwaitingACK::ClaimHTLC { htlc_id, .. } if book.owns(*htlc_id))
+		});
+		if !book.is_terminal_for_reuse()
+			|| owned_pending
+			|| owned_claim
+			|| !context.monitor_pending_finalized_fulfills.is_empty()
+			|| !context.blocked_monitor_updates.is_empty()
+			|| context.channel_state.is_monitor_update_in_progress()
+			|| context.channel_state.is_awaiting_quiescence()
+			|| context.channel_state.is_local_stfu_sent()
+			|| context.channel_state.is_remote_stfu_sent()
+			|| context.channel_state.is_quiescent()
+			|| self.quiescent_action.is_some()
+			|| self.pending_splice.is_some()
+			|| context.interactive_tx_signing_session.is_some()
+			|| matches!(
+				self.ffor_reconnect_outcome,
+				Some(FFORReestablishOutcome::ResolutionRequired { .. })
+					| Some(FFORReestablishOutcome::CloseReplayRequired { .. })
+			) {
+			return Err(FFORReceiverError::AlreadyRegistered);
+		}
+		Ok(Some(book.epoch_id))
+	}
+
+	pub(crate) fn ffor_receiver_epoch_id(&self) -> Option<[u8; 32]> {
+		self.context.ffor_receiver_book.as_ref().map(|book| book.epoch_id)
+	}
+
+	/// The terminal epoch this channel's current book replaced, if any.
+	pub(crate) fn ffor_receiver_predecessor_epoch(&self) -> Option<[u8; 32]> {
+		self.context.ffor_receiver_book.as_ref().and_then(|book| book.predecessor_epoch_id)
 	}
 
 	pub(crate) fn ffor_receiver_book_status<L: Deref>(
@@ -272,8 +383,9 @@ where
 			Some(book) => book,
 			None => return,
 		};
-		// Bound retained received records to the live HTLC set. The expected book itself is the
-		// permanent tombstone, including hashes that must never reenter ordinary payment handling.
+		// Bound retained received records to the live HTLC set. The expected book of the current
+		// epoch retains its hashes, which must never reenter ordinary payment handling while it
+		// remains this channel's registration.
 		book.received.retain(|received| {
 			self.context
 				.pending_inbound_htlcs
@@ -567,7 +679,7 @@ mod tests {
 
 	#[test]
 	fn ffor_parking_rejects_inconsistent_stored_ownership_and_unwind_material() {
-		for mutation in 0..7 {
+		for mutation in 0..8 {
 			let chanmon_cfgs = create_chanmon_cfgs(2);
 			let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 			let config = anchor_config();
@@ -598,10 +710,12 @@ mod tests {
 						})
 					},
 					5 => book.received[0].failure = None,
-					_ => {
+					6 => {
 						book.received[0].failure =
 							Some(FFORVoucherFailure::Relay { packet: Vec::new() })
 					},
+					// A book can never name itself as the epoch it replaced.
+					_ => book.predecessor_epoch_id = Some(book.epoch_id),
 				}
 				let damaged = channel.encode();
 				channel.context.ffor_receiver_book =

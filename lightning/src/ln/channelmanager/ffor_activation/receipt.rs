@@ -31,7 +31,8 @@ where
 	/// Import an authenticated witness preimage into its original stock channel monitor.
 	///
 	/// Historical recovery remains available after deadlines, disconnection, conflicting peer
-	/// reports and channel removal. The retained native setup, activation and immutable witness
+	/// reports, channel removal and replacement of the epoch by a later one on the same channel.
+	/// The retained native setup, activation and immutable witness
 	/// selection must match every receipt term. Neither a witness timestamp nor an application
 	/// payment record supplies authority. Missing original monitor state, a changed funding output,
 	/// a pending splice or a stale snapshot is refused without changing the channel.
@@ -123,6 +124,9 @@ where
 		{
 			return Err(FFORCommitmentError::MonitorMismatch.into());
 		}
+		// An epoch this channel already replaced is terminal in the archive. Its preimages still
+		// protect the original monitor, but the current book owns no voucher of that epoch.
+		let archived_terminal = recovery.is_terminal(&key);
 		// Registry data is immutable for this historical identity. Drop its lock before the
 		// stock completion macro can release the peer lock and run unrelated completion actions.
 		drop(recovery);
@@ -145,12 +149,22 @@ where
 				return Err(FFORCommitmentError::MonitorMismatch.into());
 			}
 			let logger = WithChannelContext::from(&self.logger, &channel.context, None);
-			let update = channel.ffor_import_receipt_preimage(
-				&voucher,
-				preimage,
-				monitor.known_preimage,
-				&&logger,
-			)?;
+			let update = if channel.ffor_receiver_epoch_id() == Some(context.epoch_id()) {
+				channel.ffor_import_receipt_preimage(
+					&voucher,
+					preimage,
+					monitor.known_preimage,
+					&&logger,
+				)?
+			} else if archived_terminal {
+				channel.ffor_import_historical_receipt_preimage(
+					&voucher,
+					preimage,
+					monitor.known_preimage,
+				)?
+			} else {
+				return Err(FFORReceiverError::InvalidWitnessReceipt);
+			};
 			if let Some(update) = update {
 				let update_id = update.update_id;
 				handle_new_monitor_update!(

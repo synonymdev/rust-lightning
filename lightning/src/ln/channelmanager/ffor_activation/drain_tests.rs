@@ -3,7 +3,7 @@ use crate::chain::ChannelMonitorUpdateStatus;
 use crate::ln::channel::ffor_setup_test_messages;
 use crate::ln::channelmanager::ffor_recovery_tests::claim_ffor_preimage_for_test;
 use crate::ln::ffor::FFORReceiverAbortReason;
-use crate::ln::ffor_tests::quiescence::{complete_handshake, request};
+use crate::ln::ffor_tests::quiescence::complete_handshake;
 use crate::ln::ffor_tests::{anchor_config, deliver_parked_voucher, offer_voucher};
 use crate::ln::functional_test_utils::*;
 
@@ -34,6 +34,20 @@ pub(super) fn park_two(
 pub(super) fn park_two_with_witnesses(
 	sender: &Node, receiver: &Node, id: ChannelId, witnesses: Option<Vec<PublicKey>>,
 ) -> ([FFORVoucher; 2], PaymentPreimage) {
+	park_two_epoch_with_witnesses(sender, receiver, id, witnesses, EPOCH)
+}
+
+/// Park two vouchers under an explicit epoch, for a later epoch on an already used channel.
+pub(super) fn park_two_epoch(
+	sender: &Node, receiver: &Node, id: ChannelId, epoch: [u8; 32],
+) -> ([FFORVoucher; 2], PaymentPreimage) {
+	park_two_epoch_with_witnesses(sender, receiver, id, None, epoch)
+}
+
+fn park_two_epoch_with_witnesses(
+	sender: &Node, receiver: &Node, id: ChannelId, witnesses: Option<Vec<PublicKey>>,
+	epoch: [u8; 32],
+) -> ([FFORVoucher; 2], PaymentPreimage) {
 	let preimage = PaymentPreimage([*receiver.network_payment_count.as_ref().borrow(); 32]);
 	let (first, voucher, _) = offer_voucher(sender, receiver, 2_000_000);
 	let (mut route, hash, _, secret) = get_route_and_payment_hash!(sender, receiver, 2_000_000);
@@ -41,6 +55,8 @@ pub(super) fn park_two_with_witnesses(
 	let second_voucher =
 		FFORVoucher { htlc_id: voucher.htlc_id + 1, payment_hash: hash, ..voucher };
 	let (mut init, mut accept) = ffor_setup_test_messages(sender, receiver, id, voucher);
+	init.header.epoch_id = epoch;
+	accept.header = init.header;
 	if let Payload::Init(terms) = &mut init.payload {
 		terms.witness_peers = witnesses;
 		terms.budget_msat += second_voucher.amount_msat;
@@ -84,12 +100,16 @@ pub(super) fn park_two_with_witnesses(
 	assert_eq!(second.update_add_htlcs[0].htlc_id, second_voucher.htlc_id);
 	assert_eq!(second.update_add_htlcs[0].cltv_expiry, second_voucher.cltv_expiry);
 	deliver_parked_voucher(sender, receiver, second);
-	request(sender, receiver, id).unwrap();
+	let proof = get_monitor!(receiver, id).ffor_commitment_snapshot().unwrap();
+	receiver
+		.node
+		.request_ffor_receiver_quiescence(&id, &sender.node.get_our_node_id(), epoch, proof)
+		.unwrap();
 	complete_handshake(sender, receiver);
 	let snapshot = get_monitor!(receiver, id).ffor_commitment_snapshot().unwrap();
 	receiver
 		.node
-		.prepare_ffor_receiver_activation(&id, &sender.node.get_our_node_id(), EPOCH, &snapshot)
+		.prepare_ffor_receiver_activation(&id, &sender.node.get_our_node_id(), epoch, &snapshot)
 		.unwrap();
 	persist(receiver);
 	([voucher, second_voucher], preimage)

@@ -48,6 +48,63 @@ where
 		Ok(())
 	}
 
+	/// The manager half of the epoch reuse precondition, evaluated under the peer and archive
+	/// locks that will replace the book. The channel must report a terminal previous epoch, the
+	/// archive must hold that epoch's Closed proof or abort evidence matching the channel, the
+	/// runtime requirement of that terminal transition must be complete and no monitor update for
+	/// the channel may be in flight. A channel without a registration passes.
+	pub(in crate::ln::channelmanager) fn check_ffor_epoch_reuse(
+		&self, channel: &FundedChannel<SP>, recovery: &FFORRecoveryRegistry,
+		in_flight_monitor_updates: bool,
+	) -> Result<(), FFORReceiverError> {
+		let previous = match channel.ffor_receiver_reusable_epoch()? {
+			Some(previous) => previous,
+			None => return Ok(()),
+		};
+		let key = FFORRecoveryKey { channel_id: channel.context.channel_id(), epoch_id: previous };
+		let setup = channel
+			.ffor_receiver_setup_record()
+			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?
+			.ok_or(FFORReceiverError::AlreadyRegistered)?;
+		recovery
+			.validate_channel_lifecycle(
+				&setup,
+				channel.ffor_receiver_fence(),
+				channel.ffor_receiver_abort_reason(),
+				channel.ffor_receiver_drain_binding(),
+				channel.ffor_receiver_closed_completion_hash(),
+				channel.ffor_receiver_drain_activation_hash(),
+				channel.ffor_receiver_predecessor_epoch(),
+			)
+			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
+		let activation =
+			recovery.get_activation(&key).ok_or(FFORReceiverError::AlreadyRegistered)?;
+		let closed = activation.is_closed()
+			&& channel.ffor_receiver_abort_reason().is_none()
+			&& channel.ffor_receiver_drain_binding().map(|(_, _, closed, _)| closed) == Some(true)
+			&& channel.ffor_receiver_closed_completion_hash()
+				== activation.close_record().and_then(|close| close.completion_hash());
+		let aborted = activation.is_aborted()
+			&& activation.aborted_reason().is_some()
+			&& channel.ffor_receiver_abort_reason() == activation.aborted_reason()
+			&& channel.ffor_receiver_drain_binding().is_none();
+		if !closed && !aborted {
+			return Err(FFORReceiverError::AlreadyRegistered);
+		}
+		if in_flight_monitor_updates
+			|| channel.is_awaiting_monitor_update()
+			|| channel.blocked_monitor_updates_pending() != 0
+		{
+			return Err(FFORCommitmentError::PendingUpdates.into());
+		}
+		let runtime = self.ffor_activation.lock().unwrap();
+		let requirement = &runtime.get(&key)?.requirement;
+		if !self.ffor_persistence.lock().unwrap().is_complete(requirement) {
+			return Err(FFORCommitmentError::PendingUpdates.into());
+		}
+		Ok(())
+	}
+
 	/// Stage receiver-owned interception and exact signed Init before any peer traffic is released.
 	///
 	/// The supplied connection must be the current authenticated native generation. The channel
@@ -55,6 +112,12 @@ where
 	/// limits and reserves bounded storage for the eventual accepted transcript and terminal state.
 	/// No bytes are returned. Call `advance_ffor_receiver` after ordered manager persistence.
 	/// This experimental facade does not authorize invoices or advertise offline readiness.
+	///
+	/// A channel whose previous epoch reached Closed, or whose activation was aborted on
+	/// reconnect, may stage a new epoch under a new `local_request_id` once that terminal outcome
+	/// is retained in the archive and its manager write has completed. The previous epoch's
+	/// history stays readable by its own epoch ID. A previous epoch in any other state, including
+	/// a setup aborted before activation, refuses with [`FFORReceiverError::AlreadyRegistered`].
 	pub fn prepare_ffor_receiver(
 		&self, channel_id: &ChannelId, connection: &FFORPeerConnection,
 		parameters: FFORReceiverParameters,
@@ -70,27 +133,33 @@ where
 		{
 			return Err(FFORCommitmentError::ChannelUnavailable.into());
 		}
-		{
-			let recovery = self.ffor_recovery.lock().unwrap();
-			if let Some(request) = recovery.find_request(parameters.local_request_id) {
-				if !request.matches_intent(*channel_id, connection.peer, &parameters) {
-					return Err(FFORReceiverError::AlreadyRegistered);
-				}
-				let header = request
-					.validate_recovery()
-					.map_err(|_| FFORReceiverError::RecoveryUnavailable)?
-					.header;
-				return Ok(FFORReceiverId {
-					channel_id: ChannelId(header.channel_id),
-					epoch_id: header.epoch_id,
-				});
+		let mut recovery = self.ffor_recovery.lock().unwrap();
+		if let Some(request) = recovery.find_request(parameters.local_request_id) {
+			if !request.matches_intent(*channel_id, connection.peer, &parameters) {
+				return Err(FFORReceiverError::AlreadyRegistered);
 			}
+			let header = request
+				.validate_recovery()
+				.map_err(|_| FFORReceiverError::RecoveryUnavailable)?
+				.header;
+			return Ok(FFORReceiverId {
+				channel_id: ChannelId(header.channel_id),
+				epoch_id: header.epoch_id,
+			});
 		}
-		let channel = peer
+		let peer_state = &mut *peer;
+		let in_flight = peer_state
+			.in_flight_monitor_updates
+			.get(channel_id)
+			.map_or(false, |(_, updates)| !updates.is_empty());
+		let channel = peer_state
 			.channel_by_id
 			.get_mut(channel_id)
 			.and_then(Channel::as_funded_mut)
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
+		// A previous epoch on this channel must be terminal in the channel, in the archive and in
+		// its completed write before a new epoch may replace its book. Its history is retained.
+		self.check_ffor_epoch_reuse(channel, &recovery, in_flight)?;
 		let epoch_id = self.entropy_source.get_secure_random_bytes();
 		let mut message = FFORMessage {
 			header: Header { channel_id: channel_id.0, epoch_id },
@@ -118,7 +187,6 @@ where
 			parameters.claim_margin_blocks,
 			parameters.local_request_id,
 		)?;
-		let mut recovery = self.ffor_recovery.lock().unwrap();
 		let permit = recovery
 			.prepare_request(&request)
 			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
@@ -432,9 +500,15 @@ where
 						.request()
 						.map_err(|_| FFORReceiverError::PersistenceUnavailable)?;
 					channel.abort_ffor_receiver_request(FFORReceiverAbortReason::SetupRejected)?;
+					// The channel's current request may belong to a different epoch than the
+					// rejected message named; its own runtime entry carries the new barrier.
+					let current = FFORRecoveryKey {
+						channel_id,
+						epoch_id: channel.ffor_receiver_epoch_id().unwrap_or(key.epoch_id),
+					};
 					let mut runtime = self.ffor_activation.lock().unwrap();
 					if let Some(entry) =
-						runtime.entries.iter_mut().find(|entry| entry.key.channel_id == channel_id)
+						runtime.entries.iter_mut().find(|entry| entry.key == current)
 					{
 						entry.requirement = requirement;
 						entry.may_send_init = false;
@@ -527,11 +601,14 @@ where
 			{
 				continue;
 			}
-			if let Some(entry) = runtime
-				.entries
-				.iter_mut()
-				.find(|entry| entry.key.channel_id == channel.context.channel_id())
-			{
+			let key = FFORRecoveryKey {
+				channel_id: channel.context.channel_id(),
+				epoch_id: match channel.ffor_receiver_epoch_id() {
+					Some(epoch_id) => epoch_id,
+					None => continue,
+				},
+			};
+			if let Some(entry) = runtime.entries.iter_mut().find(|entry| entry.key == key) {
 				if let Ok(requirement) = self.ffor_persistence.lock().unwrap().request() {
 					entry.requirement = requirement;
 					entry.may_send_init = false;

@@ -1,8 +1,9 @@
 //! Signed setup retained by the channel's experimental receiver parking record.
 //!
 //! Admission currently supports at most 4096 revealed peer commitments. Longer histories are
-//! refused until a bounded native history index exists. A setup remains preactivation evidence,
-//! with the parking record's one-registration limit and conservative abort on restart.
+//! refused until a bounded native history index exists. A setup remains preactivation evidence
+//! with conservative abort on restart. A channel holds one registration at a time; a terminal
+//! epoch may be replaced by a later one only through the manager's archive-checked admission.
 
 use super::*;
 use bitcoin::locktime::absolute::LOCK_TIME_THRESHOLD;
@@ -92,7 +93,7 @@ impl FFORReceiverSetup {
 	}
 
 	/// Reauthenticate historical signed evidence and its expiry height without claiming current
-	/// channel eligibility. Timestamp locktimes are invalid even for fully drained tombstones.
+	/// channel eligibility. Timestamp locktimes are invalid even for fully drained terminal books.
 	pub(crate) fn validate_recovery(&self) -> Result<AuthenticatedSetup, DecodeError> {
 		self.validate_record().map_err(|_| DecodeError::InvalidValue)
 	}
@@ -156,8 +157,12 @@ where
 		&self, init_wire: &[u8], accept_wire: &[u8], our_node_id: PublicKey, chain_hash: ChainHash,
 		current_height: u32, claim_margin_blocks: u32,
 	) -> Result<FFORReceiverSetup, FFORReceiverError> {
-		if self.context.ffor_receiver_book.is_some() {
-			return Err(FFORReceiverError::AlreadyRegistered);
+		// A terminal previous epoch may be replaced by a different epoch only; the manager
+		// verifies its archive record. The same epoch is never registered twice.
+		if let Some(previous) = self.ffor_receiver_reusable_epoch()? {
+			if Message::decode(init_wire).map_or(true, |init| init.header.epoch_id == previous) {
+				return Err(FFORReceiverError::AlreadyRegistered);
+			}
 		}
 		self.check_ffor_synchronized()?;
 		if init_wire.len() > MAX_MESSAGE_LEN || accept_wire.len() > MAX_MESSAGE_LEN {
@@ -244,20 +249,26 @@ where
 				cltv_expiry: voucher.expiry,
 			})
 			.collect();
-		if let Some(book) = self.context.ffor_receiver_book.as_ref() {
-			let request = book.request.as_ref().ok_or(FFORReceiverError::AlreadyRegistered)?;
-			if !request.validates_setup(&record)
-				|| book.abort_reason.is_some()
-				|| book.setup.is_some()
-				|| !book.received.is_empty()
-				|| book.request_gate_released.unwrap_or(false)
-			{
+		let promoting = self.context.ffor_receiver_book.as_ref().map_or(false, |book| {
+			book.request.is_some()
+				&& book.setup.is_none()
+				&& book.abort_reason.is_none()
+				&& !book.request_gate_released.unwrap_or(false)
+		});
+		if promoting {
+			let book = self.context.ffor_receiver_book.as_ref().unwrap();
+			let request = book.request.as_ref().unwrap();
+			if !request.validates_setup(&record) || !book.received.is_empty() {
 				return Err(invalid_setup());
 			}
 			self.check_ffor_synchronized()?;
 			self.ffor_validate_request(true).map_err(|_| invalid_setup())?;
 			verification::validate_vouchers(&vouchers)?;
 			self.context.ffor_receiver_book.as_mut().unwrap().vouchers = vouchers;
+		} else if self.context.ffor_receiver_book.is_some() {
+			// Only a terminal epoch can be replaced. The manager has already matched it against
+			// the archive under the same locks; the channel rechecks its own shape here.
+			self.ffor_replace_terminal_book(setup.header().epoch_id, vouchers, None)?;
 		} else {
 			self.register_ffor_receiver_book(setup.header().epoch_id, &vouchers)?;
 		}
@@ -376,7 +387,7 @@ where
 		Ok(())
 	}
 
-	/// Validate before the reader converts a live setup into an aborted restart tombstone.
+	/// Validate before the reader converts a live setup into an aborted restart record.
 	pub(in crate::ln::channel) fn ffor_restored(&mut self) -> Result<(), DecodeError> {
 		self.ffor_validate_receiver_setup()?;
 		self.validate_ffor_fence()?;

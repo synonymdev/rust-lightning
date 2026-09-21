@@ -134,12 +134,49 @@ ordinary HTLC failure rounds. Partial rounds finish before their HTLCs are faile
 all owned HTLCs drained. Ordinary payments work after drain. Registered voucher
 hashes remain excluded from ordinary receiving.
 
-There is deliberately only one registration per channel. Its epoch and public book
-remain as a permanent tombstone, and attempts to register either the same or another
-epoch are refused. The required even channel TLV 65534 is retained after abort;
-older readers must reject the channel. Restore validates live voucher ownership
-against stock inbound HTLCs before accepting the channel, and checks that committed
-vouchers retain either failure material or their deferred add.
+A channel holds one registration at a time. Its epoch and public book remain after
+abort or Closed, and the same epoch is never registered twice. A later epoch may replace
+that book only through the manager's archive-checked admission described below; any other
+existing registration refuses a new epoch with `AlreadyRegistered`. The required even
+channel TLV 65534 is retained after abort; older readers must reject the channel. Restore
+validates live voucher ownership against stock inbound HTLCs before accepting the channel,
+and checks that committed vouchers retain either failure material or their deferred add.
+
+## Repeated epochs on one channel
+
+`prepare_ffor_receiver` and `register_ffor_receiver_setup` admit a new epoch on a channel
+with an existing registration only when the previous epoch is terminal without ambiguity.
+The channel-local shape is checked first: the previous book has an authenticated setup,
+no fence and no pending pre-init gate, and either its drain is Closed with the retained
+completion hash and no abort reason, or it is aborted without a drain. No owned inbound
+HTLC may be pending, no owned preimage may be waiting in the holding cell, no monitor
+update may be in progress, blocked or in flight for the channel, and no splice, STFU
+handshake or unresolved reconnect observation may exist. Under the same peer and archive
+locks the manager then requires that the archive holds that epoch's activation record with
+its Closed proof matching the channel's completion hash, or its reconnect abort matching
+the channel's abort reason, and that the runtime persistence requirement of that terminal
+transition has completed. A setup aborted before activation, or a request the peer never
+accepted, leaves no durable abort evidence in the archive and therefore never permits
+reuse. Any missing condition refuses with the existing error variants; the new epoch also
+needs a new `local_request_id`, since an exact retry of the old one still returns the old
+selector.
+
+Admission does not delete history. The archive keeps the previous epoch's setup,
+activation, close acknowledgement, outcome journal and Closed proof under its own
+(channel, epoch) key; the new epoch is a further record subject to the same 64-record and
+byte limits, and a capacity refusal leaves the terminal book untouched. The channel book is
+replaced under the transition locks with the same ordered persistence barrier as
+activation, and the replacement names the epoch it replaced in required even field 18.
+Restore fails closed when a book names a predecessor whose archive record is missing or
+not terminal, when a book without a predecessor shares its channel with another archived
+epoch, when two unresolved archive records share a channel or funding identity, or when a
+pending request names a different epoch of the channel. Historical getters keyed by epoch,
+including recovery contexts, voucher outcomes and stored invoices, keep answering for
+replaced epochs after reuse and after restart. A witness receipt of a replaced epoch still
+imports into the original monitor as preimage protection only; the current book owns none
+of its vouchers, and a live HTLC of the current epoch with the same payment hash defers it.
+Previous-epoch payment hashes are retained in the archive, not in the channel book, so
+after replacement they follow ordinary add handling on the channel.
 
 Authenticated setup also enters a manager-owned recovery registry in required TLV
 22. Its exact signed messages, canonical book and original admission context survive
@@ -157,7 +194,7 @@ Init and retain it after promotion into accepted setup. Pending requests and the
 local retry identity use archive version 4 and required even channel fields; they
 share the same global count and byte limits with accepted records.
 The setup-only archive version retains no activation or claim authority.
-Fully drained channel tombstones permit subsequent ordinary splicing while retaining
+Fully drained terminal books permit subsequent ordinary splicing while retaining
 the original funding context in their archive.
 
 Private activation records now retain the exact signed activate and acknowledgement
@@ -239,7 +276,8 @@ all removal rounds and monitor writes completed, and funding and claim signature
 The archived completion binds the funding outpoint, both transaction IDs and commitment
 numbers, acknowledgement, activation and monitor update identity. The final write must
 complete before the manager clears the fence or advertises Closed. Ordinary payments
-and later splices then work while the permanent epoch and voucher tombstone remains.
+and later splices then work while the completed epoch's book remains the channel's
+registration until a later epoch replaces it.
 
 Witness fetch codecs authenticate encrypted records against the provisioned identity,
 mailbox, activation digest, canonical book entry, ciphertext hash and low-S signature.
@@ -427,16 +465,16 @@ spendable output does not identify a payment.
 
 ## Validation
 
-The current focused native suite passes 172 tests, including 13 invoice tests and the
-cooperative outcome journal checks. Native no-default-features and documentation builds with
-broken intra-doc links denied also pass.
+The current focused native suite passes 179 tests, including 13 invoice tests, the
+cooperative outcome journal checks and the repeated-epoch checks. Native
+no-default-features and documentation builds with broken intra-doc links denied also pass.
 
 The FFOR tests exercise real two-node commitment rounds, both funding directions,
 asymmetric dust limits and contest delays, signature corruption, stale monitors,
 monitor persistence delays, exact and partial books, mismatching and extra adds,
 and ordinary payments after abort. The parking crash matrix reloads at registration,
 uncommitted add, first commitment, both commitments before interception, parked,
-explicit abort, failure commitment sent, and fully drained tombstone.
+explicit abort, failure commitment sent, and fully drained terminal book.
 
 Run the focused suite with:
 
@@ -478,7 +516,7 @@ refusal, exact retry, phase-specific write barriers, height changes, staged repo
 disconnect, force-close and terminal abort replay. Eight drain scenarios use two
 actual vouchers in both funding directions, with no known preimage, a known preimage,
 a delayed preimage monitor write, or restart after abort release. They check actual
-fulfill and fail messages, both empty commitment sets, tombstone reload and a later
+fulfill and fail messages, both empty commitment sets, terminal book reload and a later
 ordinary payment.
 
 Cooperative close tests cover ten two-voucher scenarios across both funders, including
@@ -561,6 +599,17 @@ bits outside resolved, the wrong slot count and a signed settled slot that stock
 never fulfilled. Drain tests cover legacy records restoring without a journal, never
 acquiring one, and closed drains freezing theirs.
 
+Repeated-epoch tests run two complete cooperative epochs on one channel for both funders,
+with an ordinary payment between them, and check that both journals stay readable by
+epoch before and after restart. Refusal tests attempt a new epoch while the first is
+Activating, Active, Draining, ClosedPendingPersistence before and after its final write,
+Aborting, durably aborted with vouchers still pending, and after force close; the same
+attempt succeeds once the first epoch is Closed or its abort has drained. Further tests
+cover a capacity refusal that leaves the terminal book untouched, a restore whose archive
+lacks the replaced epoch or holds an unresolved record beside the new one, a channel book
+naming itself as predecessor, a two-epoch facade lifecycle through the public driver, and
+a first-epoch witness receipt imported after the channel moved to its second epoch.
+
 Seven receipt-import integration tests exercise both funders, delayed monitor persistence,
 idempotent retries, crash recovery from a failed write using the prior durable monitor,
 missing peer/monitor refusal, unregistered witnesses, changed identities, expired epochs,
@@ -573,9 +622,10 @@ manager/monitor fixtures only when `FFOR_NODE_REQUEST_FIXTURE_DIR` is set.
 
 ## Next boundary
 
-Reusable epochs require durable retired epoch IDs and voucher hashes, with one
-current signed transcript record under the same channel authority. The public facade
-now composes the native activation and cooperative-close transitions. Production
+Repeated epochs after Closed or a reconnect abort are admitted as described above.
+Reuse after a setup aborted before activation, or after a request the peer never accepted,
+still needs durable abort evidence in the archive and remains refused. The public facade
+composes the native activation and cooperative-close transitions. Production
 orchestration must retain witness keys and receipts, reconcile every recovered preimage
 through the native import API to completed monitor protection, and enforce the configured
 deadline before claim safety ends.

@@ -1,6 +1,7 @@
 use super::*;
 use crate::chain::ChannelMonitorUpdateStatus;
 use crate::ln::channelmanager::ffor_activation::drain_tests::drain;
+use crate::ln::ffor::FFORVoucherOutcome;
 use crate::ln::ffor_tests::quiescence::complete_handshake;
 use lightning_ffor::reestablish::{Reestablish, ReportedState};
 use lightning_ffor::wire::{Abort, CloseAck, Preimage};
@@ -17,11 +18,23 @@ fn advance_monitor(
 fn park(
 	sender: &Node, receiver: &Node, channel: ChannelId,
 ) -> (FFORReceiverId, FFORPeerConnection, FFORVoucher, PaymentPreimage) {
+	park_with_request_id(sender, receiver, channel, [91; 32])
+}
+
+fn park_with_request_id(
+	sender: &Node, receiver: &Node, channel: ChannelId, local_request_id: [u8; 32],
+) -> (FFORReceiverId, FFORPeerConnection, FFORVoucher, PaymentPreimage) {
 	let preimage = PaymentPreimage([*receiver.network_payment_count.as_ref().borrow(); 32]);
 	let (update, voucher, _) = offer_voucher(sender, receiver, 2_000_000);
 	let connection = receiver.node.ffor_peer_connection(&sender.node.get_our_node_id()).unwrap();
-	let id =
-		receiver.node.prepare_ffor_receiver(&channel, &connection, parameters(&voucher)).unwrap();
+	let id = receiver
+		.node
+		.prepare_ffor_receiver(
+			&channel,
+			&connection,
+			parameters_with_id(&voucher, local_request_id),
+		)
+		.unwrap();
 	persist(receiver);
 	let init = emit(receiver, &id, &connection);
 	let accepted = accept(sender, receiver, channel, voucher, &init).encode().unwrap();
@@ -709,4 +722,142 @@ fn ffor_driver_cancel_owned_stfu_drives_reconnect_and_gates_failures_on_durable_
 		FFORReceiverProgress::Aborted { reason: FFORReceiverAbortReason::Requested }
 	);
 	send_payment(sender, &[receiver], 1_000_000);
+}
+
+/// Drive a fresh epoch through the public facade to durable Draining with a released drain.
+fn drive_to_draining(
+	sender: &Node, receiver: &Node, channel: ChannelId, local_request_id: [u8; 32], settled: bool,
+) -> (FFORReceiverId, FFORPeerConnection, FFORVoucher, PaymentPreimage) {
+	let (id, connection, voucher, preimage) =
+		park_with_request_id(sender, receiver, channel, local_request_id);
+	persist(receiver);
+	let activate = emit(receiver, &id, &connection);
+	let (ack, hash) = activation_ack(sender, &id, &activate);
+	receiver.node.handle_ffor_receiver_message(&connection, &ack).unwrap();
+	persist(receiver);
+	assert_eq!(
+		receiver.node.advance_ffor_receiver(&id, &connection, |_| panic!("Active wire")).unwrap(),
+		FFORReceiverProgress::Active
+	);
+	settlement_exits_stfu(sender, receiver, channel);
+	receiver.node.request_ffor_receiver_close(&id, &connection).unwrap();
+	persist(receiver);
+	emit(receiver, &id, &connection);
+	let close_ack = signed(
+		sender,
+		&id,
+		Payload::CloseAck(CloseAck {
+			activation_hash: hash,
+			num_slots: 1,
+			settled: vec![u8::from(settled)],
+			preimages: if settled {
+				vec![Preimage { slot: 1, value: preimage.0 }]
+			} else {
+				Vec::new()
+			},
+			preimages_tlv_present: true,
+		}),
+	);
+	receiver.node.handle_ffor_receiver_message(&connection, &close_ack).unwrap();
+	persist(receiver);
+	assert_eq!(
+		receiver.node.advance_ffor_receiver(&id, &connection, |_| panic!("drain wire")).unwrap(),
+		FFORReceiverProgress::Draining
+	);
+	(id, connection, voucher, preimage)
+}
+
+fn finish_closed<'a, 'b, 'c>(
+	sender: &Node<'a, 'b, 'c>, receiver: &Node<'a, 'b, 'c>, id: &FFORReceiverId,
+	connection: &FFORPeerConnection, voucher: &FFORVoucher, settled: bool,
+) {
+	assert_eq!(
+		drain(sender, receiver),
+		if settled {
+			(vec![voucher.htlc_id], Vec::new())
+		} else {
+			(Vec::new(), vec![voucher.htlc_id])
+		}
+	);
+	// PaymentSent releases the sender's held monitor update once its event is processed.
+	sender.node.get_and_clear_pending_events();
+	sender.chain_monitor.added_monitors.lock().unwrap().clear();
+	assert_eq!(
+		advance_monitor(receiver, id, connection).unwrap(),
+		FFORReceiverProgress::AwaitingPersistence
+	);
+	persist(receiver);
+	assert_eq!(
+		receiver.node.advance_ffor_receiver(id, connection, |_| panic!("Closed wire")).unwrap(),
+		FFORReceiverProgress::Closed
+	);
+}
+
+fn facade_outcome(
+	receiver: &Node, id: &FFORReceiverId, voucher: &FFORVoucher,
+) -> Result<Option<FFORVoucherOutcome>, FFORReceiverError> {
+	let context = receiver.node.ffor_receiver_recovery_context(&id.channel_id(), id.epoch_id())?;
+	receiver.node.ffor_receiver_voucher_outcome(
+		&context,
+		1,
+		voucher.payment_hash,
+		voucher.amount_msat,
+	)
+}
+
+#[test]
+fn ffor_driver_second_epoch_after_closed_completes_with_its_own_journal() {
+	for receiver_funds in [false, true] {
+		fixture!(nodes, sender, receiver, channel, receiver_funds);
+		let (first, connection, first_voucher, _) =
+			drive_to_draining(sender, receiver, channel, [91; 32], true);
+		// A new epoch is refused while the first one is still Draining.
+		assert_eq!(
+			receiver.node.prepare_ffor_receiver(
+				&channel,
+				&connection,
+				parameters_with_id(&first_voucher, [92; 32])
+			),
+			Err(FFORReceiverError::AlreadyRegistered)
+		);
+		finish_closed(sender, receiver, &first, &connection, &first_voucher, true);
+		assert_eq!(
+			facade_outcome(receiver, &first, &first_voucher),
+			Ok(Some(FFORVoucherOutcome::Fulfilled))
+		);
+		send_payment(sender, &[receiver], 1_000_000);
+		// The original local request still resolves to the first epoch; a new one starts another.
+		assert_eq!(
+			receiver.node.prepare_ffor_receiver(&channel, &connection, parameters(&first_voucher)),
+			Ok(first)
+		);
+		let (second, connection, second_voucher, _) =
+			drive_to_draining(sender, receiver, channel, [92; 32], false);
+		assert_ne!(second.epoch_id(), first.epoch_id());
+		assert_eq!(second.channel_id(), channel);
+		assert_eq!(
+			receiver.node.advance_ffor_receiver(&first, &connection, |_| panic!("old epoch wire")),
+			Err(FFORReceiverError::UnknownEpoch)
+		);
+		assert_eq!(
+			facade_outcome(receiver, &first, &first_voucher),
+			Ok(Some(FFORVoucherOutcome::Fulfilled))
+		);
+		finish_closed(sender, receiver, &second, &connection, &second_voucher, false);
+		assert_eq!(
+			facade_outcome(receiver, &second, &second_voucher),
+			Ok(Some(FFORVoucherOutcome::Failed))
+		);
+		assert_eq!(
+			facade_outcome(receiver, &first, &first_voucher),
+			Ok(Some(FFORVoucherOutcome::Fulfilled))
+		);
+		assert_eq!(receiver.node.list_ffor_receiver_recovery_contexts().unwrap().len(), 2);
+		let bytes = persist(receiver);
+		let monitor = get_monitor!(receiver, channel).encode();
+		let restored = restore(receiver, &bytes, &monitor).unwrap();
+		assert!(restored.ffor_receiver_recovery_context(&channel, first.epoch_id()).is_ok());
+		assert!(restored.ffor_receiver_recovery_context(&channel, second.epoch_id()).is_ok());
+		send_payment(sender, &[receiver], 1_000_000);
+	}
 }

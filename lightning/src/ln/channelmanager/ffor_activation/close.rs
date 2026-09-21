@@ -41,6 +41,7 @@ where
 				channel.ffor_receiver_drain_binding(),
 				channel.ffor_receiver_closed_completion_hash(),
 				channel.ffor_receiver_drain_activation_hash(),
+				channel.ffor_receiver_predecessor_epoch(),
 			)
 			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
 		match channel.ffor_receiver_reconnect_outcome() {
@@ -193,6 +194,7 @@ where
 				channel.ffor_receiver_drain_binding(),
 				channel.ffor_receiver_closed_completion_hash(),
 				channel.ffor_receiver_drain_activation_hash(),
+				channel.ffor_receiver_predecessor_epoch(),
 			)
 			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
 		if matches!(

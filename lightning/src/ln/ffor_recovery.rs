@@ -168,6 +168,22 @@ impl Entry {
 				&& self.record.setup.funding_txo() == other.record.setup.funding_txo())
 	}
 
+	/// Only an archived terminal outcome lets a later epoch share this record's channel. A
+	/// setup-only record carries no durable abort evidence and therefore never permits reuse.
+	fn is_terminal(&self) -> bool {
+		self.record
+			.activation
+			.as_ref()
+			.map_or(false, |activation| activation.is_closed() || activation.is_aborted())
+	}
+
+	/// Two records may share a channel or funding identity only when at most one of them is
+	/// still unresolved. Exact duplicate keys are always refused.
+	fn conflicts_with(&self, other: &Self) -> bool {
+		self.has_same_identity(other)
+			&& (self.key == other.key || (!self.is_terminal() && !other.is_terminal()))
+	}
+
 	fn transition_reservation(record: &StoredSetup) -> usize {
 		if record.request.is_some() {
 			return MAX_RECORD_BYTES.saturating_sub(record.serialized_length());
@@ -287,15 +303,54 @@ impl FFORRecoveryRegistry {
 		&self, setup: &FFORReceiverSetup, fence: Option<(FFORReceiverFencePhase, [u8; 32])>,
 		abort_reason: Option<FFORReceiverAbortReason>,
 	) -> Result<(), DecodeError> {
-		self.validate_channel_lifecycle(setup, fence, abort_reason, None, None, None)
+		self.validate_channel_lifecycle(setup, fence, abort_reason, None, None, None, None)
+	}
+
+	/// A channel book for one epoch may coexist with earlier epochs of the same channel only
+	/// when every earlier record is terminal and the book names the one it replaced. A book
+	/// without a predecessor must be the channel's only epoch. Fails closed on any other shape,
+	/// including a pending request for a different epoch of the same channel.
+	pub(crate) fn validate_channel_predecessor(
+		&self, key: FFORRecoveryKey, predecessor: Option<[u8; 32]>,
+	) -> Result<(), DecodeError> {
+		if self.pending_requests.iter().any(|pending| {
+			pending.key.channel_id == key.channel_id && pending.key.epoch_id != key.epoch_id
+		}) {
+			return Err(DecodeError::InvalidValue);
+		}
+		let others: Vec<&Entry> = self
+			.entries
+			.iter()
+			.filter(|entry| entry.key.channel_id == key.channel_id && entry.key != key)
+			.collect();
+		match predecessor {
+			None if others.is_empty() => Ok(()),
+			Some(previous)
+				if previous != key.epoch_id
+					&& others.iter().all(|entry| entry.is_terminal())
+					&& others.iter().any(|entry| entry.key.epoch_id == previous) =>
+			{
+				Ok(())
+			},
+			_ => Err(DecodeError::InvalidValue),
+		}
+	}
+
+	/// Whether the archive retains a Closed or aborted activation record for this exact epoch.
+	pub(crate) fn is_terminal(&self, key: &FFORRecoveryKey) -> bool {
+		self.entries.iter().any(|entry| entry.key == *key && entry.is_terminal())
 	}
 
 	/// Check the channel-owned close binding against exact authenticated archived evidence.
+	/// `predecessor` is the terminal epoch the channel's current book replaced, if any; the
+	/// archive must retain that epoch's Closed or aborted record, and no other unresolved epoch
+	/// may share the channel.
 	pub(crate) fn validate_channel_lifecycle(
 		&self, setup: &FFORReceiverSetup, fence: Option<(FFORReceiverFencePhase, [u8; 32])>,
 		abort_reason: Option<FFORReceiverAbortReason>,
 		drain: Option<([u8; 32], Vec<u8>, bool, Option<FFORCooperativeJournal>)>,
 		completion_hash: Option<[u8; 32]>, drain_activation_hash: Option<[u8; 32]>,
+		predecessor: Option<[u8; 32]>,
 	) -> Result<(), DecodeError> {
 		if !self.contains_exact(setup) {
 			return Err(DecodeError::InvalidValue);
@@ -304,6 +359,7 @@ impl FFORRecoveryRegistry {
 		let header = authenticated.header();
 		let key =
 			FFORRecoveryKey { channel_id: ChannelId(header.channel_id), epoch_id: header.epoch_id };
+		self.validate_channel_predecessor(key, predecessor)?;
 		if let Some(record) = self.get_activation(&key) {
 			if record.is_draining() {
 				let close = record.close_record().ok_or(DecodeError::InvalidValue)?;
@@ -388,10 +444,15 @@ impl FFORRecoveryRegistry {
 	pub(crate) fn validate_activation_monitor(
 		&self, channel_id: ChannelId, monitor: &FFORMonitorRecoveryIdentity,
 	) -> Result<(), DecodeError> {
+		// Earlier epochs of the same channel are terminal; only the unresolved one binds the monitor.
 		let entry = self
 			.entries
 			.iter()
-			.find(|entry| entry.key.channel_id == channel_id)
+			.find(|entry| {
+				entry.key.channel_id == channel_id
+					&& entry.record.activation.is_some()
+					&& !entry.is_terminal()
+			})
 			.ok_or(DecodeError::InvalidValue)?;
 		let activation = entry.record.activation.as_ref().ok_or(DecodeError::InvalidValue)?;
 		activation.validate_monitor(&entry.record.setup, monitor)
@@ -414,7 +475,8 @@ impl FFORRecoveryRegistry {
 
 	/// Reauthenticate and reserve storage before changing the channel. Retain this permit while
 	/// installing the identical prepared setup under the peer lock, then commit it on success.
-	/// Exact retries are idempotent; the current format permits only one setup per channel/funding.
+	/// Exact retries are idempotent. A channel or funding identity may hold several epochs only
+	/// when every earlier record is Closed or aborted; those records are never replaced.
 	pub(crate) fn prepare_insert(
 		&mut self, setup: &FFORReceiverSetup,
 	) -> Result<FFORRecoveryInsertion<'_>, FFORRecoveryError> {
@@ -436,13 +498,14 @@ impl FFORRecoveryRegistry {
 		}) {
 			return Err(FFORRecoveryError::ConflictingRecord);
 		}
-		if let Some(existing) =
-			self.entries.iter().find(|existing| existing.has_same_identity(&entry))
-		{
-			if existing.key != entry.key || existing.record.encode() != entry.record.encode() {
+		if let Some(existing) = self.entries.iter().find(|existing| existing.key == entry.key) {
+			if existing.record.encode() != entry.record.encode() {
 				return Err(FFORRecoveryError::ConflictingRecord);
 			}
 			return Ok(FFORRecoveryInsertion { registry: self, entry: None });
+		}
+		if self.entries.iter().any(|existing| existing.conflicts_with(&entry)) {
+			return Err(FFORRecoveryError::ConflictingRecord);
 		}
 		self.check_capacity(entry.encoded_bytes, entry.reserved_transition_bytes())?;
 		Ok(FFORRecoveryInsertion { registry: self, entry: Some(entry) })
@@ -644,7 +707,7 @@ impl Readable for FFORRecoveryRegistry {
 			if entry.record.request.as_ref().map_or(false, |request| {
 				registry.find_request(request.local_request_id()).is_some()
 			}) || entry.encoded_bytes != length
-				|| registry.entries.iter().any(|existing| existing.has_same_identity(&entry))
+				|| registry.entries.iter().any(|existing| existing.conflicts_with(&entry))
 			{
 				return Err(DecodeError::InvalidValue);
 			}
@@ -678,9 +741,10 @@ impl Readable for FFORRecoveryRegistry {
 							|| (saved.record.chain_hash() == entry.record.chain_hash()
 								&& saved.record.funding_txo() == entry.record.funding_txo())
 					}) || registry.entries.iter().any(|saved| {
-					saved.key.channel_id == entry.key.channel_id
-						|| (saved.record.setup.chain_hash() == entry.record.chain_hash()
-							&& saved.record.setup.funding_txo() == entry.record.funding_txo())
+					!saved.is_terminal()
+						&& (saved.key.channel_id == entry.key.channel_id
+							|| (saved.record.setup.chain_hash() == entry.record.chain_hash()
+								&& saved.record.setup.funding_txo() == entry.record.funding_txo()))
 				}) {
 					return Err(DecodeError::InvalidValue);
 				}

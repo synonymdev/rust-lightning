@@ -125,6 +125,11 @@ impl FFORReceiverBook {
 	pub(super) fn is_closed(&self) -> bool {
 		self.drain.as_ref().map_or(false, |drain| drain.closed)
 	}
+
+	/// Closed with the retained completion hash of the final proof.
+	pub(super) fn is_closed_with_completion(&self) -> bool {
+		self.drain.as_ref().map_or(false, |drain| drain.closed && drain.completion_hash.is_some())
+	}
 }
 
 impl<SP: Deref> ChannelContext<SP>

@@ -1,7 +1,7 @@
 use super::*;
 use crate::chain::ChannelMonitorUpdateStatus;
 use crate::crypto::chacha20poly1305rfc::ChaCha20Poly1305RFC;
-use crate::ln::channelmanager::ffor_activation::drain_tests::{drain, park_two};
+use crate::ln::channelmanager::ffor_activation::drain_tests::{drain, park_two, park_two_epoch};
 use crate::ln::channelmanager::ffor_recovery_tests::restore;
 use crate::ln::ffor::decrypt_ffor_witness_record;
 use crate::ln::ffor_recovery::ffor_test_witness_manifests as manifests;
@@ -737,4 +737,117 @@ fn ffor_receipt_import_retains_protection_during_conflicting_reconnect() {
 		assert!(!matches!(event, MessageSendEvent::UpdateHTLCs { .. }));
 	}
 	sender.node.get_and_clear_pending_msg_events();
+}
+
+#[test]
+fn ffor_receipt_import_previous_epoch_after_channel_reuse_protects_original_monitor() {
+	for receiver_funds in [false, true] {
+		let configs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &configs);
+		let config = anchor_config();
+		let managers = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+		let nodes = create_network(2, &node_cfgs, &managers);
+		let (funder, other) = if receiver_funds { (1, 0) } else { (0, 1) };
+		let id = create_announced_chan_between_nodes_with_value(
+			&nodes, funder, other, 100_000, 40_000_000,
+		)
+		.2;
+		let (sender, receiver) = (&nodes[0], &nodes[1]);
+		let peer_id = sender.node.get_our_node_id();
+		let (vouchers, preimage) = park_two(sender, receiver, id);
+		let context = activate(sender, receiver, id);
+		let receipt = receipt(&context, &manifests(&context, 1)[0].1, preimage, 90);
+		{
+			let peers = sender.node.per_peer_state.read().unwrap();
+			let mut peer = peers.get(&receiver.node.get_our_node_id()).unwrap().lock().unwrap();
+			peer.channel_by_id.get_mut(&id).unwrap().as_funded_mut().unwrap().exit_quiescence();
+		}
+		receiver.node.prepare_ffor_receiver_close(&id, &peer_id, EPOCH).unwrap();
+		persist(receiver.node);
+		assert!(receiver
+			.node
+			.release_ffor_receiver_close(&id, &peer_id, EPOCH, |_| Ok(()))
+			.unwrap());
+		let ack = signed(
+			sender,
+			&context,
+			Payload::CloseAck(CloseAck {
+				activation_hash: context.activation_hash(),
+				num_slots: 2,
+				settled: vec![0],
+				preimages: Vec::new(),
+				preimages_tlv_present: true,
+			}),
+		);
+		receiver.node.accept_ffor_receiver_close_ack(&id, &peer_id, EPOCH, &ack).unwrap();
+		persist(receiver.node);
+		assert!(receiver.node.release_ffor_receiver_drain(&id, &peer_id, EPOCH).unwrap());
+		let (fulfilled, failed) = drain(sender, receiver);
+		assert!(fulfilled.is_empty());
+		assert_eq!(failed, vouchers.iter().map(|voucher| voucher.htlc_id).collect::<Vec<_>>());
+		sender.node.get_and_clear_pending_events();
+		let monitor = get_monitor!(receiver, id).ffor_commitment_snapshot().unwrap();
+		receiver.node.prepare_ffor_receiver_closed(&id, &peer_id, EPOCH, &monitor).unwrap();
+		persist(receiver.node);
+		assert!(receiver.node.release_ffor_receiver_closed(&id, &peer_id, EPOCH).unwrap());
+		// A later epoch now owns the channel book. The first epoch's receipt still belongs to
+		// the original monitor and never touches the new book or an ordinary payment.
+		let (later, _) = park_two_epoch(sender, receiver, id, [82; 32]);
+		assert_ne!(later[0].payment_hash, vouchers[0].payment_hash);
+		receiver.chain_monitor.added_monitors.lock().unwrap().clear();
+		assert!(matches!(
+			receiver
+				.node
+				.import_ffor_receiver_witness_receipt(
+					&context,
+					&receipt,
+					&snapshot(receiver, &context, &receipt)
+				)
+				.unwrap(),
+			FFORWitnessReceiptProgress::PendingMonitor { .. }
+		));
+		check_added_monitors(receiver, 1);
+		let known = get_monitor!(receiver, id).get_stored_preimages();
+		assert_eq!(known[&vouchers[0].payment_hash].0, preimage);
+		assert!(!known.contains_key(&later[0].payment_hash));
+		assert!(matches!(
+			receiver
+				.node
+				.import_ffor_receiver_witness_receipt(
+					&context,
+					&receipt,
+					&snapshot(receiver, &context, &receipt)
+				)
+				.unwrap(),
+			FFORWitnessReceiptProgress::MonitorPersisted { .. }
+		));
+		assert_eq!(
+			receiver
+				.node
+				.ffor_receiver_voucher_outcome(
+					&context,
+					1,
+					vouchers[0].payment_hash,
+					vouchers[0].amount_msat
+				)
+				.unwrap(),
+			Some(crate::ln::ffor::FFORVoucherOutcome::Failed)
+		);
+		let restored =
+			restore(receiver, &persist(receiver.node), &get_monitor!(receiver, id).encode())
+				.unwrap();
+		assert!(matches!(
+			restored
+				.import_ffor_receiver_witness_receipt(
+					&context,
+					&receipt,
+					&snapshot(receiver, &context, &receipt)
+				)
+				.unwrap(),
+			FFORWitnessReceiptProgress::MonitorPersisted { .. }
+		));
+		no_payment_events(receiver.node);
+		no_payment_events(&restored);
+		receiver.node.get_and_clear_pending_msg_events();
+	}
 }
