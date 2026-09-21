@@ -68,6 +68,8 @@ pub enum FFORReceiverAbortReason {
 	Restarted,
 	/// The first voucher hash reused a revealed counterparty commitment secret.
 	CommitmentSecretReused,
+	/// The owned quiescence handshake no longer matched its voucher evidence or deadline.
+	QuiescenceFailed,
 }
 
 impl_writeable_tlv_based_enum!(FFORReceiverAbortReason,
@@ -76,7 +78,20 @@ impl_writeable_tlv_based_enum!(FFORReceiverAbortReason,
 	(4, Disconnected) => {},
 	(6, Restarted) => {},
 	(8, CommitmentSecretReused) => {},
+	(10, QuiescenceFailed) => {},
 );
+
+/// State of the receiver's experimental, connection-scoped STFU handshake.
+///
+/// Neither state means that an epoch is activated or an invoice can be exposed. Quiescence
+/// ends on disconnect; a later activation mechanism must establish its own durable freeze.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FFORReceiverQuiescenceStatus {
+	/// The receiver has requested quiescence and is awaiting the peer's STFU.
+	Negotiating,
+	/// Both STFU messages were exchanged and the retained voucher proof still matches.
+	Quiescent,
+}
 
 /// Receiver-side state of one experimental voucher registration.
 ///

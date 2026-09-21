@@ -66,8 +66,8 @@ use crate::ln::channel::{
 };
 use crate::ln::channel_state::ChannelDetails;
 use crate::ln::ffor::{
-	FFORCommitmentError, FFORMonitorSnapshot, FFORReceiverError, FFORReceiverStatus,
-	FFORSettlementParty, FFORVoucher, FFORVoucherCommitments,
+	FFORCommitmentError, FFORMonitorSnapshot, FFORReceiverError, FFORReceiverQuiescenceStatus,
+	FFORReceiverStatus, FFORSettlementParty, FFORVoucher, FFORVoucherCommitments,
 };
 use crate::ln::ffor_persistence::FFORPersistenceBarrier;
 pub use crate::ln::ffor_persistence::{FFORPersistenceRequirement, FFORPersistenceToken};
@@ -4400,6 +4400,76 @@ where
 		Ok(requirement)
 	}
 
+	/// Request a connection-scoped STFU handshake for an authenticated receiver setup.
+	///
+	/// Both peers must advertise quiescence support. The channel must have exactly the complete,
+	/// irrevocably committed voucher book, with no pending updates, splices or competing handshake.
+	/// Obtain `monitor` from [`ChannelMonitor::ffor_commitment_snapshot`] and release its monitor
+	/// guard before calling. This consumes and retains the proof, rechecking it after both STFU
+	/// messages. Any intervening commitment or monitor update invalidates that proof.
+	///
+	/// Quiescence ownership lasts until abort or disconnect. This does not activate an epoch or
+	/// authorize invoices. A restart aborts setup. The runtime must abort if its handshake timeout
+	/// expires; normal peer processing also enforces the existing stock quiescence timeout.
+	pub fn request_ffor_receiver_quiescence(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		monitor: FFORMonitorSnapshot,
+	) -> Result<(), FFORReceiverError> {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let current_height = self.best_block.read().unwrap().height;
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let mut peer = per_peer_state
+			.get(counterparty_node_id)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?
+			.lock()
+			.unwrap();
+		if !self.init_features().supports_quiescence()
+			|| !peer.latest_features.supports_quiescence()
+		{
+			return Err(FFORCommitmentError::UnsupportedChannelType.into());
+		}
+		let channel = peer
+			.channel_by_id
+			.get_mut(channel_id)
+			.and_then(Channel::as_funded_mut)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
+		channel
+			.ffor_validate_receiver_identity(self.our_network_pubkey, self.chain_hash)
+			.map_err(|_| FFORCommitmentError::InvalidVoucherBook)?;
+		if let Some(msg) = channel.request_ffor_receiver_quiescence(
+			epoch_id,
+			monitor,
+			current_height,
+			&self.logger,
+		)? {
+			peer.pending_msg_events
+				.push(MessageSendEvent::SendStfu { node_id: *counterparty_node_id, msg });
+		}
+		Ok(())
+	}
+
+	/// Inspect an owned receiver STFU handshake, rechecking its proof when quiescent.
+	///
+	/// This status is connection-scoped and never establishes activation or invoice readiness.
+	/// A changed book, monitor update or expired deadline makes the completed proof invalid.
+	pub fn ffor_receiver_quiescence_status(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+	) -> Result<FFORReceiverQuiescenceStatus, FFORReceiverError> {
+		let current_height = self.best_block.read().unwrap().height;
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer = per_peer_state
+			.get(counterparty_node_id)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?
+			.lock()
+			.unwrap();
+		let channel = peer
+			.channel_by_id
+			.get(channel_id)
+			.and_then(Channel::as_funded)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
+		channel.ffor_receiver_quiescence_status(epoch_id, current_height, &self.logger)
+	}
+
 	/// Inspect an experimental receiver registration. `Parked` requires the complete two-view
 	/// commitment proof, including completed monitor updates and valid holder claim signatures.
 	///
@@ -4430,6 +4500,8 @@ where
 	/// commitment rounds are failed only after those rounds finish. A disconnect or restart retains
 	/// the abort and resumes the unwind on reconnection. Ordinary payments can proceed after drain,
 	/// but further FFOR registrations on this channel remain refused, including a different epoch.
+	/// If STFU was sent, abort requests a peer disconnect to end both sides' quiescence. Reconnect
+	/// and continue message processing to drain; failures are not sent while the peer is quiescent.
 	pub fn abort_ffor_receiver_book(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
 	) -> Result<(), FFORReceiverError> {
@@ -4446,7 +4518,20 @@ where
 			.and_then(Channel::as_funded_mut)
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
 		channel.abort_ffor_receiver_book(epoch_id)?;
+		let disconnect = channel.release_ffor_receiver_quiescence();
 		channel.ffor_queue_aborted_vouchers(&self.logger);
+		if disconnect {
+			peer.pending_msg_events.push(MessageSendEvent::HandleError {
+				node_id: *counterparty_node_id,
+				action: msgs::ErrorAction::DisconnectPeerWithWarning {
+					msg: msgs::WarningMessage {
+						channel_id: *channel_id,
+						data: "Aborting FFOR receiver quiescence before draining vouchers"
+							.to_owned(),
+					},
+				},
+			});
+		}
 		Ok(())
 	}
 
@@ -11796,7 +11881,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	}
 
 	#[rustfmt::skip]
-	fn internal_stfu(&self, counterparty_node_id: &PublicKey, msg: &msgs::Stfu) -> Result<bool, MsgHandleErrInternal> {
+	fn internal_stfu(&self, counterparty_node_id: &PublicKey, msg: &msgs::Stfu, persist_ffor: &mut bool) -> Result<bool, MsgHandleErrInternal> {
 		let per_peer_state = self.per_peer_state.read().unwrap();
 		let peer_state_mutex = per_peer_state.get(counterparty_node_id).ok_or_else(|| {
 			debug_assert!(false);
@@ -11825,6 +11910,14 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					let resp = try_channel_entry!(self, peer_state, res, chan_entry);
 					match resp {
 						None => Ok(false),
+						Some(StfuResponse::FFORReceiver { is_initiator }) => {
+							*persist_ffor = true;
+							let current_height = self.best_block.read().unwrap().height;
+							let chan = chan_entry.get_mut().as_funded_mut().unwrap();
+							let res = chan.complete_ffor_receiver_quiescence(is_initiator, current_height, &&logger);
+							try_channel_entry!(self, peer_state, res, chan_entry);
+							Ok(false)
+						},
 						Some(StfuResponse::Stfu(msg)) => {
 							peer_state.pending_msg_events.push(MessageSendEvent::SendStfu {
 								node_id: *counterparty_node_id,
@@ -15070,17 +15163,22 @@ where
 
 	fn handle_stfu(&self, counterparty_node_id: PublicKey, msg: &msgs::Stfu) {
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
-			let res = self.internal_stfu(&counterparty_node_id, msg);
-			let persist = match &res {
-				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
-				Err(_) => NotifyOption::SkipPersistHandleEvents,
-				Ok(responded) => {
-					if *responded {
-						NotifyOption::SkipPersistHandleEvents
-					} else {
-						NotifyOption::SkipPersistNoEvents
-					}
-				},
+			let mut persist_ffor = false;
+			let res = self.internal_stfu(&counterparty_node_id, msg, &mut persist_ffor);
+			let persist = if persist_ffor {
+				NotifyOption::DoPersist
+			} else {
+				match &res {
+					Err(e) if e.closes_channel() => NotifyOption::DoPersist,
+					Err(_) => NotifyOption::SkipPersistHandleEvents,
+					Ok(responded) => {
+						if *responded {
+							NotifyOption::SkipPersistHandleEvents
+						} else {
+							NotifyOption::SkipPersistNoEvents
+						}
+					},
+				}
 			};
 			let _ = handle_error!(self, res, counterparty_node_id);
 			persist

@@ -1,11 +1,13 @@
 use super::*;
 
+mod quiescence;
 mod setup;
 use crate::ln::ffor::{
 	self as verification, FFORCommitmentError, FFORMonitorSnapshot, FFORReceiverAbortReason,
 	FFORReceiverError, FFORReceiverStatus, FFORSettlementParty, FFORVoucher,
 	FFORVoucherCommitments, FFORVoucherFailure,
 };
+pub(crate) use quiescence::FFORReceiverQuiescence;
 #[cfg(test)]
 pub(crate) use setup::ffor_setup_test_messages;
 pub(crate) use setup::FFORReceiverSetup;

@@ -9,6 +9,8 @@ use crate::util::config::UserConfig;
 use crate::util::ser::Writeable;
 use core::sync::atomic::Ordering;
 
+mod quiescence;
+
 pub(super) fn anchor_config() -> UserConfig {
 	let mut config = test_default_channel_config();
 	config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;

@@ -45,6 +45,22 @@ only derives encrypted failure material from their onion keys. `Registered` repo
 progress; `Parked` additionally requires the complete monitor-backed commitment proof,
 including both current commitment transactions and holder claim signatures.
 
+`request_ffor_receiver_quiescence` starts an owned STFU handshake only for a
+complete authenticated book and peers that support quiescence. It retains the
+monitor proof and checks it again after both STFU messages, including the receiver's
+initiator role and the settlement deadline. An intervening commitment or monitor
+update invalidates the proof. `ffor_receiver_quiescence_status` distinguishes a
+pending handshake from completed, still-valid quiescence. Neither state authorizes
+an invoice. Stock quiescence ends on disconnect and is not an activation freeze.
+
+The owned handshake excludes a competing splice. Explicit abort after sending
+STFU requests a disconnect before voucher failures can drain on reconnection.
+Timeout, disconnect and restart also unwind setup; force-close remains available.
+Only the epoch identity is serialized in a required action variant. Transient
+monitor evidence is discarded on restart, which aborts the setup. The runtime must
+enforce its handshake deadline through explicit abort, alongside the existing
+stock peer timeout.
+
 An explicit abort, mismatch, disconnect, or restart unwinds committed vouchers using
 ordinary HTLC failure rounds. Partial rounds finish before their HTLCs are failed.
 `Aborting` and `Aborted` distinguish pending removal from a synchronized channel with
@@ -118,6 +134,10 @@ Authenticated setup tests cover signature and identity mismatches, funding and
 commitment mismatches, history bounds, block-height expiry and revealed-secret reuse.
 Registry and manager recovery tests cover closure retention, stale channel disposal,
 missing or conflicting records, capacity refusal and archive-only serialization.
+Quiescence tests cover real STFU exchange, unsupported peers, competing actions,
+partial rounds, delayed monitors, changed commitments, deadline equality, initiator
+tie loss, pending abort, disconnect, restart and force-close. The ordinary
+quiescence and splice suites also pass with these channel changes.
 
 ## Next boundary
 

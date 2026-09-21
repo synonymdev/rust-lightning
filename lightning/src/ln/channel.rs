@@ -2820,6 +2820,7 @@ impl_writeable_tlv_based!(SpliceInstructions, {
 
 pub(crate) enum QuiescentAction {
 	Splice(SpliceInstructions),
+	FFORReceiver(ffor::FFORReceiverQuiescence),
 	#[cfg(any(test, fuzzing))]
 	DoNothing,
 }
@@ -2827,16 +2828,19 @@ pub(crate) enum QuiescentAction {
 pub(crate) enum StfuResponse {
 	Stfu(msgs::Stfu),
 	SpliceInit(msgs::SpliceInit),
+	FFORReceiver { is_initiator: bool },
 }
 
 #[cfg(any(test, fuzzing))]
 impl_writeable_tlv_based_enum_upgradable!(QuiescentAction,
 	(0, DoNothing) => {},
 	{1, Splice} => (),
+	{2, FFORReceiver} => (),
 );
 #[cfg(not(any(test, fuzzing)))]
 impl_writeable_tlv_based_enum_upgradable!(QuiescentAction,,
 	{1, Splice} => (),
+	{2, FFORReceiver} => (),
 );
 
 /// Wrapper around a [`Transaction`] useful for caching the result of [`Transaction::compute_txid`].
@@ -7012,7 +7016,6 @@ where
 							contributed_outputs: outputs,
 						})
 					},
-					#[cfg(any(test, fuzzing))]
 					Some(quiescent_action) => {
 						self.quiescent_action = Some(quiescent_action);
 						None
@@ -9294,6 +9297,7 @@ where
 		if let Some(book) = self.context.ffor_receiver_book.as_mut() {
 			book.abort(crate::ln::ffor::FFORReceiverAbortReason::Disconnected);
 		}
+		self.release_ffor_receiver_quiescence();
 
 		// We only clear `peer_disconnected` if we were able to reestablish the channel. We always
 		// reset our awaiting response in case we failed reestablishment and are disconnecting.
@@ -12135,6 +12139,11 @@ where
 	pub fn validate_splice_init(
 		&self, msg: &msgs::SpliceInit, our_funding_contribution: SignedAmount,
 	) -> Result<FundingScope, ChannelError> {
+		if matches!(self.quiescent_action, Some(QuiescentAction::FFORReceiver(_))) {
+			return Err(ChannelError::WarnAndDisconnect(
+				"FFOR receiver owns this quiescence session".to_owned(),
+			));
+		}
 		if self.holder_commitment_point.current_point().is_none() {
 			return Err(ChannelError::WarnAndDisconnect(format!(
 				"Channel {} commitment point needs to be advanced once before spliced",
@@ -13316,6 +13325,11 @@ where
 			"Received counterparty stfu, channel is now quiescent and we are{} the initiator",
 			if !is_holder_quiescence_initiator { " not" } else { "" }
 		);
+		if matches!(self.quiescent_action, Some(QuiescentAction::FFORReceiver(_))) {
+			return Ok(Some(StfuResponse::FFORReceiver {
+				is_initiator: is_holder_quiescence_initiator,
+			}));
+		}
 
 		if is_holder_quiescence_initiator {
 			match self.quiescent_action.take() {
@@ -13340,6 +13354,7 @@ where
 					let splice_init = self.send_splice_init(instructions);
 					return Ok(Some(StfuResponse::SpliceInit(splice_init)));
 				},
+				Some(QuiescentAction::FFORReceiver(_)) => unreachable!(),
 				#[cfg(any(test, fuzzing))]
 				Some(QuiescentAction::DoNothing) => {
 					// In quiescence test we want to just hang out here, letting the test manually
@@ -15760,6 +15775,7 @@ where
 			quiescent_action,
 		};
 		channel.ffor_restored()?;
+		channel.restore_ffor_receiver_quiescence()?;
 		Ok(channel)
 	}
 }
