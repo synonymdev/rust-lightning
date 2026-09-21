@@ -56,6 +56,7 @@ use crate::ln::channel_keys::{
 	RevocationKey,
 };
 use crate::ln::channelmanager::{HTLCSource, PaymentClaimDetails, SentHTLCId};
+use crate::ln::ffor::{FFORCommitmentError, FFORMonitorSnapshot};
 use crate::ln::msgs::DecodeError;
 use crate::ln::types::ChannelId;
 use crate::sign::{
@@ -2102,6 +2103,134 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// Note that for channels closed prior to LDK 0.1, this may return [`u64::MAX`].
 	pub fn get_latest_update_id(&self) -> u64 {
 		self.inner.lock().unwrap().get_latest_update_id()
+	}
+
+	/// Captures canonical commitment identities and signed claim material for FFOR verification.
+	///
+	/// Release any [`ChainMonitor::get_monitor`] guard before passing the result to
+	/// [`ChannelManager::ffor_voucher_commitments`], so no monitor lock is held while acquiring the
+	/// manager's channel lock. The manager rejects snapshots that do not match its current state.
+	/// This snapshot alone neither proves completed persistence nor activates offline receiving.
+	///
+	/// [`ChainMonitor::get_monitor`]: crate::chain::chainmonitor::ChainMonitor::get_monitor
+	/// [`ChannelManager::ffor_voucher_commitments`]: crate::ln::channelmanager::ChannelManager::ffor_voucher_commitments
+	pub fn ffor_commitment_snapshot(&self) -> Result<FFORMonitorSnapshot, FFORCommitmentError> {
+		let inner = self.inner.lock().unwrap();
+		if inner.funding_spend_seen || inner.lockdown_from_offchain || inner.holder_tx_signed {
+			return Err(FFORCommitmentError::ChannelUnavailable);
+		}
+		if !inner.pending_funding.is_empty() {
+			return Err(FFORCommitmentError::PendingUpdates);
+		}
+		let counterparty_txid = inner
+			.funding
+			.current_counterparty_commitment_txid
+			.ok_or(FFORCommitmentError::MonitorMismatch)?;
+		let htlcs = inner
+			.funding
+			.counterparty_claimable_outpoints
+			.get(&counterparty_txid)
+			.ok_or(FFORCommitmentError::MonitorMismatch)?;
+		Ok(FFORMonitorSnapshot {
+			channel_id: inner.channel_id(),
+			funding_txo: inner.get_funding_txo(),
+			update_id: inner.latest_update_id,
+			destination_script: inner.destination_script.clone(),
+			holder: inner.funding.current_holder_commitment_tx.clone(),
+			holder_number: inner.current_holder_commitment_number,
+			counterparty_txid,
+			counterparty_number: inner.current_counterparty_commitment_number,
+			counterparty_htlcs: htlcs.iter().map(|(htlc, _)| htlc.clone()).collect(),
+			revoked_through: inner.commitment_secrets.get_min_seen_secret(),
+		})
+	}
+
+	/// Validate publication while holding this monitor's state lock.
+	///
+	/// Only the actual owning watcher may use this boundary. It must also exclude pending monitor
+	/// persistence and retain ownership of this exact monitor throughout the bounded callback.
+	/// The callback must perform no I/O or native reentry. Snapshot comparisons alone cannot replace
+	/// this lock: chain spends and locally learned preimages need not change the update counter.
+	pub fn validate_and_publish_ffor_invoice(
+		&self, check: &crate::ln::ffor::FFORInvoiceMonitorCheck,
+		publish: &mut dyn FnMut() -> Result<(), ()>,
+	) -> Result<bool, crate::ln::ffor::FFORReceiverError> {
+		use crate::ln::channel::INITIAL_COMMITMENT_NUMBER;
+		use crate::ln::ffor::FFORReceiverError;
+		let inner = self.inner.lock().unwrap();
+		let holder = inner.funding.current_holder_commitment_tx.trust();
+		if inner.channel_id() != check.channel_id
+			|| inner.get_funding_txo() != check.funding_txo
+			|| inner.counterparty_node_id != check.settlement
+			|| inner.latest_update_id != check.update_id
+			|| inner.funding_spend_seen
+			|| inner.lockdown_from_offchain
+			|| inner.holder_tx_signed
+			|| !inner.pending_funding.is_empty()
+			|| inner.payment_preimages.contains_key(&check.payment_hash)
+			|| holder.txid() != check.commitments.holder.txid
+			|| inner.funding.current_counterparty_commitment_txid
+				!= Some(check.commitments.counterparty.txid)
+			|| INITIAL_COMMITMENT_NUMBER.checked_sub(inner.current_holder_commitment_number)
+				!= Some(check.commitments.holder.number)
+			|| INITIAL_COMMITMENT_NUMBER.checked_sub(inner.current_counterparty_commitment_number)
+				!= Some(check.commitments.counterparty.number)
+			|| !holder.nondust_htlcs().iter().any(|htlc| {
+				!htlc.offered
+					&& htlc.payment_hash == check.payment_hash
+					&& htlc.amount_msat == check.amount_msat
+					&& htlc.cltv_expiry == check.voucher_expiry
+					&& htlc.transaction_output_index.is_some()
+			}) {
+			return Err(FFORReceiverError::InvalidInvoice);
+		}
+		check.validate_time(inner.best_block.height)?;
+		Ok(publish().is_ok())
+	}
+
+	/// Observe one authenticated witness preimage in this monitor, including after force-close.
+	///
+	/// Drop every monitor guard before passing the result to
+	/// [`ChannelManager::import_ffor_receiver_witness_receipt`]. This captures in-memory state;
+	/// only that manager call can check matching native ownership and outstanding persistence.
+	/// A pending splice is conservatively refused so original funding cannot be substituted.
+	///
+	/// [`ChannelManager::import_ffor_receiver_witness_receipt`]: crate::ln::channelmanager::ChannelManager::import_ffor_receiver_witness_receipt
+	pub fn ffor_witness_receipt_snapshot(
+		&self, receipt: &crate::ln::ffor::FFORWitnessReceipt,
+	) -> Result<crate::ln::ffor::FFORWitnessMonitorSnapshot, FFORCommitmentError> {
+		let inner = self.inner.lock().unwrap();
+		if !inner.pending_funding.is_empty() {
+			return Err(FFORCommitmentError::PendingUpdates);
+		}
+		let payment_hash = PaymentHash(receipt.body().payment_hash());
+		Ok(crate::ln::ffor::FFORWitnessMonitorSnapshot {
+			channel_id: inner.channel_id(),
+			funding_txo: inner.get_funding_txo(),
+			counterparty: inner.counterparty_node_id,
+			update_id: inner.latest_update_id,
+			payment_hash,
+			known_preimage: inner
+				.payment_preimages
+				.get(&payment_hash)
+				.map_or(false, |(preimage, _)| preimage.0 == receipt.body().preimage()),
+		})
+	}
+
+	/// The frozen archive must match the actual monitor, even when force-close prevents obtaining
+	/// a live activation snapshot. Preimage and close updates may advance only the monitor update ID.
+	pub(crate) fn ffor_recovery_identity(&self) -> crate::ln::ffor::FFORMonitorRecoveryIdentity {
+		let inner = self.inner.lock().unwrap();
+		crate::ln::ffor::FFORMonitorRecoveryIdentity {
+			channel_id: inner.channel_id(),
+			funding_txo: inner.get_funding_txo(),
+			update_id: inner.latest_update_id,
+			holder_number: inner.current_holder_commitment_number,
+			holder_txid: inner.funding.current_holder_commitment_tx.trust().txid(),
+			counterparty_number: inner.current_counterparty_commitment_number,
+			counterparty_txid: inner.funding.current_counterparty_commitment_txid,
+			destination_script: inner.destination_script.clone(),
+		}
 	}
 
 	/// Gets the funding transaction outpoint of the channel this ChannelMonitor is monitoring for.

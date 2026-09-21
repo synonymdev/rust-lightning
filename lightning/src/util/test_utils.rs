@@ -557,6 +557,13 @@ impl<'a> TestChainMonitor<'a> {
 	}
 }
 impl<'a> chain::Watch<TestChannelSigner> for TestChainMonitor<'a> {
+	fn validate_and_publish_ffor_invoice(
+		&self, check: &crate::ln::ffor::FFORInvoiceMonitorCheck,
+		publish: &mut dyn FnMut() -> Result<(), ()>,
+	) -> Result<bool, crate::ln::ffor::FFORReceiverError> {
+		self.chain_monitor.validate_and_publish_ffor_invoice(check, publish)
+	}
+
 	fn watch_channel(
 		&self, channel_id: ChannelId, monitor: ChannelMonitor<TestChannelSigner>,
 	) -> Result<chain::ChannelMonitorUpdateStatus, ()> {
@@ -1801,6 +1808,9 @@ impl NodeSigner for TestNodeSigner {
 }
 
 pub struct TestKeysInterface {
+	pub unavailable_ffor_signer: AtomicBool,
+	pub wrong_invoice_signer: AtomicBool,
+	pub unavailable_node_ecdh: AtomicBool,
 	pub backing: DynKeysInterface,
 	pub override_random_bytes: Mutex<Option<[u8; 32]>>,
 	pub disable_revocation_policy_check: bool,
@@ -1823,6 +1833,15 @@ impl EntropySource for TestKeysInterface {
 }
 
 impl NodeSigner for TestKeysInterface {
+	fn sign_ffor_message(
+		&self, request: &crate::sign::ffor::FFORSigningRequest<'_>,
+	) -> Result<Signature, ()> {
+		if self.unavailable_ffor_signer.load(Ordering::Acquire) {
+			return Err(());
+		}
+		self.backing.sign_ffor_message(request)
+	}
+
 	fn get_node_id(&self, recipient: Recipient) -> Result<PublicKey, ()> {
 		self.backing.get_node_id(recipient)
 	}
@@ -1830,6 +1849,9 @@ impl NodeSigner for TestKeysInterface {
 	fn ecdh(
 		&self, recipient: Recipient, other_key: &PublicKey, tweak: Option<&Scalar>,
 	) -> Result<SharedSecret, ()> {
+		if self.unavailable_node_ecdh.load(Ordering::Acquire) {
+			return Err(());
+		}
 		self.backing.ecdh(recipient, other_key, tweak)
 	}
 
@@ -1840,6 +1862,12 @@ impl NodeSigner for TestKeysInterface {
 	fn sign_invoice(
 		&self, invoice: &RawBolt11Invoice, recipient: Recipient,
 	) -> Result<RecoverableSignature, ()> {
+		if self.wrong_invoice_signer.load(Ordering::Acquire) {
+			return Ok(Secp256k1::new().sign_ecdsa_recoverable(
+				&secp256k1::Message::from_digest(invoice.signable_hash()),
+				&SecretKey::from_slice(&[3; 32]).unwrap(),
+			));
+		}
 		self.backing.sign_invoice(invoice, recipient)
 	}
 
@@ -1951,6 +1979,9 @@ impl TestKeysInterface {
 	fn build(backing: Box<dyn DynKeysInterfaceTrait<EcdsaSigner = DynSigner>>) -> Self {
 		Self {
 			backing: DynKeysInterface::new(backing),
+			unavailable_ffor_signer: AtomicBool::new(false),
+			wrong_invoice_signer: AtomicBool::new(false),
+			unavailable_node_ecdh: AtomicBool::new(false),
 			override_random_bytes: Mutex::new(None),
 			disable_revocation_policy_check: false,
 			disable_all_state_policy_checks: false,

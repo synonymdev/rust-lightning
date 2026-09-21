@@ -77,6 +77,7 @@ use musig2::types::{PartialSignature, PublicNonce};
 pub(crate) mod type_resolver;
 
 pub mod ecdsa;
+pub mod ffor;
 #[cfg(taproot)]
 pub mod taproot;
 pub mod tx_builder;
@@ -988,6 +989,21 @@ pub trait NodeSigner {
 	/// An `Err` can be returned to signal that the signer is unavailable / cannot produce a valid
 	/// signature.
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()>;
+
+	/// Sign an experimental FFOR Variant D message with the local node identity.
+	///
+	/// The compact low-S ECDSA signature must authenticate the request's single SHA256 digest,
+	/// including the `ffor/msg` domain and the two-byte wire type. Do not use [`Self::sign_message`],
+	/// which uses a different prefix. Implementers may inspect the complete unsigned wire bytes
+	/// and refuse requests outside their policy. The caller must validate canonical protocol
+	/// fields and the intended channel transition before requesting a signature.
+	///
+	/// This operation does not change channel state or establish durable activation. It never
+	/// uses a phantom identity. The default refuses signing, preserving compatibility for
+	/// external signers that have not explicitly implemented this experimental protocol.
+	fn sign_ffor_message(&self, _request: &ffor::FFORSigningRequest<'_>) -> Result<Signature, ()> {
+		Err(())
+	}
 }
 
 /// A trait that describes a wallet capable of creating a spending [`Transaction`] from a set of
@@ -2404,6 +2420,11 @@ impl NodeSigner for KeysManager {
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		Ok(crate::util::message_signing::sign(msg, &self.node_secret))
 	}
+
+	fn sign_ffor_message(&self, request: &ffor::FFORSigningRequest<'_>) -> Result<Signature, ()> {
+		let message = hash_to_message!(&request.digest());
+		Ok(sign_with_aux_rand(&self.secp_ctx, &message, &self.node_secret, &self))
+	}
 }
 
 impl OutputSpender for KeysManager {
@@ -2572,6 +2593,10 @@ impl NodeSigner for PhantomKeysManager {
 
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		self.inner.sign_message(msg)
+	}
+
+	fn sign_ffor_message(&self, request: &ffor::FFORSigningRequest<'_>) -> Result<Signature, ()> {
+		self.inner.sign_ffor_message(request)
 	}
 }
 

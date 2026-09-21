@@ -18,6 +18,11 @@ pub mod channel_keys;
 pub mod channel_state;
 pub mod channelmanager;
 mod features;
+pub mod ffor;
+mod ffor_persistence;
+mod ffor_recovery;
+#[cfg(test)]
+mod ffor_tests;
 pub mod funding;
 pub mod inbound_payment;
 pub mod msgs;
