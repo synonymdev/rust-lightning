@@ -7,6 +7,8 @@ use alloc::vec::Vec;
 
 use core::fmt;
 
+use bitcoin::locktime::absolute::LOCK_TIME_THRESHOLD;
+
 use crate::amounts::{AmountError, FeePolicy};
 
 /// BOLT 2 upper bound, not a promise of available channel capacity.
@@ -28,7 +30,7 @@ pub struct BookTerms {
 	pub fees: FeePolicy,
 	/// Last height at which the peer can admit delegated payments.
 	pub settlement_deadline: u32,
-	/// Uniform absolute HTLC expiry.
+	/// Uniform absolute HTLC expiry height, strictly below Bitcoin's locktime threshold.
 	pub voucher_expiry: u32,
 }
 
@@ -75,7 +77,7 @@ pub enum BookError {
 	BudgetMismatch,
 	/// The voucher sum exceeds the receiver's negotiated in-flight bound.
 	InFlightLimit,
-	/// Admission has already ended, or the required claim margin does not fit.
+	/// Admission has ended, the claim margin does not fit, or expiry is not a block height.
 	Deadline,
 	/// The settlement peer cannot fund the book and retain its reserve.
 	SettlementReserve,
@@ -119,7 +121,8 @@ pub fn validate_anchor_book(
 		return Err(BookError::SlotCount);
 	}
 	let required_expiry = terms.settlement_deadline.checked_add(claim_margin_blocks);
-	if terms.settlement_deadline <= current_height
+	if terms.voucher_expiry >= LOCK_TIME_THRESHOLD
+		|| terms.settlement_deadline <= current_height
 		|| claim_margin_blocks == 0
 		|| required_expiry.map_or(true, |expiry| terms.voucher_expiry < expiry)
 	{

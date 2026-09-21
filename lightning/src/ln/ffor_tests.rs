@@ -7,6 +7,7 @@ use crate::ln::types::ChannelId;
 use crate::types::payment::{PaymentHash, PaymentSecret};
 use crate::util::config::UserConfig;
 use crate::util::ser::Writeable;
+use core::sync::atomic::Ordering;
 
 pub(super) fn anchor_config() -> UserConfig {
 	let mut config = test_default_channel_config();
@@ -977,4 +978,198 @@ fn ffor_parking_multiple_rounds_and_extra_add_abort_the_entire_book() {
 	);
 	assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
 	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+}
+
+#[test]
+fn ffor_parking_retries_unavailable_node_signer_before_and_after_restart() {
+	// Recovery while registered, after explicit abort, and after a persisted restart abort.
+	for recovery in 0..3 {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let (persister, chain_monitor);
+		let config = anchor_config();
+		let node_chanmgrs =
+			create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config.clone())]);
+		let reloaded;
+		let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+		let sender_id = nodes[0].node.get_our_node_id();
+		let receiver_id = nodes[1].node.get_our_node_id();
+		let (update, voucher, _) = offer_voucher(&nodes[0], &nodes[1], 2_000_000);
+		register_book(&nodes[1], &nodes[0], channel_id, &[voucher]);
+		nodes[1].node.handle_update_add_htlc(sender_id, &update.update_add_htlcs[0]);
+		commitment_signed_dance!(&nodes[1], &nodes[0], update.commitment_signed, false);
+		nodes[1].keys_manager.unavailable_node_ecdh.store(true, Ordering::Release);
+
+		for _ in 0..3 {
+			assert!(nodes[1].node.needs_pending_htlc_processing());
+			nodes[1].node.process_pending_htlc_forwards();
+			assert!(nodes[1].node.needs_pending_htlc_processing());
+			assert_eq!(
+				receiver_status(&nodes[1], &nodes[0], channel_id),
+				FFORReceiverStatus::Registered { parked_vouchers: 0, total_vouchers: 1 }
+			);
+			assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+			assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+		}
+
+		if recovery == 1 {
+			nodes[1]
+				.node
+				.abort_ffor_receiver_book(&channel_id, &sender_id, RECEIVER_EPOCH)
+				.unwrap();
+		} else if recovery == 2 {
+			let monitor_encoded = get_monitor!(nodes[1], channel_id).encode();
+			let manager_encoded = nodes[1].node.encode();
+			nodes[0].node.peer_disconnected(receiver_id);
+			reload_node!(
+				nodes[1],
+				config,
+				&manager_encoded,
+				&[&monitor_encoded],
+				persister,
+				chain_monitor,
+				reloaded
+			);
+		}
+
+		if recovery != 0 {
+			nodes[1].node.process_pending_htlc_forwards();
+			assert!(nodes[1].node.needs_pending_htlc_processing());
+			assert_eq!(
+				receiver_status(&nodes[1], &nodes[0], channel_id),
+				FFORReceiverStatus::Aborting {
+					reason: if recovery == 1 {
+						FFORReceiverAbortReason::Requested
+					} else {
+						FFORReceiverAbortReason::Restarted
+					}
+				}
+			);
+			assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+			assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+		}
+
+		nodes[1].keys_manager.unavailable_node_ecdh.store(false, Ordering::Release);
+		if recovery == 2 {
+			pump_ffor_reconnection(&nodes[0], &nodes[1]);
+			expect_payment_failed!(&nodes[0], voucher.payment_hash, false);
+		} else {
+			nodes[1].node.process_pending_htlc_forwards();
+			if recovery == 0 {
+				assert!(matches!(
+					receiver_status(&nodes[1], &nodes[0], channel_id),
+					FFORReceiverStatus::Parked { .. }
+				));
+				assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+				nodes[1]
+					.node
+					.abort_ffor_receiver_book(&channel_id, &sender_id, RECEIVER_EPOCH)
+					.unwrap();
+			}
+			drain_voucher_failures(&nodes[0], &nodes[1], &[voucher.payment_hash]);
+		}
+		assert!(!nodes[1].node.needs_pending_htlc_processing());
+		assert!(matches!(
+			receiver_status(&nodes[1], &nodes[0], channel_id),
+			FFORReceiverStatus::Aborted { .. }
+		));
+		assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+		send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+	}
+}
+
+#[test]
+fn ffor_registration_waits_for_its_own_durable_snapshot() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let config = anchor_config();
+	let node_chanmgrs = create_node_chanmgrs(
+		3,
+		&node_cfgs,
+		&[Some(config.clone()), Some(config.clone()), Some(config)],
+	);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let first_channel = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	let second_channel = create_announced_chan_between_nodes(&nodes, 2, 1).2;
+	let voucher = FFORVoucher {
+		htlc_id: 0,
+		payment_hash: PaymentHash([3; 32]),
+		amount_msat: 2_000_000,
+		cltv_expiry: 200,
+	};
+	let receiver = nodes[1].node;
+	let first = receiver
+		.register_ffor_receiver_book(
+			&first_channel,
+			&nodes[0].node.get_our_node_id(),
+			[4; 32],
+			&[voucher],
+		)
+		.unwrap();
+	assert!(!receiver.is_ffor_state_persisted(&first));
+	let earlier_snapshot = receiver.capture_ffor_persistence();
+	let second = receiver
+		.register_ffor_receiver_book(
+			&second_channel,
+			&nodes[2].node.get_our_node_id(),
+			[5; 32],
+			&[voucher],
+		)
+		.unwrap();
+	// This later serialization contains both registrations, but the earlier captured token
+	// deliberately acknowledges only the first. A failed/cancelled write acknowledges neither.
+	let stored = receiver.encode();
+	assert!(!stored.is_empty());
+	assert!(!receiver.is_ffor_state_persisted(&first));
+	assert!(!receiver.is_ffor_state_persisted(&second));
+	for _ in 0..3 {
+		assert!(receiver.get_and_clear_needs_persistence());
+	}
+	receiver.ffor_persistence_completed(earlier_snapshot).unwrap();
+	assert!(receiver.is_ffor_state_persisted(&first));
+	assert!(!receiver.is_ffor_state_persisted(&second));
+	assert!(receiver.get_and_clear_needs_persistence());
+	let latest = receiver.capture_ffor_persistence();
+	let _stored = receiver.encode();
+	receiver.ffor_persistence_completed(latest).unwrap();
+	assert!(receiver.is_ffor_state_persisted(&second));
+	assert!(!receiver.get_and_clear_needs_persistence());
+	assert!(!nodes[0].node.is_ffor_state_persisted(&first));
+	assert!(receiver.ffor_persistence_completed(nodes[0].node.capture_ffor_persistence()).is_err());
+}
+
+#[test]
+fn ffor_persistence_tokens_do_not_authorize_a_restored_manager() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let (persister, chain_monitor);
+	let config = anchor_config();
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config.clone())]);
+	let reloaded;
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	let voucher = FFORVoucher {
+		htlc_id: 0,
+		payment_hash: PaymentHash([7; 32]),
+		amount_msat: 2_000_000,
+		cltv_expiry: 200,
+	};
+	let requirement = nodes[1]
+		.node
+		.register_ffor_receiver_book(
+			&channel_id,
+			&nodes[0].node.get_our_node_id(),
+			[8; 32],
+			&[voucher],
+		)
+		.unwrap();
+	let old_token = nodes[1].node.capture_ffor_persistence();
+	let manager = nodes[1].node.encode();
+	let monitor = get_monitor!(nodes[1], channel_id).encode();
+	nodes[0].node.peer_disconnected(nodes[1].node.get_our_node_id());
+	reload_node!(nodes[1], config, &manager, &[&monitor], persister, chain_monitor, reloaded);
+	assert!(nodes[1].node.ffor_persistence_completed(old_token).is_err());
+	assert!(!nodes[1].node.is_ffor_state_persisted(&requirement));
 }

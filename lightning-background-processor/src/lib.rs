@@ -39,6 +39,7 @@ use lightning::events::EventHandler;
 use lightning::events::EventsProvider;
 use lightning::events::ReplayEvent;
 use lightning::events::{Event, PathFailure};
+use lightning::io;
 use lightning::util::ser::Writeable;
 
 use lightning::ln::channelmanager::AChannelManager;
@@ -1080,6 +1081,7 @@ where
 			log_trace!(logger, "Persisting ChannelManager...");
 
 			let fut = async {
+				let persistence_token = channel_manager.get_cm().capture_ffor_persistence();
 				kv_store
 					.write(
 						CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
@@ -1087,7 +1089,15 @@ where
 						CHANNEL_MANAGER_PERSISTENCE_KEY,
 						channel_manager.get_cm().encode(),
 					)
-					.await
+					.await?;
+				channel_manager.get_cm().ffor_persistence_completed(persistence_token).map_err(
+					|_| {
+						io::Error::new(
+							io::ErrorKind::InvalidData,
+							"FFOR persistence token belongs to another manager",
+						)
+					},
+				)
 			};
 			// TODO: Once our MSRV is 1.68 we should be able to drop the Box
 			let mut fut = Box::pin(fut);
@@ -1309,6 +1319,7 @@ where
 	// After we exit, ensure we persist the ChannelManager one final time - this avoids
 	// some races where users quit while channel updates were in-flight, with
 	// ChannelMonitor update(s) persisted without a corresponding ChannelManager update.
+	let persistence_token = channel_manager.get_cm().capture_ffor_persistence();
 	kv_store
 		.write(
 			CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
@@ -1317,6 +1328,12 @@ where
 			channel_manager.get_cm().encode(),
 		)
 		.await?;
+	channel_manager.get_cm().ffor_persistence_completed(persistence_token).map_err(|_| {
+		io::Error::new(
+			io::ErrorKind::InvalidData,
+			"FFOR persistence token belongs to another manager",
+		)
+	})?;
 	if let Some(ref scorer) = scorer {
 		kv_store
 			.write(
@@ -1636,12 +1653,22 @@ impl BackgroundProcessor {
 				}
 				if channel_manager.get_cm().get_and_clear_needs_persistence() {
 					log_trace!(logger, "Persisting ChannelManager...");
+					let persistence_token = channel_manager.get_cm().capture_ffor_persistence();
 					(kv_store.write(
 						CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
 						CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 						CHANNEL_MANAGER_PERSISTENCE_KEY,
 						channel_manager.get_cm().encode(),
 					))?;
+					channel_manager
+						.get_cm()
+						.ffor_persistence_completed(persistence_token)
+						.map_err(|_| {
+							io::Error::new(
+								io::ErrorKind::InvalidData,
+								"FFOR persistence token belongs to another manager",
+							)
+						})?;
 					log_trace!(logger, "Done persisting ChannelManager.");
 				}
 
@@ -1744,11 +1771,20 @@ impl BackgroundProcessor {
 			// After we exit, ensure we persist the ChannelManager one final time - this avoids
 			// some races where users quit while channel updates were in-flight, with
 			// ChannelMonitor update(s) persisted without a corresponding ChannelManager update.
+			let persistence_token = channel_manager.get_cm().capture_ffor_persistence();
 			kv_store.write(
 				CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
 				CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 				CHANNEL_MANAGER_PERSISTENCE_KEY,
 				channel_manager.get_cm().encode(),
+			)?;
+			channel_manager.get_cm().ffor_persistence_completed(persistence_token).map_err(
+				|_| {
+					io::Error::new(
+						io::ErrorKind::InvalidData,
+						"FFOR persistence token belongs to another manager",
+					)
+				},
 			)?;
 			if let Some(ref scorer) = scorer {
 				kv_store.write(
@@ -1877,6 +1913,8 @@ mod tests {
 	use std::sync::Arc;
 	use std::time::Duration;
 	use std::{env, fs};
+
+	mod ffor;
 
 	const EVENT_DEADLINE: Duration =
 		Duration::from_millis(5 * (FRESHNESS_TIMER.as_millis() as u64));
@@ -2064,6 +2102,7 @@ mod tests {
 	}
 
 	struct Persister {
+		manager_write_gate: Option<ffor::SyncWriteGate>,
 		graph_error: Option<(std::io::ErrorKind, &'static str)>,
 		graph_persistence_notifier: Option<SyncSender<()>>,
 		manager_error: Option<(std::io::ErrorKind, &'static str)>,
@@ -2075,6 +2114,7 @@ mod tests {
 		fn new(data_dir: PathBuf) -> Self {
 			let kv_store = FilesystemStore::new(data_dir);
 			Self {
+				manager_write_gate: None,
 				graph_error: None,
 				graph_persistence_notifier: None,
 				manager_error: None,
@@ -2118,6 +2158,9 @@ mod tests {
 				&& secondary_namespace == CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE
 				&& key == CHANNEL_MANAGER_PERSISTENCE_KEY
 			{
+				if let Some(gate) = &self.manager_write_gate {
+					gate.wait()?;
+				}
 				if let Some((error, message)) = self.manager_error {
 					return Err(std::io::Error::new(error, message).into());
 				}

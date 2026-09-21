@@ -1801,6 +1801,7 @@ impl NodeSigner for TestNodeSigner {
 }
 
 pub struct TestKeysInterface {
+	pub unavailable_node_ecdh: AtomicBool,
 	pub backing: DynKeysInterface,
 	pub override_random_bytes: Mutex<Option<[u8; 32]>>,
 	pub disable_revocation_policy_check: bool,
@@ -1830,6 +1831,9 @@ impl NodeSigner for TestKeysInterface {
 	fn ecdh(
 		&self, recipient: Recipient, other_key: &PublicKey, tweak: Option<&Scalar>,
 	) -> Result<SharedSecret, ()> {
+		if self.unavailable_node_ecdh.load(Ordering::Acquire) {
+			return Err(());
+		}
 		self.backing.ecdh(recipient, other_key, tweak)
 	}
 
@@ -1951,6 +1955,7 @@ impl TestKeysInterface {
 	fn build(backing: Box<dyn DynKeysInterfaceTrait<EcdsaSigner = DynSigner>>) -> Self {
 		Self {
 			backing: DynKeysInterface::new(backing),
+			unavailable_node_ecdh: AtomicBool::new(false),
 			override_random_bytes: Mutex::new(None),
 			disable_revocation_policy_check: false,
 			disable_all_state_policy_checks: false,

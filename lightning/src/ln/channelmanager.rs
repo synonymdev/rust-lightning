@@ -69,6 +69,9 @@ use crate::ln::ffor::{
 	FFORCommitmentError, FFORMonitorSnapshot, FFORReceiverError, FFORReceiverStatus,
 	FFORSettlementParty, FFORVoucher, FFORVoucherCommitments,
 };
+use crate::ln::ffor_persistence::FFORPersistenceBarrier;
+pub use crate::ln::ffor_persistence::{FFORPersistenceRequirement, FFORPersistenceToken};
+use crate::ln::ffor_recovery::FFORRecoveryRegistry;
 use crate::ln::funding::SpliceContribution;
 use crate::ln::inbound_payment;
 use crate::ln::interactivetxs::InteractiveTxMessageSend;
@@ -2900,6 +2903,10 @@ pub struct ChannelManager<
 
 	event_persist_notifier: Notifier,
 	needs_persist_flag: AtomicBool,
+	// Completion metadata is process-local; an old token cannot prove a restored state durable.
+	ffor_persistence: Mutex<FFORPersistenceBarrier>,
+	// Evidence outlives channels, including force-close and stale-manager restoration.
+	ffor_recovery: Mutex<FFORRecoveryRegistry>,
 
 	/// Tracks the message events that are to be broadcasted when we are connected to some peer.
 	pending_broadcast_messages: Mutex<Vec<MessageSendEvent>>,
@@ -4022,6 +4029,8 @@ where
 			background_events_processed_since_startup: AtomicBool::new(false),
 			event_persist_notifier: Notifier::new(),
 			needs_persist_flag: AtomicBool::new(false),
+			ffor_persistence: Mutex::new(FFORPersistenceBarrier::new()),
+			ffor_recovery: Mutex::new(FFORRecoveryRegistry::new()),
 			funding_batch_states: Mutex::new(BTreeMap::new()),
 
 			pending_broadcast_messages: Mutex::new(Vec::new()),
@@ -4305,8 +4314,9 @@ where
 	/// The channel must be connected, synchronized, empty, and use a supported anchor channel type.
 	/// The first voucher must use the peer's exact next incoming HTLC ID. Matching vouchers are kept
 	/// out of ordinary payment processing, including `PaymentClaimable` and forwarding events.
-	/// The caller is responsible for authenticating the epoch and persisting the manager before
-	/// instructing the peer to send vouchers. This method requests persistence but does not await it.
+	/// The caller is responsible for authenticating the epoch and awaiting the returned persistence
+	/// requirement before instructing the peer to send vouchers. Query it with
+	/// [`Self::is_ffor_state_persisted`]. This method requests persistence but does not await it.
 	///
 	/// This is a private experimental protocol boundary, with no feature advertisement or activation.
 	/// It does not freeze commitment updates or authorize invoices. Disconnects and restarts abort
@@ -4317,7 +4327,7 @@ where
 	pub fn register_ffor_receiver_book(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
 		vouchers: &[FFORVoucher],
-	) -> Result<(), FFORReceiverError> {
+	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let per_peer_state = self.per_peer_state.read().unwrap();
 		let mut peer = per_peer_state
@@ -4330,7 +4340,64 @@ where
 			.get_mut(channel_id)
 			.and_then(Channel::as_funded_mut)
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
-		channel.register_ffor_receiver_book(epoch_id, vouchers)
+		let requirement = self
+			.ffor_persistence
+			.lock()
+			.unwrap()
+			.request()
+			.map_err(|_| FFORReceiverError::PersistenceUnavailable)?;
+		channel.register_ffor_receiver_book(epoch_id, vouchers)?;
+		Ok(requirement)
+	}
+
+	/// Authenticate and retain a signed Variant D setup before receiving its voucher book.
+	///
+	/// The manager supplies the actual local identity, chain and current height. The channel checks
+	/// peer identity, commitment numbering, funding terms and the exact next incoming HTLC ID.
+	/// `claim_margin_blocks` is local deployment policy and must not come from the peer. Invalid
+	/// signatures, incompatible terms, or unsupported channel history leave the book unregistered.
+	///
+	/// Await the returned persistence requirement before telling the peer to send vouchers. This
+	/// retains setup evidence but does not activate or freeze the channel, or authorize an invoice.
+	/// The same abort, restart and one-registration limits as [`Self::register_ffor_receiver_book`]
+	/// apply. Raw-book registration does not supply the authenticated evidence retained here.
+	pub fn register_ffor_receiver_setup(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, init_wire: &[u8],
+		accept_wire: &[u8], claim_margin_blocks: u32,
+	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let current_height = self.best_block.read().unwrap().height;
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let mut peer = per_peer_state
+			.get(counterparty_node_id)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?
+			.lock()
+			.unwrap();
+		let channel = peer
+			.channel_by_id
+			.get_mut(channel_id)
+			.and_then(Channel::as_funded_mut)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
+		let setup = channel.prepare_ffor_receiver_setup(
+			init_wire,
+			accept_wire,
+			self.our_network_pubkey,
+			self.chain_hash,
+			current_height,
+			claim_margin_blocks,
+		)?;
+		let mut recovery = self.ffor_recovery.lock().unwrap();
+		let insertion =
+			recovery.prepare_insert(&setup).map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
+		let requirement = self
+			.ffor_persistence
+			.lock()
+			.unwrap()
+			.request()
+			.map_err(|_| FFORReceiverError::PersistenceUnavailable)?;
+		channel.install_prepared_ffor_receiver_setup(setup)?;
+		insertion.commit();
+		Ok(requirement)
 	}
 
 	/// Inspect an experimental receiver registration. `Parked` requires the complete two-view
@@ -14766,7 +14833,56 @@ where
 	/// See [`Self::get_event_or_persistence_needed_future`] for retrieving a [`Future`] that
 	/// indicates this should be checked.
 	pub fn get_and_clear_needs_persistence(&self) -> bool {
+		// A failed or cancelled write must not clear an outstanding FFOR durability barrier.
 		self.needs_persist_flag.swap(false, Ordering::AcqRel)
+			| self.ffor_persistence.lock().unwrap().needs_persistence()
+	}
+
+	/// Capture a completion token immediately before serializing this manager for persistence.
+	///
+	/// Use a single ordered persister for all manager writes. After capturing, encode this manager,
+	/// durably write those bytes, then call [`Self::ffor_persistence_completed`] with the token.
+	/// Never capture after encoding, acknowledge a failed write, or race unordered writes to the
+	/// same storage key. The usual monitor persistence requirements also continue to apply.
+	///
+	/// Capturing waits for in-flight protected mutations to finish. Any later mutation remains
+	/// conservatively blocked until a subsequent token completes, even if it entered the snapshot.
+	/// This does not itself release messages or establish activation readiness.
+	pub fn capture_ffor_persistence(&self) -> FFORPersistenceToken {
+		let _consistency_lock = self.total_consistency_lock.write().unwrap();
+		self.ffor_persistence.lock().unwrap().capture()
+	}
+
+	/// Confirm the durable write paired with a token from [`Self::capture_ffor_persistence`].
+	///
+	/// Call only after that write succeeds. A token from a different or restored manager is refused.
+	/// Older completions are idempotent, but the writes themselves must still be ordered. This
+	/// records only storage completion; channel phase and authenticated peer evidence remain
+	/// separate requirements for any later action.
+	pub fn ffor_persistence_completed(&self, token: FFORPersistenceToken) -> Result<(), ()> {
+		let advanced = {
+			let _consistency_lock = self.total_consistency_lock.read().unwrap();
+			self.ffor_persistence.lock().unwrap().complete(token)?
+		};
+		if advanced {
+			self.event_persist_notifier.notify();
+		}
+		Ok(())
+	}
+
+	/// Whether a snapshot covering this protected mutation or a later state has reached storage.
+	///
+	/// False is returned for another manager instance, including one restored from the same bytes.
+	/// A true result does not mean the channel's phase is unchanged or that an invoice is ready.
+	pub fn is_ffor_state_persisted(&self, requirement: &FFORPersistenceRequirement) -> bool {
+		self.ffor_persistence.lock().unwrap().is_complete(requirement)
+	}
+
+	/// Request a protected revision without channel setup for persistence integration tests.
+	#[cfg(any(test, feature = "_test_utils"))]
+	pub fn testing_request_ffor_persistence(&self) -> FFORPersistenceRequirement {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		self.ffor_persistence.lock().unwrap().request().unwrap()
 	}
 
 	#[cfg(any(test, feature = "_test_utils"))]
@@ -16605,6 +16721,8 @@ where
 			}
 		}
 
+		let ffor_recovery = self.ffor_recovery.lock().unwrap();
+		let ffor_recovery = if ffor_recovery.is_empty() { None } else { Some(&*ffor_recovery) };
 		write_tlv_fields!(writer, {
 			(1, pending_outbound_payments_no_retry, required),
 			(2, pending_intercepted_htlcs, option),
@@ -16623,6 +16741,7 @@ where
 			(17, in_flight_monitor_updates, option),
 			(19, peer_storage_dir, optional_vec),
 			(21, WithoutLength(&self.flow.writeable_async_receive_offer_cache()), required),
+			(22, ffor_recovery, option),
 		});
 
 		// Remove the SpliceFailed events added earlier.
@@ -16913,6 +17032,8 @@ where
 		let chain_hash: ChainHash = Readable::read(reader)?;
 		let best_block_height: u32 = Readable::read(reader)?;
 		let best_block_hash: BlockHash = Readable::read(reader)?;
+		let our_network_pubkey =
+			args.node_signer.get_node_id(Recipient::Node).map_err(|_| DecodeError::InvalidValue)?;
 
 		let empty_peer_state = || PeerState {
 			channel_by_id: new_hash_map(),
@@ -16928,6 +17049,7 @@ where
 		};
 
 		let mut failed_htlcs = Vec::new();
+		let mut ffor_channel_setups = Vec::new();
 		let channel_count: u64 = Readable::read(reader)?;
 		let mut channel_id_set = hash_set_with_capacity(cmp::min(channel_count as usize, 128));
 		let mut per_peer_state = hash_map_with_capacity(cmp::min(
@@ -16946,6 +17068,10 @@ where
 					&provided_channel_type_features(&args.config),
 				),
 			)?;
+			channel.ffor_validate_receiver_identity(our_network_pubkey, chain_hash)?;
+			if let Some(setup) = channel.ffor_receiver_setup_record()? {
+				ffor_channel_setups.push(setup);
+			}
 			let logger = WithChannelContext::from(&args.logger, &channel.context, None);
 			let channel_id = channel.context.channel_id();
 			channel_id_set.insert(channel_id);
@@ -17323,6 +17449,7 @@ where
 		let mut inbound_payment_id_secret = None;
 		let mut peer_storage_dir: Option<Vec<(PublicKey, Vec<u8>)>> = None;
 		let mut async_receive_offer_cache: AsyncReceiveOfferCache = AsyncReceiveOfferCache::new();
+		let mut ffor_recovery = None;
 		read_tlv_fields!(reader, {
 			(1, pending_outbound_payments_no_retry, option),
 			(2, pending_intercepted_htlcs, option),
@@ -17341,12 +17468,24 @@ where
 			(17, in_flight_monitor_updates, option),
 			(19, peer_storage_dir, optional_vec),
 			(21, async_receive_offer_cache, (default_value, async_receive_offer_cache)),
+			(22, ffor_recovery, option),
 		});
+		let ffor_recovery = ffor_recovery.unwrap_or_else(FFORRecoveryRegistry::new);
+		ffor_recovery.validate_identity(our_network_pubkey, chain_hash)?;
+		for setup in &ffor_channel_setups {
+			if !ffor_recovery.contains_exact(setup) {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
 		let mut decode_update_add_htlcs = decode_update_add_htlcs.unwrap_or_else(|| new_hash_map());
 		for peer in per_peer_state.values() {
-			for channel in peer.lock().unwrap().channel_by_id.values().filter_map(Channel::as_funded) {
-				let deferred_adds = decode_update_add_htlcs.get(&channel.context.outbound_scid_alias())
-					.map(Vec::as_slice).unwrap_or(&[]);
+			for channel in
+				peer.lock().unwrap().channel_by_id.values().filter_map(Channel::as_funded)
+			{
+				let deferred_adds = decode_update_add_htlcs
+					.get(&channel.context.outbound_scid_alias())
+					.map(Vec::as_slice)
+					.unwrap_or(&[]);
 				channel.ffor_validate_unwind_material(deferred_adds)?;
 			}
 		}
@@ -18104,10 +18243,6 @@ where
 		let mut secp_ctx = Secp256k1::new();
 		secp_ctx.seeded_randomize(&args.entropy_source.get_secure_random_bytes());
 
-		let our_network_pubkey = match args.node_signer.get_node_id(Recipient::Node) {
-			Ok(key) => key,
-			Err(()) => return Err(DecodeError::InvalidValue),
-		};
 		if let Some(network_pubkey) = received_network_pubkey {
 			if network_pubkey != our_network_pubkey {
 				log_error!(args.logger, "Key that was generated does not match the existing key.");
@@ -18313,6 +18448,8 @@ where
 
 			event_persist_notifier: Notifier::new(),
 			needs_persist_flag: AtomicBool::new(false),
+			ffor_persistence: Mutex::new(FFORPersistenceBarrier::new()),
+			ffor_recovery: Mutex::new(ffor_recovery),
 
 			funding_batch_states: Mutex::new(BTreeMap::new()),
 
@@ -18612,6 +18749,9 @@ where
 		Ok((best_block_hash.clone(), channel_manager))
 	}
 }
+
+#[cfg(test)]
+mod ffor_recovery_tests;
 
 #[cfg(test)]
 mod tests {

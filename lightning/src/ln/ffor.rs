@@ -7,6 +7,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use bitcoin::hashes::Hash;
+use bitcoin::locktime::absolute::LOCK_TIME_THRESHOLD;
 use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::Txid;
@@ -42,7 +43,8 @@ pub struct FFORVoucher {
 	pub payment_hash: PaymentHash,
 	/// The exact value in millisatoshis, before on-chain rounding.
 	pub amount_msat: u64,
-	/// The absolute CLTV expiry height shared by every voucher in the book.
+	/// The absolute CLTV expiry height shared by every voucher, strictly below Bitcoin's
+	/// locktime threshold. Timestamp locktimes are not valid voucher expiries.
 	pub cltv_expiry: u32,
 }
 
@@ -64,6 +66,8 @@ pub enum FFORReceiverAbortReason {
 	Disconnected,
 	/// The channel was restored from storage before a durable activation mechanism existed.
 	Restarted,
+	/// The first voucher hash reused a revealed counterparty commitment secret.
+	CommitmentSecretReused,
 }
 
 impl_writeable_tlv_based_enum!(FFORReceiverAbortReason,
@@ -71,6 +75,7 @@ impl_writeable_tlv_based_enum!(FFORReceiverAbortReason,
 	(2, VoucherMismatch) => {},
 	(4, Disconnected) => {},
 	(6, Restarted) => {},
+	(8, CommitmentSecretReused) => {},
 );
 
 /// Receiver-side state of one experimental voucher registration.
@@ -114,6 +119,10 @@ pub enum FFORReceiverError {
 	NotRegistered,
 	/// The supplied epoch does not identify this channel's registration.
 	UnknownEpoch,
+	/// No unused persistence revision remains in this manager instance.
+	PersistenceUnavailable,
+	/// Retained recovery storage is full or conflicts with an existing setup.
+	RecoveryUnavailable,
 }
 
 impl From<FFORCommitmentError> for FFORReceiverError {
@@ -129,6 +138,8 @@ impl fmt::Display for FFORReceiverError {
 			Self::AlreadyRegistered => f.write_str("FFOR receiver already registered on channel"),
 			Self::NotRegistered => f.write_str("no FFOR receiver registration on channel"),
 			Self::UnknownEpoch => f.write_str("unknown FFOR receiver epoch"),
+			Self::PersistenceUnavailable => f.write_str("FFOR persistence revision exhausted"),
+			Self::RecoveryUnavailable => f.write_str("FFOR recovery record cannot be retained"),
 		}
 	}
 }
@@ -280,6 +291,7 @@ pub(crate) fn validate_vouchers(vouchers: &[FFORVoucher]) -> Result<(), FFORComm
 		if first.htlc_id.checked_add(index as u64) != Some(voucher.htlc_id)
 			|| voucher.amount_msat == 0
 			|| voucher.cltv_expiry == 0
+			|| voucher.cltv_expiry >= LOCK_TIME_THRESHOLD
 			|| voucher.cltv_expiry != first.cltv_expiry
 			|| !hashes.insert(voucher.payment_hash.0)
 		{

@@ -127,6 +127,19 @@ fn rejects_expired_or_overflowing_deadlines() {
 }
 
 #[test]
+fn voucher_expiry_must_be_a_block_height() {
+	let mut book = terms(vec![1_000_000]);
+	book.voucher_expiry = 499_999_999;
+	book.settlement_deadline = book.voucher_expiry - 1008;
+	assert_eq!(validate(&book, &channel()), Ok(()));
+	for expiry in [500_000_000, u32::MAX] {
+		book.voucher_expiry = expiry;
+		book.settlement_deadline = expiry - 1008;
+		assert_eq!(validate(&book, &channel()), Err(BookError::Deadline));
+	}
+}
+
+#[test]
 fn rejects_arithmetic_overflow_without_wrapping() {
 	let mut book = terms(vec![1_000_000]);
 	book.amounts_msat = vec![u64::MAX];

@@ -100,6 +100,9 @@ use core::{cmp, fmt, mem};
 use super::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
 
 mod ffor;
+#[cfg(test)]
+pub(crate) use ffor::ffor_setup_test_messages;
+pub(crate) use ffor::FFORReceiverSetup;
 
 #[cfg(any(test, feature = "_test_utils"))]
 #[allow(unused)]
@@ -15616,7 +15619,7 @@ where
 			}
 		}
 
-		Ok(FundedChannel {
+		let mut channel = FundedChannel {
 			funding: FundingScope {
 				value_to_self_msat,
 				counterparty_selected_channel_reserve_satoshis,
@@ -15755,7 +15758,9 @@ where
 			holder_commitment_point,
 			pending_splice,
 			quiescent_action,
-		})
+		};
+		channel.ffor_restored()?;
+		Ok(channel)
 	}
 }
 

@@ -1,9 +1,14 @@
 use super::*;
+
+mod setup;
 use crate::ln::ffor::{
 	self as verification, FFORCommitmentError, FFORMonitorSnapshot, FFORReceiverAbortReason,
 	FFORReceiverError, FFORReceiverStatus, FFORSettlementParty, FFORVoucher,
 	FFORVoucherCommitments, FFORVoucherFailure,
 };
+#[cfg(test)]
+pub(crate) use setup::ffor_setup_test_messages;
+pub(crate) use setup::FFORReceiverSetup;
 
 /// Channel-owned identity survives the stock inbound HTLC's transition to `Committed`.
 pub(super) struct FFORReceiverBook {
@@ -11,6 +16,7 @@ pub(super) struct FFORReceiverBook {
 	vouchers: Vec<FFORVoucher>,
 	received: Vec<FFORReceivedVoucher>,
 	abort_reason: Option<FFORReceiverAbortReason>,
+	setup: Option<FFORReceiverSetup>,
 }
 
 struct FFORReceivedVoucher {
@@ -28,6 +34,8 @@ impl_writeable_tlv_based!(FFORReceiverBook, {
 	(2, vouchers, required_vec),
 	(4, received, required_vec),
 	(6, abort_reason, option),
+	// Readers predating authenticated setup must refuse this record.
+	(8, setup, option),
 });
 
 impl FFORReceiverBook {
@@ -82,7 +90,9 @@ impl FFORReceiverBook {
 				return Err(DecodeError::InvalidValue);
 			}
 		}
-		self.abort(FFORReceiverAbortReason::Restarted);
+		if let Some(setup) = self.setup.as_ref() {
+			setup.validate_book(self).map_err(|_| DecodeError::InvalidValue)?;
+		}
 		Ok(())
 	}
 
@@ -117,6 +127,7 @@ where
 			vouchers: vouchers.to_vec(),
 			received: Vec::new(),
 			abort_reason: None,
+			setup: None,
 		});
 		Ok(())
 	}
@@ -149,6 +160,9 @@ where
 				parked_vouchers: parked as u16,
 				total_vouchers: book.vouchers.len() as u16,
 			});
+		}
+		if self.ffor_revealed_secret_matches()? {
+			return Err(FFORCommitmentError::InvalidVoucherBook.into());
 		}
 		let commitments = self.ffor_voucher_commitments(
 			FFORSettlementParty::Counterparty,
@@ -234,6 +248,7 @@ where
 	pub(crate) fn ffor_validate_unwind_material(
 		&self, deferred_adds: &[msgs::UpdateAddHTLC],
 	) -> Result<(), DecodeError> {
+		self.ffor_validate_receiver_setup()?;
 		let book = match self.context.ffor_receiver_book.as_ref() {
 			Some(book) => book,
 			None => return Ok(()),
@@ -264,6 +279,7 @@ where
 	}
 
 	pub(crate) fn ffor_park_received_htlc(&mut self, htlc_id: u64, failure: FFORVoucherFailure) {
+		self.ffor_abort_revealed_secret_reuse();
 		if let Some(book) = self.context.ffor_receiver_book.as_mut() {
 			if let Some(received) =
 				book.received.iter_mut().find(|received| received.voucher.htlc_id == htlc_id)
@@ -278,6 +294,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.ffor_abort_revealed_secret_reuse();
 		let book = match self.context.ffor_receiver_book.as_ref() {
 			Some(book) if book.abort_reason.is_some() => book,
 			_ => return,
