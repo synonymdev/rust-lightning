@@ -147,6 +147,7 @@ where
 		let recovery = self.ffor_recovery.lock().unwrap();
 		let (key, registration, _) = self.ffor_ack_registration_locked(&recovery, historical)?;
 		let current = self.ffor_active_state_locked(channel, &recovery, &key)?;
+		let mut runtime = self.ffor_activation.lock().unwrap();
 		let height = self.best_block.read().unwrap();
 		Self::validate_ffor_witness_context(historical, &current, height.height)?;
 		if attempt.key != key
@@ -158,7 +159,6 @@ where
 		{
 			return Err(FFORReceiverError::InvalidWitnessRegistration);
 		}
-		let mut runtime = self.ffor_activation.lock().unwrap();
 		let requirement = &runtime.get(&key)?.requirement;
 		let barrier = self.ffor_persistence.lock().unwrap();
 		if requirement != &context.requirement || !barrier.is_complete(requirement) {

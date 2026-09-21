@@ -45,6 +45,11 @@ mod witness_ack;
 pub use witness_ack::{
 	FFORReceiverWitnessAcknowledgements, FFORWitnessAcknowledgement, FFORWitnessProvisionAttempt,
 };
+pub(crate) mod invoice;
+pub use invoice::{
+	FFORInvoiceIntent, FFORInvoiceMonitorCheck, FFORInvoicePreparation, FFORStoredInvoice,
+	FFORWitnessRouteEvidence,
+};
 
 /// Which channel participant offers every voucher HTLC in the book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +173,8 @@ pub enum FFORReceiverError {
 	InvalidWitnessRegistration,
 	/// The authenticated receipt does not belong to the retained native epoch and witness selection.
 	InvalidWitnessReceipt,
+	/// Invoice intent, signed route evidence, retained bytes or current publication conditions differ.
+	InvalidInvoice,
 }
 
 impl From<FFORCommitmentError> for FFORReceiverError {
@@ -188,6 +195,7 @@ impl fmt::Display for FFORReceiverError {
 			Self::SignerUnavailable => f.write_str("FFOR node signature unavailable"),
 			Self::InvalidWitnessRegistration => f.write_str("invalid FFOR witness registration"),
 			Self::InvalidWitnessReceipt => f.write_str("invalid FFOR witness receipt"),
+			Self::InvalidInvoice => f.write_str("invalid or unavailable FFOR invoice"),
 		}
 	}
 }

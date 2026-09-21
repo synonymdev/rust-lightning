@@ -5,8 +5,10 @@ parking and verification of both commitment views for FFOR Variant D. Native man
 transitions compose activation, reconnect, pre-active abort and cooperative voucher drain
 with ordered storage.
 An experimental public receiver facade owns pre-init admission, synchronous peer input,
-activation and cooperative close advancement. Production transport orchestration and
-invoice readiness remain unfinished.
+activation and cooperative close advancement. One immutable signed receiver invoice can
+be assigned per supported epoch and released only through a guarded application
+publication contract. Production transport orchestration, the application publication
+runtime and payment outcome credit remain unfinished.
 
 `prepare_ffor_receiver` checks the current authenticated native peer generation,
 derives a fresh protocol epoch and signs the exact Init. Before any bytes leave,
@@ -338,9 +340,9 @@ checks do not claim to detect every arbitrary alteration of local storage.
 Similarly, an archive without its original live channel cannot independently prove
 the historical funding context against arbitrary local storage alteration.
 
-No feature bit, production custom-message transport, invoice readiness or background
-deadline service is implemented here. The facade rechecks deadlines before new Init,
-Accept, STFU and activation work; its caller must continue advancing and may cancel
+No feature bit, production custom-message transport, application invoice publication
+runtime or background deadline service is implemented here. The facade rechecks deadlines
+before new Init, Accept, STFU and activation work; its caller must continue advancing and may cancel
 a stalled pre-activation setup. Cancellation of an owned STFU handshake requests a
 native disconnect. Automatic voucher failures wait for controlled release after the
 abort revision is durable.
@@ -353,10 +355,47 @@ identity. External signers refuse this operation by default. Signing requests ch
 only the allowed envelope type and size; protocol and transition validation remain
 required before requesting a signature.
 
+## Invoice assignment and publication
+
+The supported issuer uses a one-slot, non-hash-chained Variant D book. It derives amount,
+payment hash, receiver identity, settlement fees, inbound alias and CLTV from native
+ownership. The signed Init witness restriction must exactly match the registered and
+durably acknowledged witness set.
+
+The invoice has one W -> S -> R route hint and no MPP support. Native verifies the
+public W-S announcement and directional update, signatures, distinct identities, canonical
+endpoint ordering, enabled state, amount bounds, fees and freshness. These signatures
+identify route terms; they do not prove current channel funding or liquidity. Private W-S
+channels without authenticated route evidence are not supported. BOLT11 hints remain
+advisory, with the signed witness restriction providing the honest settlement peer's
+admission guard.
+
+`prepare_ffor_receiver_invoice` signs outside locks. Native then rechecks the current
+phase, frozen pair, deadline, route binding and completed persistence before retaining the
+exact signed bytes. Requested expiry is capped using eight minutes per remaining block
+before admission closes, less the explicit safety margin. The actual watched monitor is
+locked through retention or final bounded publication, excluding pending off-chain
+persistence, known preimages, funding spends, pending funding changes and local commitment
+signing. The higher of manager and monitor height is used so delayed notifications cannot
+extend admission. New issuance requires the std clock; no_std supports historical
+decoding only.
+
+`ffor_receiver_invoice_for_storage` returns exact bytes only after the latest native write
+completes. It supports historical recovery after expiry or close and does not grant
+display permission. The application must first durably confirm these bytes, the matching
+Pending payment and its protected confirmation marker. `release_ffor_receiver_invoice`
+then rechecks native and monitor state through `Watch::validate_and_publish_ffor_invoice`
+and a callback that performs only bounded in-memory publication. Retry, failed publication
+and restart cannot replace the assigned invoice. Custom Watch implementations default to
+refusing this operation until they implement the actual-monitor boundary. Invoice
+assignment adds required field 12 and archive schema 7, bounding the signed string to
+4096 bytes and its record to 8192 bytes. The assignment is permanent after failed
+publication, expiry or restart, and it is not a payment success signal.
+
 ## Validation
 
-The current focused native suite passes 156 tests. Native no-default-features and
-documentation builds with broken intra-doc links denied also pass.
+The current focused native suite passes 169 tests, including 13 invoice tests. Native
+no-default-features and documentation builds with broken intra-doc links denied also pass.
 
 The FFOR tests exercise real two-node commitment rounds, both funding directions,
 asymmetric dust limits and contest delays, signature corruption, stale monitors,
@@ -463,7 +502,17 @@ exact retries, independent first promises, restoration and archive-only history.
 also check offline settlement-peer operation, current deadlines, fixed storage through
 all terminal phases with a maximum book, legacy quota refusal and malformed archives.
 A previous field-layout reader rejects the new required ACK field; schema downgrade is
-also refused. These checks do not exercise a production witness or invoice issuance.
+also refused. These checks do not exercise a production witness.
+
+Thirteen invoice tests cover every durable witness acknowledgement, exact retries, failed
+and stale persistence, restored handles, wrong signers, signed route loops, missing or
+additional witness permissions, archive corruption and capacity, monitor height ahead of
+manager, known preimages without a counter change, funding spend before manager
+notification, and actual monitor exclusion through publication. A genuine public-driver
+fixture covers setup through witness registration and invoice assignment; it exposed a
+runtime/height lock inversion in witness registration and release, which now use a
+consistent registry, runtime, height and persistence order. An opt-in exporter writes that
+fixture only when `FFOR_NODE_INVOICE_FIXTURE_DIR` is set.
 
 Seven receipt-import integration tests exercise both funders, delayed monitor persistence,
 idempotent retries, crash recovery from a failed write using the prior durable monitor,
@@ -486,6 +535,7 @@ deadline before claim safety ends.
 
 Production transport must bind the receiver facade to actual authenticated
 connections and deliver acknowledgement retries in the required order. Durable witness
-mailbox recovery, receipt-import orchestration, deadline enforcement and invoice eligibility remain
-separate required boundaries. None can be inferred from durable setup, activation or
+mailbox recovery, receipt-import orchestration, deadline enforcement, the application
+invoice publication runtime and authoritative payment outcomes remain separate required
+boundaries. None can be inferred from durable setup, activation or
 a successful private protocol test.

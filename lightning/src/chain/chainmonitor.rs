@@ -1402,6 +1402,23 @@ where
 		Ok(persist_res)
 	}
 
+	fn validate_and_publish_ffor_invoice(
+		&self, check: &crate::ln::ffor::FFORInvoiceMonitorCheck,
+		publish: &mut dyn FnMut() -> Result<(), ()>,
+	) -> Result<bool, crate::ln::ffor::FFORReceiverError> {
+		let monitors = self.monitors.read().unwrap();
+		let monitor = monitors
+			.get(&check.channel_id())
+			.ok_or(crate::ln::ffor::FFORReceiverError::InvalidInvoice)?;
+		let pending = monitor.pending_monitor_updates.lock().unwrap();
+		if !pending.is_empty() {
+			return Err(crate::ln::ffor::FFORReceiverError::ChannelState(
+				crate::ln::ffor::FFORCommitmentError::PendingUpdates,
+			));
+		}
+		monitor.monitor.validate_and_publish_ffor_invoice(check, publish)
+	}
+
 	fn update_channel(
 		&self, channel_id: ChannelId, update: &ChannelMonitorUpdate,
 	) -> ChannelMonitorUpdateStatus {

@@ -57,6 +57,7 @@ fn ffor_witness_ack_archive_legacy_upgrade_checks_capacity_before_tracking() {
 		request: None,
 		witnesses: Some(metadata.clone()),
 		witness_acks: None,
+		invoice: None,
 	};
 	let mut bytes = vec![WITNESS_VERSION];
 	1u16.write(&mut bytes).unwrap();
@@ -102,6 +103,7 @@ fn ffor_witness_ack_archive_rejects_corruption_and_old_reader_downgrade() {
 		request: None,
 		witnesses: Some(metadata.clone()),
 		witness_acks: Some(acks.clone()),
+		invoice: None,
 	};
 	for mutation in 0..7 {
 		let mut damaged = record();

@@ -332,6 +332,21 @@ pub trait Watch<ChannelSigner: EcdsaChannelSigner> {
 		&self, channel_id: ChannelId, update: &ChannelMonitorUpdate,
 	) -> ChannelMonitorUpdateStatus;
 
+	/// Atomically validate the actual watched monitor for an FFOR invoice action.
+	///
+	/// Implementations must exclude monitor mutation and outstanding off-chain writes throughout
+	/// validation and the callback, using the original watched monitor, never a clone. The callback
+	/// is invoked at most once and performs only a bounded native assignment or publication of an
+	/// already durable invoice: no I/O, monitor, manager or storage reentry. The default refuses,
+	/// preserving compatibility for custom watchers which have not implemented this stronger
+	/// boundary.
+	fn validate_and_publish_ffor_invoice(
+		&self, _check: &crate::ln::ffor::FFORInvoiceMonitorCheck,
+		_publish: &mut dyn FnMut() -> Result<(), ()>,
+	) -> Result<bool, crate::ln::ffor::FFORReceiverError> {
+		Err(crate::ln::ffor::FFORReceiverError::InvalidInvoice)
+	}
+
 	/// Returns any monitor events since the last call. Subsequent calls must only return new
 	/// events.
 	///

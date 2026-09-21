@@ -2145,6 +2145,49 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		})
 	}
 
+	/// Validate publication while holding this monitor's state lock.
+	///
+	/// Only the actual owning watcher may use this boundary. It must also exclude pending monitor
+	/// persistence and retain ownership of this exact monitor throughout the bounded callback.
+	/// The callback must perform no I/O or native reentry. Snapshot comparisons alone cannot replace
+	/// this lock: chain spends and locally learned preimages need not change the update counter.
+	pub fn validate_and_publish_ffor_invoice(
+		&self, check: &crate::ln::ffor::FFORInvoiceMonitorCheck,
+		publish: &mut dyn FnMut() -> Result<(), ()>,
+	) -> Result<bool, crate::ln::ffor::FFORReceiverError> {
+		use crate::ln::channel::INITIAL_COMMITMENT_NUMBER;
+		use crate::ln::ffor::FFORReceiverError;
+		let inner = self.inner.lock().unwrap();
+		let holder = inner.funding.current_holder_commitment_tx.trust();
+		if inner.channel_id() != check.channel_id
+			|| inner.get_funding_txo() != check.funding_txo
+			|| inner.counterparty_node_id != check.settlement
+			|| inner.latest_update_id != check.update_id
+			|| inner.funding_spend_seen
+			|| inner.lockdown_from_offchain
+			|| inner.holder_tx_signed
+			|| !inner.pending_funding.is_empty()
+			|| inner.payment_preimages.contains_key(&check.payment_hash)
+			|| holder.txid() != check.commitments.holder.txid
+			|| inner.funding.current_counterparty_commitment_txid
+				!= Some(check.commitments.counterparty.txid)
+			|| INITIAL_COMMITMENT_NUMBER.checked_sub(inner.current_holder_commitment_number)
+				!= Some(check.commitments.holder.number)
+			|| INITIAL_COMMITMENT_NUMBER.checked_sub(inner.current_counterparty_commitment_number)
+				!= Some(check.commitments.counterparty.number)
+			|| !holder.nondust_htlcs().iter().any(|htlc| {
+				!htlc.offered
+					&& htlc.payment_hash == check.payment_hash
+					&& htlc.amount_msat == check.amount_msat
+					&& htlc.cltv_expiry == check.voucher_expiry
+					&& htlc.transaction_output_index.is_some()
+			}) {
+			return Err(FFORReceiverError::InvalidInvoice);
+		}
+		check.validate_time(inner.best_block.height)?;
+		Ok(publish().is_ok())
+	}
+
 	/// Observe one authenticated witness preimage in this monitor, including after force-close.
 	///
 	/// Drop every monitor guard before passing the result to

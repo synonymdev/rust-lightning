@@ -188,6 +188,7 @@ impl FFORRecoveryRegistry {
 					.unwrap_or_else(|| FFORReceiverWitnessAcknowledgements::empty(&witnesses)),
 			),
 			witnesses: Some(witnesses),
+			invoice: previous.record.invoice.clone(),
 		})?;
 		let header_growth = if self.version() < REQUEST_VERSION { 2 } else { 0 };
 		self.prepare_replacement(index, entry, header_growth)

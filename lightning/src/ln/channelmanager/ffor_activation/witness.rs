@@ -68,6 +68,7 @@ where
 			FFORRecoveryKey { channel_id: context.channel_id(), epoch_id: context.epoch_id() };
 		let mut recovery = self.ffor_recovery.lock().unwrap();
 		let current = self.ffor_active_state_locked(channel, &recovery, &key)?;
+		let mut runtime = self.ffor_activation.lock().unwrap();
 		let height = self.best_block.read().unwrap();
 		Self::validate_ffor_witness_context(context, &current, height.height)?;
 		let registration = FFORReceiverWitnessRegistration::from_manifests(&current, manifests)
@@ -77,25 +78,24 @@ where
 				return Err(FFORReceiverError::InvalidWitnessRegistration);
 			}
 			if recovery.get_witness_acks(&key).is_some() {
-				return Ok(self.ffor_activation.lock().unwrap().get(&key)?.requirement.clone());
+				return Ok(runtime.get(&key)?.requirement.clone());
 			}
 			// A legacy registration must reserve compact ACK capacity before the new authenticated
 			// attempt path sends anything. Exact retries cannot skip this checked upgrade.
 		}
 		// Initial registration cannot convert a merely observed or unpersisted Active phase into
 		// authority. Its exact compact evidence and all later close reservations must fit first.
-		self.ffor_active_context_locked(channel, &recovery, &key)?;
+		let mut barrier = self.ffor_persistence.lock().unwrap();
+		if !barrier.is_complete(&runtime.get(&key)?.requirement) {
+			return Err(FFORCommitmentError::PendingUpdates.into());
+		}
 		let upgrade = recovery
 			.prepare_witnesses(&key, registration)
 			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
-		let requirement = self
-			.ffor_persistence
-			.lock()
-			.unwrap()
-			.request()
-			.map_err(|_| FFORReceiverError::PersistenceUnavailable)?;
+		let requirement =
+			barrier.request().map_err(|_| FFORReceiverError::PersistenceUnavailable)?;
 		upgrade.commit();
-		self.ffor_activation.lock().unwrap().record(key, requirement.clone(), false);
+		runtime.record(key, requirement.clone(), false);
 		Ok(requirement)
 	}
 
@@ -169,6 +169,7 @@ where
 		};
 		let recovery = self.ffor_recovery.lock().unwrap();
 		let current = self.ffor_active_state_locked(channel, &recovery, &key)?;
+		let runtime = self.ffor_activation.lock().unwrap();
 		let height = self.best_block.read().unwrap();
 		Self::validate_ffor_witness_context(historical, &current, height.height)?;
 		let registration =
@@ -176,7 +177,6 @@ where
 		if !registration.matches_manifest(witness, provision.manifest()) {
 			return Err(FFORReceiverError::InvalidWitnessRegistration);
 		}
-		let runtime = self.ffor_activation.lock().unwrap();
 		let requirement = &runtime.get(&key)?.requirement;
 		let barrier = self.ffor_persistence.lock().unwrap();
 		if requirement != &context.requirement || !barrier.is_complete(requirement) {

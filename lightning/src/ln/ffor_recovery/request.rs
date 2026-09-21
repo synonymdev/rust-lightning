@@ -154,6 +154,7 @@ impl FFORRecoveryRegistry {
 			request: Some(request.clone()),
 			witnesses: None,
 			witness_acks: None,
+			invoice: None,
 		})?;
 		// Both forms were charged the full record allowance before Init. Promotion cannot increase
 		// total used plus reserved bytes, and the borrowed permit prevents a conflicting insertion.

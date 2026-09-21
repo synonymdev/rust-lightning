@@ -6,8 +6,10 @@
 
 mod request;
 use request::PendingRequest;
+pub(crate) mod invoice;
 mod witness;
 mod witness_ack;
+use invoice::FFORInvoiceRecord;
 
 mod activation;
 pub(crate) use activation::{FFORReceiverActivation, FFORReceiverCloseRecord};
@@ -36,6 +38,7 @@ const REQUEST_VERSION: u8 = 4;
 // Earlier readers must not forget protected application key and manifest ownership.
 const WITNESS_VERSION: u8 = 5;
 const WITNESS_ACK_VERSION: u8 = 6;
+const INVOICE_VERSION: u8 = 7;
 const MAX_RECORDS: usize = 64;
 const MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
 // Two maximum wire messages, a 483-slot canonical book, and fixed admission fields fit here.
@@ -71,6 +74,7 @@ struct StoredSetup {
 	request: Option<crate::ln::channel::FFORReceiverRequest>,
 	witnesses: Option<FFORReceiverWitnessRegistration>,
 	witness_acks: Option<FFORReceiverWitnessAcknowledgements>,
+	invoice: Option<FFORInvoiceRecord>,
 }
 
 impl_writeable_tlv_based!(StoredSetup, {
@@ -80,6 +84,7 @@ impl_writeable_tlv_based!(StoredSetup, {
 	(6, request, option),
 	(8, witnesses, option),
 	(10, witness_acks, option),
+	(12, invoice, option),
 });
 
 struct Entry {
@@ -120,6 +125,21 @@ impl Entry {
 		}
 		if let Some(acks) = record.witness_acks.as_ref() {
 			acks.validate(record.witnesses.as_ref().ok_or(FFORRecoveryError::InvalidRecord)?)?;
+		}
+		if let Some(invoice) = record.invoice.as_ref() {
+			let context = record
+				.activation
+				.as_ref()
+				.ok_or(FFORRecoveryError::InvalidRecord)?
+				.receiver_context(&record.setup)
+				.map_err(|_| FFORRecoveryError::InvalidRecord)?;
+			invoice
+				.validate(
+					&context,
+					record.witnesses.as_ref().ok_or(FFORRecoveryError::InvalidRecord)?,
+					record.witness_acks.as_ref().ok_or(FFORRecoveryError::InvalidRecord)?,
+				)
+				.map_err(|_| FFORRecoveryError::InvalidRecord)?;
 		}
 		let header = authenticated.header();
 		let encoded_bytes = record.serialized_length();
@@ -401,6 +421,7 @@ impl FFORRecoveryRegistry {
 			request: None,
 			witnesses: None,
 			witness_acks: None,
+			invoice: None,
 		})?;
 		if self.pending_requests.iter().any(|pending| {
 			pending.key.channel_id == entry.key.channel_id
@@ -442,6 +463,7 @@ impl FFORRecoveryRegistry {
 			request,
 			witnesses,
 			witness_acks: self.get_witness_acks(&key).cloned(),
+			invoice: self.get_invoice(&key).cloned(),
 		})?;
 		let index = self
 			.entries
@@ -490,6 +512,9 @@ impl FFORRecoveryRegistry {
 	}
 
 	fn version(&self) -> u8 {
+		if self.entries.iter().any(|entry| entry.record.invoice.is_some()) {
+			return INVOICE_VERSION;
+		}
 		if self.entries.iter().any(|entry| entry.record.witness_acks.is_some()) {
 			return WITNESS_ACK_VERSION;
 		}
@@ -572,6 +597,7 @@ impl Readable for FFORRecoveryRegistry {
 			&& version != REQUEST_VERSION
 			&& version != WITNESS_VERSION
 			&& version != WITNESS_ACK_VERSION
+			&& version != INVOICE_VERSION
 		{
 			return Err(DecodeError::UnknownRequiredFeature);
 		}

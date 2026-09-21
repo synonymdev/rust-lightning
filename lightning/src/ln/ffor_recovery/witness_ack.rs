@@ -116,6 +116,7 @@ impl FFORRecoveryRegistry {
 			request: previous.record.request.clone(),
 			witnesses: previous.record.witnesses.clone(),
 			witness_acks: Some(acks),
+			invoice: previous.record.invoice.clone(),
 		})?;
 		self.prepare_replacement(index, entry, 0)
 	}

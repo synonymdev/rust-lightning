@@ -131,6 +131,7 @@ fn stored(record: FFORReceiverSetup) -> StoredSetup {
 		request: None,
 		witnesses: None,
 		witness_acks: None,
+		invoice: None,
 	}
 }
 
@@ -300,7 +301,7 @@ fn ffor_recovery_reader_refuses_future_schema_missing_fields_and_truncation() {
 		assert!(decode(&framed[..length]).is_err(), "accepted prefix {}", length);
 	}
 	let mut future = framed.clone();
-	future[0] = WITNESS_ACK_VERSION + 1;
+	future[0] = INVOICE_VERSION + 1;
 	assert!(matches!(decode(&future), Err(DecodeError::UnknownRequiredFeature)));
 	// Empty TLV records omit both mandatory fields.
 	assert!(decode(&frame(&[vec![0]])).is_err());

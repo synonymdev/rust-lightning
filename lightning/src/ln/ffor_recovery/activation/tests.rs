@@ -356,6 +356,7 @@ fn ffor_activation_archive_reserves_maximum_ack_through_competing_admission_and_
 		request: None,
 		witnesses: None,
 		witness_acks: None,
+		invoice: None,
 		canonical_book: extra_setup.validate_recovery().unwrap().canonical_book().to_vec(),
 		setup: extra_setup,
 		activation: Some(extra_activation),

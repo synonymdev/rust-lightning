@@ -81,6 +81,7 @@ fn ffor_witness_archive_reauthenticates_compact_metadata_and_required_fence() {
 		request: None,
 		witnesses: Some(metadata.clone()),
 		witness_acks: None,
+		invoice: None,
 	};
 	for mutation in 0..9 {
 		let mut damaged = record();
