@@ -1,8 +1,10 @@
 use super::*;
 use crate::chain::transaction::OutPoint;
 use crate::io::Read;
+use crate::ln::ffor::journal::FFORCooperativeJournal;
 use crate::ln::ffor_recovery::{
-	CLOSED_RESERVATION_BYTES, CLOSE_RESERVATION_BYTES, CLOSE_VERSION, MAX_RECORD_BYTES,
+	CLOSED_RESERVATION_BYTES, CLOSE_RESERVATION_BYTES, CLOSE_VERSION, INVOICE_VERSION,
+	JOURNAL_VERSION, MAX_RECORD_BYTES,
 };
 use crate::util::ser::BigSize;
 use bitcoin::hashes::sha256;
@@ -71,8 +73,20 @@ pub(super) fn phases(maximum: bool) -> (FFORReceiverSetup, Vec<FFORReceiverActiv
 	let closing = active.with_close(&setup, &close_wire(&setup, &active, maximum)).unwrap();
 	let draining =
 		closing.with_close_ack(&setup, &close_ack(&setup, &closing, maximum, vec![])).unwrap();
-	let closed = historical_closed(&setup, &draining, &completion(&setup, &draining));
+	let journal = full_journal(&setup, 3);
+	let closed =
+		historical_closed(&setup, &draining, &completion_with(&setup, &draining, Some(journal)));
 	(setup, vec![activating, active, closing, draining, closed])
+}
+
+/// A complete journal for the whole book, fulfilling every `every`-th slot from the first.
+fn full_journal(setup: &FFORReceiverSetup, every: usize) -> FFORCooperativeJournal {
+	let count = setup.validate_recovery().unwrap().vouchers().len();
+	let mut journal = FFORCooperativeJournal::new(count).unwrap();
+	for slot in 0..count {
+		assert!(journal.record(slot, slot % every == 0));
+	}
+	journal
 }
 
 // This storage fixture exercises historical framing only. It cannot construct the channel's
@@ -86,8 +100,27 @@ struct HistoricalCompletion {
 	settlement_txid: Txid,
 	monitor_update_id: u64,
 	funding_txo: OutPoint,
+	journal: Option<FFORCooperativeJournal>,
 }
 impl_writeable_tlv_based!(HistoricalCompletion, {
+	(0, completion_hash, required), (2, receiver_number, required),
+	(4, receiver_txid, required), (6, settlement_number, required),
+	(8, settlement_txid, required), (10, monitor_update_id, required), (12, funding_txo, required),
+	(14, journal, option),
+});
+
+/// The completion record layout before the native outcome journal existed.
+#[derive(Clone)]
+struct PreviousCompletion {
+	completion_hash: [u8; 32],
+	receiver_number: u64,
+	receiver_txid: Txid,
+	settlement_number: u64,
+	settlement_txid: Txid,
+	monitor_update_id: u64,
+	funding_txo: OutPoint,
+}
+impl_writeable_tlv_based!(PreviousCompletion, {
 	(0, completion_hash, required), (2, receiver_number, required),
 	(4, receiver_txid, required), (6, settlement_number, required),
 	(8, settlement_txid, required), (10, monitor_update_id, required), (12, funding_txo, required),
@@ -105,6 +138,13 @@ impl_writeable_tlv_based!(HistoricalClose, {
 fn completion(
 	setup: &FFORReceiverSetup, draining: &FFORReceiverActivation,
 ) -> HistoricalCompletion {
+	completion_with(setup, draining, None)
+}
+
+fn completion_with(
+	setup: &FFORReceiverSetup, draining: &FFORReceiverActivation,
+	journal: Option<FFORCooperativeJournal>,
+) -> HistoricalCompletion {
 	let mut completed = HistoricalCompletion {
 		completion_hash: [0; 32],
 		receiver_number: 5,
@@ -113,8 +153,13 @@ fn completion(
 		settlement_txid: Txid::from_byte_array([8; 32]),
 		monitor_update_id: 6,
 		funding_txo: setup.funding_txo(),
+		journal,
 	};
-	let mut bytes = b"ffor/native-drain-complete/v1".to_vec();
+	let mut bytes = if completed.journal.is_some() {
+		b"ffor/native-drain-complete/v2".to_vec()
+	} else {
+		b"ffor/native-drain-complete/v1".to_vec()
+	};
 	bytes.extend_from_slice(&key(setup).epoch_id);
 	bytes.extend_from_slice(&draining.activation_hash(setup).unwrap());
 	bytes.extend_from_slice(&draining.close_record().unwrap().acknowledgement_hash().unwrap());
@@ -127,6 +172,9 @@ fn completion(
 	] {
 		bytes.extend_from_slice(&number.to_be_bytes());
 		bytes.extend_from_slice(txid.as_byte_array());
+	}
+	if let Some(journal) = &completed.journal {
+		bytes.extend_from_slice(&journal.digest_bytes());
 	}
 	completed.completion_hash = sha256::Hash::hash(&bytes).to_byte_array();
 	completed
@@ -178,7 +226,10 @@ fn ffor_activation_close_maximum_transcripts_preserve_history_and_reservations()
 			assert_eq!(retained.ack_wire(), phases[1].ack_wire());
 		}
 		if index >= 2 {
-			assert_eq!(registry.encode()[0], CLOSE_VERSION);
+			assert_eq!(
+				registry.encode()[0],
+				if index == 4 { JOURNAL_VERSION } else { CLOSE_VERSION }
+			);
 			let close = retained.close_record().unwrap();
 			assert_eq!(close.close_wire().len(), MAX_MESSAGE_LEN);
 			assert_eq!(close.close_wire(), phases[2].close_record().unwrap().close_wire());
@@ -189,9 +240,171 @@ fn ffor_activation_close_maximum_transcripts_preserve_history_and_reservations()
 			assert_eq!(close.settled().unwrap(), vec![0; 61]);
 			assert!(close.preimages().unwrap().is_empty());
 		}
+		if index == 4 {
+			assert_eq!(registry.encode()[0], JOURNAL_VERSION);
+			let close = retained.close_record().unwrap();
+			assert_eq!(close.journal(), Some(&full_journal(&setup, 3)));
+			assert_eq!(close.journal().unwrap().slots(), 483);
+		}
 		registry = roundtrip(&registry);
 	}
 	assert!(registry.get_activation(&key(&setup)).unwrap().is_closed());
+	// The maximum journaled Closed record plus its framing growth stays inside the reservation.
+	let maximum = completion_with(&setup, &phases[3], Some(full_journal(&setup, 1)));
+	assert!(
+		maximum.serialized_length() + 64 <= CLOSED_RESERVATION_BYTES,
+		"{}",
+		maximum.serialized_length()
+	);
+}
+
+#[test]
+fn ffor_activation_close_journal_binds_completion_and_refuses_legacy_readers_and_corruption() {
+	let (setup, phases) = phases(false);
+	let authenticated = setup.validate_recovery().unwrap();
+	let count = authenticated.vouchers().len();
+	let draining = &phases[3];
+	// A legacy completion without a journal still validates under the original digest domain
+	// and reports no outcomes.
+	let legacy = historical_closed(&setup, draining, &completion(&setup, draining));
+	legacy.validate(&authenticated).unwrap();
+	assert!(legacy.close_record().unwrap().journal().is_none());
+	let mut registry = registered(&setup);
+	for phase in &phases[..4] {
+		registry.prepare_activation(&setup, phase).unwrap().commit();
+	}
+	let before_closed = registry.encode();
+	registry.prepare_activation(&setup, &legacy).unwrap().commit();
+	assert_eq!(registry.encode()[0], CLOSE_VERSION);
+	registry = FFORRecoveryRegistry::read(&mut &before_closed[..]).unwrap();
+
+	let journal = full_journal(&setup, 2);
+	let journaled = historical_closed(
+		&setup,
+		draining,
+		&completion_with(&setup, draining, Some(journal.clone())),
+	);
+	journaled.validate(&authenticated).unwrap();
+	registry.prepare_activation(&setup, &journaled).unwrap().commit();
+	let bytes = registry.encode();
+	assert_eq!(bytes[0], JOURNAL_VERSION);
+	let restored = roundtrip(&registry);
+	assert_eq!(
+		restored.get_activation(&key(&setup)).unwrap().close_record().unwrap().journal(),
+		Some(&journal)
+	);
+	// The journal cannot be replaced or dropped once the Closed proof is retained.
+	assert!(registry.prepare_activation(&setup, &legacy).is_err());
+	let other = historical_closed(
+		&setup,
+		draining,
+		&completion_with(&setup, draining, Some(full_journal(&setup, 1))),
+	);
+	assert!(registry.prepare_activation(&setup, &other).is_err());
+	// Old readers reject the journal field and the new version byte instead of dropping them.
+	let old_reader = PreviousCompletion::read(
+		&mut &completion_with(&setup, draining, Some(journal.clone())).encode()[..],
+	);
+	assert!(matches!(old_reader, Err(DecodeError::UnknownRequiredFeature)));
+	let mut downgraded = bytes.clone();
+	downgraded[0] = INVOICE_VERSION;
+	assert!(FFORRecoveryRegistry::read(&mut &downgraded[..]).is_err());
+	let mut future = bytes.clone();
+	future[0] = JOURNAL_VERSION + 1;
+	assert!(matches!(
+		FFORRecoveryRegistry::read(&mut &future[..]),
+		Err(DecodeError::UnknownRequiredFeature)
+	));
+	// Malformed journals: wrong domain, incomplete coverage, padding, subset, size and a signed
+	// settled slot that stock accounting never fulfilled.
+	let bytes_len = (count + 7) / 8;
+	let (payable_setup, payable_closing, preimages) = payable(false);
+	let payable_authenticated = payable_setup.validate_recovery().unwrap();
+	let settled_draining = payable_closing
+		.with_close_ack(
+			&payable_setup,
+			&close_ack(&payable_setup, &payable_closing, false, vec![preimages[0].clone()]),
+		)
+		.unwrap();
+	let unfulfilled = {
+		let mut journal = FFORCooperativeJournal::new(2).unwrap();
+		assert!(journal.record(0, false));
+		assert!(journal.record(1, true));
+		journal
+	};
+	let cases: Vec<(&FFORReceiverSetup, &FFORReceiverActivation, HistoricalCompletion)> = vec![
+		(&setup, draining, {
+			let mut completed = completion(&setup, draining);
+			completed.journal = Some(journal.clone());
+			completed
+		}),
+		(
+			&setup,
+			draining,
+			completion_with(&setup, draining, Some(FFORCooperativeJournal::new(count).unwrap())),
+		),
+		(&setup, draining, {
+			let mut resolved = vec![0xff; bytes_len];
+			if count % 8 == 0 {
+				resolved.push(0);
+			}
+			completion_with(
+				&setup,
+				draining,
+				Some(FFORCooperativeJournal::from_parts(
+					count as u16,
+					resolved,
+					vec![0; bytes_len],
+				)),
+			)
+		}),
+		(
+			&setup,
+			draining,
+			completion_with(
+				&setup,
+				draining,
+				Some(FFORCooperativeJournal::from_parts(
+					count as u16,
+					vec![0; bytes_len],
+					vec![1; bytes_len],
+				)),
+			),
+		),
+		(&setup, draining, completion_with(&setup, draining, Some(full_journal_of(count + 1, 2)))),
+		(
+			&payable_setup,
+			&settled_draining,
+			completion_with(&payable_setup, &settled_draining, Some(unfulfilled)),
+		),
+	];
+	for (index, (case_setup, base, completed)) in cases.iter().enumerate() {
+		let closed = historical_closed(case_setup, base, completed);
+		let authenticated = if index == 5 { &payable_authenticated } else { &authenticated };
+		assert!(closed.validate(authenticated).is_err(), "change {index}");
+	}
+	// The same signed settled slot validates once stock accounting fulfilled it.
+	let fulfilled = {
+		let mut journal = FFORCooperativeJournal::new(2).unwrap();
+		assert!(journal.record(0, true));
+		assert!(journal.record(1, false));
+		journal
+	};
+	historical_closed(
+		&payable_setup,
+		&settled_draining,
+		&completion_with(&payable_setup, &settled_draining, Some(fulfilled)),
+	)
+	.validate(&payable_authenticated)
+	.unwrap();
+}
+
+fn full_journal_of(count: usize, every: usize) -> FFORCooperativeJournal {
+	let mut journal = FFORCooperativeJournal::new(count).unwrap();
+	for slot in 0..count {
+		assert!(journal.record(slot, slot % every == 0));
+	}
+	journal
 }
 
 #[test]

@@ -444,7 +444,22 @@ fn ffor_receipt_import_late_failed_voucher_only_protects_monitor_and_keeps_stock
 		let monitor = get_monitor!(receiver, id).ffor_commitment_snapshot().unwrap();
 		receiver.node.prepare_ffor_receiver_closed(&id, &peer_id, EPOCH, &monitor).unwrap();
 		persist(receiver.node);
-		receiver.node.release_ffor_receiver_closed(&id, &peer_id, EPOCH).unwrap();
+		assert!(receiver.node.release_ffor_receiver_closed(&id, &peer_id, EPOCH).unwrap());
+		// The late preimage protected the monitor but the signed failure is the recorded outcome.
+		for (index, voucher) in vouchers.iter().enumerate() {
+			assert_eq!(
+				receiver
+					.node
+					.ffor_receiver_voucher_outcome(
+						&context,
+						index as u16 + 1,
+						voucher.payment_hash,
+						voucher.amount_msat
+					)
+					.unwrap(),
+				Some(crate::ln::ffor::FFORVoucherOutcome::Failed)
+			);
+		}
 		let restored =
 			restore(receiver, &persist(receiver.node), &get_monitor!(receiver, id).encode())
 				.unwrap();

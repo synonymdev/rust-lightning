@@ -1,5 +1,6 @@
 use super::*;
 use crate::ln::channelmanager::ffor_recovery_tests::install_ffor_activation_for_test;
+use crate::ln::ffor::FFORCommitment;
 use crate::ln::ffor_recovery::FFORReceiverActivation;
 use crate::ln::ffor_tests::quiescence::{complete_handshake, register_signed, request};
 use crate::ln::ffor_tests::{anchor_config, deliver_parked_voucher, offer_voucher};
@@ -225,4 +226,93 @@ fn ffor_drain_restored_permission_and_duplicate_hash_fail_closed() {
 			Err(DecodeError::InvalidValue)
 		));
 	}
+}
+
+/// The drain layout before the native outcome journal existed.
+struct LegacyDrain {
+	acknowledgement_hash: [u8; 32],
+	activation_hash: [u8; 32],
+	feerate_per_kw: u32,
+	settled: Vec<u8>,
+	known_preimages: Vec<(u64, PaymentPreimage)>,
+	completion_hash: Option<[u8; 32]>,
+	closed: bool,
+}
+impl_writeable_tlv_based!(LegacyDrain, {
+	(0, acknowledgement_hash, required),
+	(2, settled, required_vec),
+	(4, known_preimages, required_vec),
+	(6, completion_hash, option),
+	(8, closed, required),
+	(10, activation_hash, required),
+	(12, feerate_per_kw, required),
+});
+
+#[test]
+fn ffor_drain_legacy_records_restore_without_a_journal_and_never_acquire_one() {
+	let legacy = LegacyDrain {
+		acknowledgement_hash: [1; 32],
+		activation_hash: [2; 32],
+		feerate_per_kw: 253,
+		settled: vec![0],
+		known_preimages: vec![],
+		completion_hash: None,
+		closed: false,
+	};
+	let mut restored = FFORReceiverDrain::read(&mut &legacy.encode()[..]).unwrap();
+	assert!(restored.journal.is_none());
+	assert!(!restored.enabled);
+	// A restored legacy drain records nothing at the stock removal point.
+	restored.record_removal(0, true);
+	assert!(restored.journal.is_none());
+	assert_eq!(restored.encode(), legacy.encode());
+	assert_eq!(
+		ffor_drain_completion_digest(
+			[3; 32],
+			[2; 32],
+			[1; 32],
+			ChannelId([4; 32]),
+			OutPoint { txid: Txid::from_byte_array([5; 32]), index: 0 },
+			FFORVoucherCommitments {
+				holder: FFORCommitment { number: 5, txid: Txid::from_byte_array([6; 32]) },
+				counterparty: FFORCommitment { number: 5, txid: Txid::from_byte_array([7; 32]) },
+			},
+			6,
+			None,
+		),
+		{
+			let mut bytes = b"ffor/native-drain-complete/v1".to_vec();
+			bytes.extend_from_slice(&[3; 32]);
+			bytes.extend_from_slice(&[2; 32]);
+			bytes.extend_from_slice(&[1; 32]);
+			bytes.extend_from_slice(&[4; 32]);
+			bytes.extend_from_slice(
+				&OutPoint { txid: Txid::from_byte_array([5; 32]), index: 0 }.encode(),
+			);
+			bytes.extend_from_slice(&6u64.to_be_bytes());
+			for (number, txid) in [(5u64, [6u8; 32]), (5, [7; 32])] {
+				bytes.extend_from_slice(&number.to_be_bytes());
+				bytes.extend_from_slice(&txid);
+			}
+			Sha256::hash(&bytes).to_byte_array()
+		}
+	);
+	// New drains carry a journal that old readers must refuse rather than drop.
+	let mut journaled = FFORReceiverDrain::read(&mut &legacy.encode()[..]).unwrap();
+	journaled.journal = FFORCooperativeJournal::new(8);
+	journaled.record_removal(0, true);
+	journaled.record_removal(1, false);
+	assert!(matches!(
+		LegacyDrain::read(&mut &journaled.encode()[..]),
+		Err(DecodeError::UnknownRequiredFeature)
+	));
+	let again = FFORReceiverDrain::read(&mut &journaled.encode()[..]).unwrap();
+	assert_eq!(again.journal, journaled.journal);
+	assert!(again.journal.as_ref().unwrap().is_fulfilled(0));
+	assert!(again.journal.as_ref().unwrap().is_resolved(1));
+	assert!(!again.journal.as_ref().unwrap().is_fulfilled(1));
+	// A closed drain freezes its journal.
+	journaled.closed = true;
+	journaled.record_removal(2, true);
+	assert!(!journaled.journal.as_ref().unwrap().is_resolved(2));
 }

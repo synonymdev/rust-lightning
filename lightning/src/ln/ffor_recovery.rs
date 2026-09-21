@@ -20,6 +20,7 @@ use bitcoin::secp256k1::PublicKey;
 
 use crate::io;
 use crate::ln::channel::{FFORReceiverFencePhase, FFORReceiverSetup};
+use crate::ln::ffor::journal::FFORCooperativeJournal;
 use crate::ln::ffor::{
 	FFORMonitorRecoveryIdentity, FFORReceiverAbortReason, FFORReceiverWitnessAcknowledgements,
 	FFORReceiverWitnessRegistration,
@@ -39,6 +40,8 @@ const REQUEST_VERSION: u8 = 4;
 const WITNESS_VERSION: u8 = 5;
 const WITNESS_ACK_VERSION: u8 = 6;
 const INVOICE_VERSION: u8 = 7;
+// Earlier readers must reject the native outcome journal rather than drop it.
+const JOURNAL_VERSION: u8 = 8;
 const MAX_RECORDS: usize = 64;
 const MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
 // Two maximum wire messages, a 483-slot canonical book, and fixed admission fields fit here.
@@ -290,7 +293,8 @@ impl FFORRecoveryRegistry {
 	/// Check the channel-owned close binding against exact authenticated archived evidence.
 	pub(crate) fn validate_channel_lifecycle(
 		&self, setup: &FFORReceiverSetup, fence: Option<(FFORReceiverFencePhase, [u8; 32])>,
-		abort_reason: Option<FFORReceiverAbortReason>, drain: Option<([u8; 32], Vec<u8>, bool)>,
+		abort_reason: Option<FFORReceiverAbortReason>,
+		drain: Option<([u8; 32], Vec<u8>, bool, Option<FFORCooperativeJournal>)>,
 		completion_hash: Option<[u8; 32]>, drain_activation_hash: Option<[u8; 32]>,
 	) -> Result<(), DecodeError> {
 		if !self.contains_exact(setup) {
@@ -303,13 +307,15 @@ impl FFORRecoveryRegistry {
 		if let Some(record) = self.get_activation(&key) {
 			if record.is_draining() {
 				let close = record.close_record().ok_or(DecodeError::InvalidValue)?;
-				let (ack_hash, settled, closed) = drain.ok_or(DecodeError::InvalidValue)?;
+				let (ack_hash, settled, closed, journal) =
+					drain.ok_or(DecodeError::InvalidValue)?;
 				let hash = record.validate(&authenticated)?;
 				if abort_reason.is_some()
 					|| Some(ack_hash) != close.acknowledgement_hash()
 					|| settled != close.settled()?
 					|| completion_hash != close.completion_hash()
 					|| drain_activation_hash != Some(hash)
+					|| (record.is_closed() && close.journal() != journal.as_ref())
 				{
 					return Err(DecodeError::InvalidValue);
 				}
@@ -478,7 +484,11 @@ impl FFORRecoveryRegistry {
 			} {
 			return Err(FFORRecoveryError::ConflictingRecord);
 		}
-		self.prepare_replacement(index, entry, 0)
+		// A journaled Closed proof raises the archive past the request version, which adds the
+		// pending-request count to the framing. The terminal reservation covers this growth.
+		let journaled = activation.close_record().map_or(false, |close| close.journal().is_some());
+		let header_growth = if journaled && self.version() < REQUEST_VERSION { 2 } else { 0 };
+		self.prepare_replacement(index, entry, header_growth)
 	}
 
 	fn prepare_replacement(
@@ -512,6 +522,13 @@ impl FFORRecoveryRegistry {
 	}
 
 	fn version(&self) -> u8 {
+		if self.entries.iter().any(|entry| {
+			entry.record.activation.as_ref().map_or(false, |activation| {
+				activation.close_record().map_or(false, |close| close.journal().is_some())
+			})
+		}) {
+			return JOURNAL_VERSION;
+		}
 		if self.entries.iter().any(|entry| entry.record.invoice.is_some()) {
 			return INVOICE_VERSION;
 		}
@@ -598,6 +615,7 @@ impl Readable for FFORRecoveryRegistry {
 			&& version != WITNESS_VERSION
 			&& version != WITNESS_ACK_VERSION
 			&& version != INVOICE_VERSION
+			&& version != JOURNAL_VERSION
 		{
 			return Err(DecodeError::UnknownRequiredFeature);
 		}

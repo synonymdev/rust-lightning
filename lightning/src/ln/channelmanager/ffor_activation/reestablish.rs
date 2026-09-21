@@ -127,7 +127,8 @@ where
 			// The peer may resume ordinary updates as soon as it sees Closed. Persistence
 			// alone does not grant that permission to this manager instance after restore.
 			if channel.ffor_receiver_fence().is_some()
-				|| channel.ffor_receiver_drain_binding().map(|(_, _, closed)| closed) != Some(true)
+				|| channel.ffor_receiver_drain_binding().map(|(_, _, closed, _)| closed)
+					!= Some(true)
 			{
 				return Ok(None);
 			}

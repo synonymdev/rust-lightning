@@ -50,6 +50,8 @@ pub use invoice::{
 	FFORInvoiceIntent, FFORInvoiceMonitorCheck, FFORInvoicePreparation, FFORStoredInvoice,
 	FFORWitnessRouteEvidence,
 };
+pub(crate) mod journal;
+pub use journal::FFORVoucherOutcome;
 
 /// Which channel participant offers every voucher HTLC in the book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

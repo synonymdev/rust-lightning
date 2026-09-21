@@ -60,7 +60,14 @@ fn ffor_witness_archive_bounds_maximum_book_and_reserves_terminal_transitions() 
 		assert!(registry.encoded_bytes + registry.reserved_transition_bytes <= reserved);
 		assert_eq!(registry.get_witnesses(&key(&setup)), Some(&metadata));
 		let bytes = registry.encode();
-		assert_eq!(bytes[0], crate::ln::ffor_recovery::WITNESS_ACK_VERSION);
+		assert_eq!(
+			bytes[0],
+			if phase.is_closed() {
+				crate::ln::ffor_recovery::JOURNAL_VERSION
+			} else {
+				crate::ln::ffor_recovery::WITNESS_ACK_VERSION
+			}
+		);
 		assert_eq!(bytes.len(), registry.encoded_bytes);
 		let restored = FFORRecoveryRegistry::read(&mut &bytes[..]).unwrap();
 		assert_eq!(restored.get_witnesses(&key(&setup)), Some(&metadata));

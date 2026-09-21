@@ -8747,13 +8747,25 @@ where
 			let pending_outbound_htlcs: &mut Vec<_> = &mut self.context.pending_outbound_htlcs;
 			let expecting_peer_commitment_signed =
 				&mut self.context.expecting_peer_commitment_signed;
+			let ffor_receiver_book = &mut self.context.ffor_receiver_book;
 
 			// We really shouldnt have two passes here, but retain gives a non-mutable ref (Rust bug)
 			pending_inbound_htlcs.retain(|htlc| {
 				if let &InboundHTLCState::LocalRemoved(ref reason) = &htlc.state {
 					log_trace!(logger, " ...removing inbound LocalRemoved {}", &htlc.payment_hash);
-					if let &InboundHTLCRemovalReason::Fulfill(_, _) = reason {
+					let fulfilled = matches!(reason, InboundHTLCRemovalReason::Fulfill(_, _));
+					if fulfilled {
 						value_to_self_msat_diff += htlc.amount_msat as i64;
+					}
+					// An owned voucher's outcome is journaled with the same stock accounting.
+					if let Some(book) = ffor_receiver_book.as_mut() {
+						book.record_drain_removal(
+							htlc.htlc_id,
+							htlc.payment_hash,
+							htlc.amount_msat,
+							htlc.cltv_expiry,
+							fulfilled,
+						);
 					}
 					*expecting_peer_commitment_signed = true;
 					false

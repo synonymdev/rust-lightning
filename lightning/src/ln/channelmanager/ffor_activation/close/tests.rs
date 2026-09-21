@@ -2,6 +2,7 @@ use super::*;
 use crate::chain::ChannelMonitorUpdateStatus;
 use crate::ln::channelmanager::ffor_activation::drain_tests::{drain, park_two};
 use crate::ln::channelmanager::ffor_recovery_tests::claim_ffor_preimage_for_test;
+use crate::ln::ffor::FFORVoucherOutcome;
 use crate::ln::ffor_tests::anchor_config;
 use crate::ln::functional_test_utils::*;
 use lightning_ffor::reestablish::{Reestablish, ReportedState};
@@ -98,6 +99,21 @@ fn ffor_close_manager_drains_both_views_and_persists_closed_before_ordinary_paym
 			let (vouchers, preimage) = park_two(&nodes[0], &nodes[1], id);
 			let (hash, activation_ack) = activate(&nodes[0], &nodes[1], id);
 			let old_monitor = get_monitor!(nodes[1], id).ffor_commitment_snapshot().unwrap();
+			let outcome = |node: &Node, slot: u16| {
+				let context = node.node.ffor_receiver_recovery_context(&id, EPOCH).unwrap();
+				let voucher = vouchers[usize::from(slot.clamp(1, 2)) - 1];
+				node.node.ffor_receiver_voucher_outcome(
+					&context,
+					slot,
+					voucher.payment_hash,
+					voucher.amount_msat,
+				)
+			};
+			let expected_first = if settled || learned {
+				FFORVoucherOutcome::Fulfilled
+			} else {
+				FFORVoucherOutcome::Failed
+			};
 			if learned {
 				claim_ffor_preimage_for_test(
 					&nodes[0],
@@ -284,6 +300,9 @@ fn ffor_close_manager_drains_both_views_and_persists_closed_before_ordinary_paym
 			);
 			nodes[0].node.get_and_clear_pending_events();
 			assert!(nodes[1].node.list_usable_channels().is_empty());
+			// Every slot is journaled, but nothing is reported before the retained Closed proof.
+			assert_eq!(outcome(&nodes[1], 1), Ok(None));
+			assert_eq!(outcome(&nodes[1], 2), Ok(None));
 			assert!(nodes[1]
 				.node
 				.prepare_ffor_receiver_closed(&id, &peer, EPOCH, &old_monitor)
@@ -313,6 +332,31 @@ fn ffor_close_manager_drains_both_views_and_persists_closed_before_ordinary_paym
 					.unwrap(),
 				closed
 			);
+			assert_eq!(outcome(&nodes[1], 1), Ok(Some(expected_first)));
+			assert_eq!(outcome(&nodes[1], 2), Ok(Some(FFORVoucherOutcome::Failed)));
+			assert!(outcome(&nodes[1], 0).is_err());
+			assert!(outcome(&nodes[1], 3).is_err());
+			{
+				let context = nodes[1].node.ffor_receiver_recovery_context(&id, EPOCH).unwrap();
+				assert!(nodes[1]
+					.node
+					.ffor_receiver_voucher_outcome(
+						&context,
+						1,
+						vouchers[1].payment_hash,
+						vouchers[0].amount_msat
+					)
+					.is_err());
+				assert!(nodes[1]
+					.node
+					.ffor_receiver_voucher_outcome(
+						&context,
+						1,
+						vouchers[0].payment_hash,
+						vouchers[0].amount_msat + 1
+					)
+					.is_err());
+			}
 			assert_eq!(drain(&nodes[0], &nodes[1]), (Vec::new(), Vec::new()));
 			assert_eq!(nodes[1].node.list_usable_channels().len(), 1);
 			let manager = persist(&nodes[1]);
@@ -327,7 +371,11 @@ fn ffor_close_manager_drains_both_views_and_persists_closed_before_ordinary_paym
 				chain_monitor,
 				reloaded
 			);
+			// A restored manager reports nothing until its own fresh write completes.
+			assert!(outcome(&nodes[1], 1).is_err());
 			persist(&nodes[1]);
+			assert_eq!(outcome(&nodes[1], 1), Ok(Some(expected_first)));
+			assert_eq!(outcome(&nodes[1], 2), Ok(Some(FFORVoucherOutcome::Failed)));
 			nodes[1]
 				.node
 				.accept_ffor_receiver_activation_ack(&id, &peer, EPOCH, &activation_ack)
@@ -335,6 +383,21 @@ fn ffor_close_manager_drains_both_views_and_persists_closed_before_ordinary_paym
 			connect_nodes(&nodes[0], &nodes[1]);
 			assert_eq!(drain(&nodes[0], &nodes[1]), (Vec::new(), Vec::new()));
 			send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+			if settled && !delay_monitor && !restart_mid_round {
+				// Archive-only history after the channel is gone still reports the same outcomes.
+				nodes[1]
+					.node
+					.force_close_broadcasting_latest_txn(&id, &peer, "archive only".into())
+					.unwrap();
+				nodes[1].node.get_and_clear_pending_events();
+				nodes[1].node.get_and_clear_pending_msg_events();
+				nodes[1].chain_monitor.added_monitors.lock().unwrap().clear();
+				assert!(nodes[1].node.list_channels().is_empty());
+				assert_eq!(outcome(&nodes[1], 1), Ok(Some(expected_first)));
+				persist(&nodes[1]);
+				assert_eq!(outcome(&nodes[1], 1), Ok(Some(expected_first)));
+				assert_eq!(outcome(&nodes[1], 2), Ok(Some(FFORVoucherOutcome::Failed)));
+			}
 		}
 	}
 }
@@ -419,6 +482,20 @@ fn ffor_close_manager_force_close_retains_draining_archive_and_monitor_preimage(
 		reload_node!(nodes[1], config, &manager, &[&monitor], persister, chain_monitor, reloaded);
 		assert!(nodes[1].node.list_channels().is_empty());
 		assert_eq!(nodes[1].node.ffor_recovery.lock().unwrap().encode(), archive);
+		persist(&nodes[1]);
+		let context = nodes[1].node.ffor_receiver_recovery_context(&id, EPOCH).unwrap();
+		assert_eq!(
+			nodes[1]
+				.node
+				.ffor_receiver_voucher_outcome(
+					&context,
+					1,
+					vouchers[0].payment_hash,
+					vouchers[0].amount_msat
+				)
+				.unwrap(),
+			None
+		);
 		assert_eq!(
 			get_monitor!(nodes[1], id).get_stored_preimages()[&vouchers[0].payment_hash].0,
 			preimage

@@ -3,6 +3,7 @@
 use super::*;
 use crate::chain::transaction::OutPoint;
 use crate::ln::channel::{ffor_drain_completion_digest, FFORReceiverDrainCompletion};
+use crate::ln::ffor::journal::FFORCooperativeJournal;
 use crate::ln::types::ChannelId;
 use crate::types::payment::PaymentPreimage;
 use bitcoin::hashes::sha256;
@@ -32,6 +33,8 @@ struct ClosedDrain {
 	settlement_txid: Txid,
 	monitor_update_id: u64,
 	funding_txo: OutPoint,
+	// Complete native outcome journal. Legacy records without one report no outcomes.
+	journal: Option<FFORCooperativeJournal>,
 }
 
 impl_writeable_tlv_based!(ClosedDrain, {
@@ -42,6 +45,7 @@ impl_writeable_tlv_based!(ClosedDrain, {
 	(8, settlement_txid, required),
 	(10, monitor_update_id, required),
 	(12, funding_txo, required),
+	(14, journal, option),
 });
 
 impl FFORReceiverCloseRecord {
@@ -104,9 +108,16 @@ impl FFORReceiverCloseRecord {
 				closed.funding_txo,
 				commitments,
 				closed.monitor_update_id,
+				closed.journal.as_ref(),
 			);
 			if digest != closed.completion_hash {
 				return Err(DecodeError::InvalidValue);
+			}
+			if let Some(journal) = &closed.journal {
+				journal.validate(setup.vouchers().len())?;
+				if !journal.all_resolved() || !journal.covers_settled(&self.settled()?) {
+					return Err(DecodeError::InvalidValue);
+				}
 			}
 			if closed.receiver_number == 0
 				|| closed.receiver_number > INITIAL_COMMITMENT_NUMBER
@@ -151,6 +162,11 @@ impl FFORReceiverCloseRecord {
 
 	pub(crate) fn completion_hash(&self) -> Option<[u8; 32]> {
 		self.closed.as_ref().map(|closed| closed.completion_hash)
+	}
+
+	/// The complete native outcome journal retained with the Closed proof, if any.
+	pub(crate) fn journal(&self) -> Option<&FFORCooperativeJournal> {
+		self.closed.as_ref()?.journal.as_ref()
 	}
 
 	/// Returns the signed bitmap only after the caller has authenticated this immutable record.
@@ -272,6 +288,7 @@ impl FFORReceiverActivation {
 			settlement_txid: commitments.counterparty.txid,
 			monitor_update_id,
 			funding_txo,
+			journal: completion.journal().cloned(),
 		};
 		if close.closed.as_ref().map_or(false, |old| old.encode() != closed.encode()) {
 			return Err(DecodeError::InvalidValue);

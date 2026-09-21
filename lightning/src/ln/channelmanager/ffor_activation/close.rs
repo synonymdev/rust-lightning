@@ -492,7 +492,7 @@ where
 		if !self.ffor_persistence.lock().unwrap().is_complete(&runtime.get(&key)?.requirement) {
 			return Ok(false);
 		}
-		if channel.ffor_receiver_drain_binding().map(|(_, _, closed)| closed) != Some(true) {
+		if channel.ffor_receiver_drain_binding().map(|(_, _, closed, _)| closed) != Some(true) {
 			channel.finish_ffor_receiver_closed(epoch_id, digest)?;
 		}
 		Ok(true)

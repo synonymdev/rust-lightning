@@ -13,6 +13,7 @@ mod close;
 mod context;
 mod driver;
 mod invoice;
+mod outcome;
 mod receipt;
 mod reestablish;
 mod witness;

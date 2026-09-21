@@ -141,6 +141,24 @@ impl FFORReceiverBook {
 		Ok(())
 	}
 
+	/// Record one irrevocable inbound removal in the drain journal at the stock revoke-and-ack
+	/// point. Ownership requires the exact voucher identity. Restore validation guarantees the
+	/// slot is still unresolved whenever a journal exists, so this never fails after preflight.
+	pub(super) fn record_drain_removal(
+		&mut self, htlc_id: u64, payment_hash: PaymentHash, amount_msat: u64, cltv_expiry: u32,
+		fulfilled: bool,
+	) {
+		let slot = self.vouchers.iter().position(|v| {
+			v.htlc_id == htlc_id
+				&& v.payment_hash == payment_hash
+				&& v.amount_msat == amount_msat
+				&& v.cltv_expiry == cltv_expiry
+		});
+		if let (Some(slot), Some(drain)) = (slot, self.drain.as_mut()) {
+			drain.record_removal(slot, fulfilled);
+		}
+	}
+
 	fn owns(&self, htlc_id: u64) -> bool {
 		self.received.iter().any(|received| received.voucher.htlc_id == htlc_id)
 	}

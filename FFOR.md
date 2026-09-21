@@ -392,10 +392,44 @@ assignment adds required field 12 and archive schema 7, bounding the signed stri
 4096 bytes and its record to 8192 bytes. The assignment is permanent after failed
 publication, expiry or restart, and it is not a payment success signal.
 
+## Cooperative outcome journal
+
+A new drain initializes a versioned journal with one resolved bit and one fulfilled bit per
+book slot, at most 483 slots and two 61-byte bitmaps. The stock revoke-and-ack removal of an
+inbound LocalRemoved HTLC records the exact owned voucher's slot at the same point it adds a
+fulfilled amount to the channel balance, without a new fallible step after the existing
+commitment-round preflight. The journal is native accounting only. It is never derived from
+the signed settled bitmap or from known preimages, and fulfilled is always a subset of
+resolved. A preimage learned after a signed failure protects the monitor but leaves that slot
+failed.
+
+Restore validation requires exact bitmap lengths, zero padding, the subset rule and, for each
+slot, either a resolved bit or the voucher still pending as a stock HTLC, never both; a
+fulfilled slot must have a known preimage. The drain completion proof requires every slot
+resolved and every signed settled slot fulfilled, binds the whole journal into a distinct
+`ffor/native-drain-complete/v2` digest domain, and carries it into the retained ClosedDrain
+under required-even field 14 with archive version 8. Legacy drains and archives without a
+journal keep the original digest domain, remain readable, and never acquire invented outcomes.
+Older readers reject journaled records with `UnknownRequiredFeature` instead of dropping them.
+A journaled Closed proof also raises a close-only archive past the request version, and that
+framing growth is charged inside the existing 512-byte terminal reservation.
+
+`ffor_receiver_voucher_outcome` is a historical, manager-instance-bound getter keyed by the
+current epoch context, the one-based slot, the exact payment hash and amount. It reports
+Fulfilled or Failed only from a fully finalized journal after the latest native manager write
+completed, including a fresh barrier after restore. Pending drains, force-closed epochs and
+legacy absence return no outcome. It changes no balances and emits no events. On-chain
+outcomes remain a separate unimplemented boundary: a future proof must join the stock
+monitor's irrevocably resolved HTLC evidence to the actual confirmed funding spend, an owned
+inbound voucher output, the original commitment identity and completed monitor persistence,
+with explicit partially drained commitment and reorg analysis. A preimage or a generic
+spendable output does not identify a payment.
+
 ## Validation
 
-The current focused native suite passes 169 tests, including 13 invoice tests. Native
-no-default-features and documentation builds with broken intra-doc links denied also pass.
+The current focused native suite passes 172 tests, including 13 invoice tests and the
+cooperative outcome journal checks. Native no-default-features and documentation builds with
+broken intra-doc links denied also pass.
 
 The FFOR tests exercise real two-node commitment rounds, both funding directions,
 asymmetric dust limits and contest delays, signature corruption, stale monitors,
@@ -514,6 +548,19 @@ runtime/height lock inversion in witness registration and release, which now use
 consistent registry, runtime, height and persistence order. An opt-in exporter writes that
 fixture only when `FFOR_NODE_INVOICE_FIXTURE_DIR` is set.
 
+Journal coverage extends the cooperative drain matrix across both funders, signed settled,
+learned and failed slots, delayed monitors and restart mid-round: outcomes are absent before
+the retained Closed proof, exact afterwards, refused for wrong slots, hashes and amounts,
+absent again on a restored manager until its fresh write completes, and preserved as
+archive-only history after the channel is force-closed away. A late receipt after a signed
+failure reports Failed. A force-closed drain reports nothing. Archive tests cover the legacy
+digest without a journal, journaled round trips at the maximum 483-slot book inside the
+terminal reservation, replacement refusal, old readers, downgraded and future version bytes,
+and malformed journals with the wrong domain, incomplete coverage, padding bits, fulfilled
+bits outside resolved, the wrong slot count and a signed settled slot that stock accounting
+never fulfilled. Drain tests cover legacy records restoring without a journal, never
+acquiring one, and closed drains freezing theirs.
+
 Seven receipt-import integration tests exercise both funders, delayed monitor persistence,
 idempotent retries, crash recovery from a failed write using the prior durable monitor,
 missing peer/monitor refusal, unregistered witnesses, changed identities, expired epochs,
@@ -536,6 +583,6 @@ deadline before claim safety ends.
 Production transport must bind the receiver facade to actual authenticated
 connections and deliver acknowledgement retries in the required order. Durable witness
 mailbox recovery, receipt-import orchestration, deadline enforcement, the application
-invoice publication runtime and authoritative payment outcomes remain separate required
-boundaries. None can be inferred from durable setup, activation or
+invoice publication runtime, joining journaled outcomes to the application payment ledger and
+on-chain outcomes remain separate required boundaries. None can be inferred from durable setup, activation or
 a successful private protocol test.

@@ -3,6 +3,7 @@
 //! permission to drain, and never releases the ordinary mutation fence before final persistence.
 
 use super::*;
+use crate::ln::ffor::journal::FFORCooperativeJournal;
 use crate::ln::ffor_recovery::FFORReceiverCloseRecord;
 
 pub(super) struct FFORReceiverDrain {
@@ -15,6 +16,8 @@ pub(super) struct FFORReceiverDrain {
 	closed: bool,
 	// Instance-local permission follows a successful manager write. Never restored from disk.
 	enabled: bool,
+	// Native per-slot outcomes. Legacy drains restored without one never acquire outcomes.
+	journal: Option<FFORCooperativeJournal>,
 }
 
 impl_writeable_tlv_based!(FFORReceiverDrain, {
@@ -26,6 +29,7 @@ impl_writeable_tlv_based!(FFORReceiverDrain, {
 	(10, activation_hash, required),
 	(12, feerate_per_kw, required),
 	(11, enabled, (static_value, false)),
+	(14, journal, option),
 });
 
 /// Point-in-time proof that both current commitments are empty and all stock rounds completed.
@@ -40,9 +44,14 @@ pub(crate) struct FFORReceiverDrainCompletion {
 	channel_id: ChannelId,
 	funding_txo: OutPoint,
 	monitor_update_id: u64,
+	journal: Option<FFORCooperativeJournal>,
 }
 
 impl FFORReceiverDrainCompletion {
+	/// The complete native outcome journal, absent only for a legacy drain without one.
+	pub(crate) fn journal(&self) -> Option<&FFORCooperativeJournal> {
+		self.journal.as_ref()
+	}
 	pub(crate) fn epoch_id(&self) -> [u8; 32] {
 		self.epoch_id
 	}
@@ -67,17 +76,24 @@ impl FFORReceiverDrainCompletion {
 			self.funding_txo,
 			self.commitments,
 			self.monitor_update_id,
+			self.journal.as_ref(),
 		)
 	}
 }
 
 /// Recompute a retained completion digest. This does not construct or authenticate a channel proof.
+/// A journal binds every resolved and fulfilled slot under a distinct domain; legacy records
+/// without one keep the original domain.
 pub(crate) fn ffor_drain_completion_digest(
 	epoch_id: [u8; 32], activation_hash: [u8; 32], acknowledgement_hash: [u8; 32],
 	channel_id: ChannelId, funding_txo: OutPoint, commitments: FFORVoucherCommitments,
-	monitor_update_id: u64,
+	monitor_update_id: u64, journal: Option<&FFORCooperativeJournal>,
 ) -> [u8; 32] {
-	let mut bytes = b"ffor/native-drain-complete/v1".to_vec();
+	let mut bytes = if journal.is_some() {
+		b"ffor/native-drain-complete/v2".to_vec()
+	} else {
+		b"ffor/native-drain-complete/v1".to_vec()
+	};
 	bytes.extend_from_slice(&epoch_id);
 	bytes.extend_from_slice(&activation_hash);
 	bytes.extend_from_slice(&acknowledgement_hash);
@@ -88,7 +104,21 @@ pub(crate) fn ffor_drain_completion_digest(
 		bytes.extend_from_slice(&identity.number.to_be_bytes());
 		bytes.extend_from_slice(identity.txid.as_byte_array());
 	}
+	if let Some(journal) = journal {
+		bytes.extend_from_slice(&journal.digest_bytes());
+	}
 	Sha256::hash(&bytes).to_byte_array()
+}
+
+impl FFORReceiverDrain {
+	pub(super) fn record_removal(&mut self, slot: usize, fulfilled: bool) {
+		if self.closed {
+			return;
+		}
+		if let Some(journal) = &mut self.journal {
+			journal.record(slot, fulfilled);
+		}
+	}
 }
 
 impl FFORReceiverBook {
@@ -195,6 +225,21 @@ where
 				_ => return Err(DecodeError::InvalidValue),
 			}
 		}
+		if let Some(journal) = &drain.journal {
+			journal.validate(book.vouchers.len())?;
+			for (slot, voucher) in book.vouchers.iter().enumerate() {
+				let pending =
+					self.pending_inbound_htlcs.iter().any(|h| h.htlc_id == voucher.htlc_id);
+				if journal.is_resolved(slot) == pending {
+					return Err(DecodeError::InvalidValue);
+				}
+				if journal.is_fulfilled(slot)
+					&& !drain.known_preimages.iter().any(|(id, _)| *id == voucher.htlc_id)
+				{
+					return Err(DecodeError::InvalidValue);
+				}
+			}
+		}
 		for update in &self.holding_cell_htlc_updates {
 			match update {
 				HTLCUpdateAwaitingACK::ClaimHTLC { htlc_id, payment_preimage, .. }
@@ -272,6 +317,7 @@ where
 			completion_hash: None,
 			closed: false,
 			enabled: false,
+			journal: FFORCooperativeJournal::new(book.vouchers.len()),
 		});
 		book.fence.as_mut().unwrap().phase = FFORReceiverFencePhase::Draining;
 		Ok(())
@@ -334,13 +380,12 @@ where
 		self.context.ffor_drain_enabled()
 	}
 
-	pub(crate) fn ffor_receiver_drain_binding(&self) -> Option<([u8; 32], Vec<u8>, bool)> {
-		self.context
-			.ffor_receiver_book
-			.as_ref()?
-			.drain
-			.as_ref()
-			.map(|drain| (drain.acknowledgement_hash, drain.settled.clone(), drain.closed))
+	pub(crate) fn ffor_receiver_drain_binding(
+		&self,
+	) -> Option<([u8; 32], Vec<u8>, bool, Option<FFORCooperativeJournal>)> {
+		self.context.ffor_receiver_book.as_ref()?.drain.as_ref().map(|drain| {
+			(drain.acknowledgement_hash, drain.settled.clone(), drain.closed, drain.journal.clone())
+		})
 	}
 
 	pub(crate) fn ffor_receiver_drain_activation_hash(&self) -> Option<[u8; 32]> {
@@ -351,12 +396,24 @@ where
 		self.context.ffor_receiver_book.as_ref()?.drain.as_ref()?.completion_hash
 	}
 
+	/// The native outcome journal of the current drain, if this drain has one.
+	pub(crate) fn ffor_receiver_drain_journal(&self) -> Option<&FFORCooperativeJournal> {
+		self.context.ffor_receiver_book.as_ref()?.drain.as_ref()?.journal.as_ref()
+	}
+
 	pub(crate) fn validate_ffor_drain(&self) -> Result<(), DecodeError> {
 		let book = self.context.ffor_receiver_book.as_ref().ok_or(DecodeError::InvalidValue)?;
 		if book.is_closed() {
+			let drain = book.drain.as_ref().unwrap();
+			if let Some(journal) = &drain.journal {
+				journal.validate(book.vouchers.len())?;
+				if !journal.all_resolved() || !journal.covers_settled(&drain.settled) {
+					return Err(DecodeError::InvalidValue);
+				}
+			}
 			return if book.fence.is_none()
 				&& book.abort_reason.is_none()
-				&& book.drain.as_ref().unwrap().completion_hash.is_some()
+				&& drain.completion_hash.is_some()
 			{
 				Ok(())
 			} else {
@@ -552,6 +609,14 @@ where
 			&monitor.holder,
 			&self.funding.channel_transaction_parameters,
 		)?;
+		if let Some(journal) = &drain.journal {
+			if !journal.all_resolved() {
+				return Err(FFORCommitmentError::PendingUpdates.into());
+			}
+			if !journal.covers_settled(&drain.settled) {
+				return Err(FFORCommitmentError::InvalidVoucherBook.into());
+			}
+		}
 		Ok(FFORReceiverDrainCompletion {
 			epoch_id: book.epoch_id,
 			activation_hash: fence.activation_hash,
@@ -563,6 +628,7 @@ where
 				holder: verification::commitment_identity(&holder),
 				counterparty: verification::commitment_identity(&counterparty),
 			},
+			journal: drain.journal.clone(),
 		})
 	}
 
@@ -577,6 +643,7 @@ where
 		if book.epoch_id != completion.epoch_id
 			|| fence.activation_hash != completion.activation_hash
 			|| drain.acknowledgement_hash != completion.acknowledgement_hash
+			|| drain.journal != completion.journal
 			|| self.context.latest_monitor_update_id != completion.monitor_update_id
 			|| !self.context.pending_inbound_htlcs.is_empty()
 			|| !matches!(
