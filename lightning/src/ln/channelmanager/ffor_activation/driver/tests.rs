@@ -75,6 +75,8 @@ fn emit(receiver: &Node, id: &FFORReceiverId, connection: &FFORPeerConnection) -
 	wire
 }
 
+mod intent;
+
 #[test]
 fn ffor_driver_durable_init_exact_backpressure_and_synchronous_accept() {
 	for receiver_funds in [false, true] {

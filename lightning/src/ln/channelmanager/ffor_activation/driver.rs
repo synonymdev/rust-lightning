@@ -165,6 +165,48 @@ where
 			.transpose()
 	}
 
+	/// Compare an application's retained preparation intent to the exact native request history.
+	///
+	/// Checks every original parameter, including local retry identity, channel, settlement peer,
+	/// ordered voucher amounts and witness restriction, fees, deadlines, claim margin and hash-chain
+	/// policy. A known request with different parameters returns [`FFORReceiverError::AlreadyRegistered`].
+	/// The explicit `local_request_id` must also equal the one in `parameters`.
+	///
+	/// This bounded read-only check works for pending, accepted and terminal histories, including
+	/// after restart or channel removal. It requires neither a connection nor a current deadline,
+	/// phase or completed persistence requirement. Success grants no permission to resend, replace
+	/// a request, advance an epoch or expose an invoice.
+	///
+	/// `Ok(None)` means this manager has no retained history for that local request ID. Applications
+	/// whose protected record was already bound must treat this as missing native history and refuse
+	/// to continue that record. Absence is not proof that a new request is safe to prepare.
+	pub fn validate_ffor_receiver_request_intent(
+		&self, local_request_id: [u8; 32], channel_id: &ChannelId,
+		counterparty_node_id: &PublicKey, parameters: &FFORReceiverParameters,
+	) -> Result<Option<FFORReceiverId>, FFORReceiverError> {
+		let _guard = self.total_consistency_lock.read().unwrap();
+		let recovery = self.ffor_recovery.lock().unwrap();
+		recovery
+			.validate_identity(self.our_network_pubkey, self.chain_hash)
+			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
+		if parameters.local_request_id != local_request_id {
+			return Err(FFORReceiverError::AlreadyRegistered);
+		}
+		let request = match recovery.find_request(local_request_id) {
+			Some(request) => request,
+			None => return Ok(None),
+		};
+		let header =
+			request.validate_recovery().map_err(|_| FFORReceiverError::RecoveryUnavailable)?.header;
+		if !request.matches_intent(*channel_id, *counterparty_node_id, parameters) {
+			return Err(FFORReceiverError::AlreadyRegistered);
+		}
+		Ok(Some(FFORReceiverId {
+			channel_id: ChannelId(header.channel_id),
+			epoch_id: header.epoch_id,
+		}))
+	}
+
 	/// Release at most one exact Init after its pre-init gate is durable on the original connection.
 	///
 	/// `enqueue` must atomically verify its paired authenticated transport generation and insert

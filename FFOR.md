@@ -44,6 +44,13 @@ epoch or channel authority. An exact retry returns the retained native selector;
 changed channel, peer or policy is refused. A bounded historical lookup recovers
 that selector after restart or live-channel removal without granting permission
 to send or expose an invoice.
+`validate_ffor_receiver_request_intent` additionally compares every original
+preparation parameter, including ordered amounts and witness restriction, against
+pending or accepted native history without requiring a peer connection. Exact
+historical matches remain available after abort, expiry and channel removal. A
+changed local ID, channel, peer or parameter is refused. `None` means no retained
+history for that ID; a protected application record that was already bound must
+refuse that missing history rather than treat absence as permission to prepare again.
 
 The peer may send ordinary voucher adds immediately after Accept.
 `handle_ffor_receiver_message` therefore processes Accept synchronously under the
@@ -400,6 +407,9 @@ accepted-manager persistence. Other cases cover pre-Accept adds, contradictory s
 replies, deadline crossing, retry identity after restore, missing archive evidence,
 capacity refusal, witness policy, cancellation and normal payment after controlled
 gate release on a fresh connection.
+Read-only intent tests check every preparation field, preserve pending write barriers,
+and recover exact pending, promoted and archive-only histories after restart in both
+funding directions where applicable.
 
 The lifecycle facade tests advance through real voucher and STFU rounds, durable
 activation, close, both settled and failed drain, and final Closed in both funding
