@@ -72,6 +72,7 @@ use crate::ln::ffor::{
 use crate::ln::ffor_persistence::FFORPersistenceBarrier;
 pub use crate::ln::ffor_persistence::{FFORPersistenceRequirement, FFORPersistenceToken};
 use crate::ln::ffor_recovery::FFORRecoveryRegistry;
+mod ffor_activation;
 use crate::ln::funding::SpliceContribution;
 use crate::ln::inbound_payment;
 use crate::ln::interactivetxs::InteractiveTxMessageSend;
@@ -142,6 +143,7 @@ use crate::util::ser::{
 	WithoutLength, Writeable, Writer,
 };
 use crate::util::wakers::{Future, Notifier};
+use ffor_activation::FFORReceiverRuntime;
 
 #[cfg(test)]
 use crate::blinded_path::payment::BlindedPaymentPath;
@@ -2907,6 +2909,8 @@ pub struct ChannelManager<
 	ffor_persistence: Mutex<FFORPersistenceBarrier>,
 	// Evidence outlives channels, including force-close and stale-manager restoration.
 	ffor_recovery: Mutex<FFORRecoveryRegistry>,
+	// Process-local durability and original-connection outbox bookkeeping.
+	ffor_activation: Mutex<FFORReceiverRuntime>,
 
 	/// Tracks the message events that are to be broadcasted when we are connected to some peer.
 	pending_broadcast_messages: Mutex<Vec<MessageSendEvent>>,
@@ -4031,6 +4035,7 @@ where
 			needs_persist_flag: AtomicBool::new(false),
 			ffor_persistence: Mutex::new(FFORPersistenceBarrier::new()),
 			ffor_recovery: Mutex::new(FFORRecoveryRegistry::new()),
+			ffor_activation: Mutex::new(FFORReceiverRuntime::new()),
 			funding_batch_states: Mutex::new(BTreeMap::new()),
 
 			pending_broadcast_messages: Mutex::new(Vec::new()),
@@ -12066,6 +12071,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						// freed HTLCs to fail backwards. If in the future we no longer drop pending
 						// add-HTLCs on disconnect, we may be handed HTLCs to fail backwards here.
 						let outbound_scid_alias = chan.context.outbound_scid_alias();
+						let proof = self.check_ffor_reconnect_archive(chan);
+						try_channel_entry!(self, peer_state, proof, chan_entry);
 						let res = chan.channel_reestablish(
 							msg,
 							&&logger,
@@ -12076,6 +12083,11 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							|htlc_id| self.path_for_release_held_htlc(htlc_id, outbound_scid_alias, &msg.channel_id, counterparty_node_id)
 						);
 						let responses = try_channel_entry!(self, peer_state, res, chan_entry);
+						if chan.context.is_ffor_frozen() {
+							let transition = self.apply_ffor_reconnect_outcome(chan);
+							try_channel_entry!(self, peer_state, transition, chan_entry);
+							return Ok(());
+						}
 						let mut channel_update = None;
 						if let Some(msg) = responses.shutdown_msg {
 							peer_state.pending_msg_events.push(MessageSendEvent::SendShutdown {
@@ -12131,6 +12143,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					peer_state.pending_msg_events.push(MessageSendEvent::SendChannelReestablish {
 						node_id: *counterparty_node_id,
 						msg: msgs::ChannelReestablish {
+							ffor_reestablish: None,
 							channel_id: msg.channel_id,
 							next_local_commitment_number: 0,
 							next_remote_commitment_number: 0,
@@ -14366,7 +14379,7 @@ where
 				let mut peer_state_lock = peer_state_mutex.lock().unwrap();
 				let peer_state = &mut *peer_state_lock;
 				if peer_state.pending_msg_events.len() > 0 {
-					pending_events.append(&mut peer_state.pending_msg_events);
+					self.drain_ffor_pending_messages(peer_state, &mut pending_events);
 				}
 				if peer_state.is_connected {
 					is_any_peer_connected = true
@@ -17173,7 +17186,11 @@ where
 			)?;
 			channel.ffor_validate_receiver_identity(our_network_pubkey, chain_hash)?;
 			if let Some(setup) = channel.ffor_receiver_setup_record()? {
-				ffor_channel_setups.push((setup, channel.ffor_receiver_fence()));
+				ffor_channel_setups.push((
+					setup,
+					channel.ffor_receiver_fence(),
+					channel.ffor_receiver_abort_reason(),
+				));
 			}
 			let logger = WithChannelContext::from(&args.logger, &channel.context, None);
 			let channel_id = channel.context.channel_id();
@@ -17574,13 +17591,17 @@ where
 			(22, ffor_recovery, option),
 		});
 		let ffor_recovery = ffor_recovery.unwrap_or_else(FFORRecoveryRegistry::new);
+		let mut ffor_persistence = FFORPersistenceBarrier::new();
+		let ffor_activation = FFORReceiverRuntime::restored(&ffor_recovery, &mut ffor_persistence)?;
 		ffor_recovery.validate_identity(our_network_pubkey, chain_hash)?;
-		for (setup, fence) in &ffor_channel_setups {
-			ffor_recovery.validate_channel_fence(setup, *fence)?;
+		for (setup, fence, abort_reason) in &ffor_channel_setups {
+			ffor_recovery.validate_channel_outcome(setup, *fence, *abort_reason)?;
 		}
 		for channel_id in ffor_recovery.activation_channels() {
-			let monitor = args.channel_monitors.get(&channel_id).ok_or(DecodeError::InvalidValue)?;
-			ffor_recovery.validate_activation_monitor(channel_id, &monitor.ffor_recovery_identity())?;
+			let monitor =
+				args.channel_monitors.get(&channel_id).ok_or(DecodeError::InvalidValue)?;
+			ffor_recovery
+				.validate_activation_monitor(channel_id, &monitor.ffor_recovery_identity())?;
 		}
 		let mut decode_update_add_htlcs = decode_update_add_htlcs.unwrap_or_else(|| new_hash_map());
 		for peer in per_peer_state.values() {
@@ -18553,8 +18574,9 @@ where
 
 			event_persist_notifier: Notifier::new(),
 			needs_persist_flag: AtomicBool::new(false),
-			ffor_persistence: Mutex::new(FFORPersistenceBarrier::new()),
+			ffor_persistence: Mutex::new(ffor_persistence),
 			ffor_recovery: Mutex::new(ffor_recovery),
+			ffor_activation: Mutex::new(ffor_activation),
 
 			funding_batch_states: Mutex::new(BTreeMap::new()),
 
@@ -18851,6 +18873,9 @@ where
 		//TODO: Broadcast channel update for closed channels, but only after we've made a
 		//connection or two.
 
+		if channel_manager.ffor_persistence.lock().unwrap().needs_persistence() {
+			channel_manager.event_persist_notifier.notify();
+		}
 		Ok((best_block_hash.clone(), channel_manager))
 	}
 }

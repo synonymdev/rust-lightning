@@ -1801,6 +1801,7 @@ impl NodeSigner for TestNodeSigner {
 }
 
 pub struct TestKeysInterface {
+	pub unavailable_ffor_signer: AtomicBool,
 	pub unavailable_node_ecdh: AtomicBool,
 	pub backing: DynKeysInterface,
 	pub override_random_bytes: Mutex<Option<[u8; 32]>>,
@@ -1824,6 +1825,15 @@ impl EntropySource for TestKeysInterface {
 }
 
 impl NodeSigner for TestKeysInterface {
+	fn sign_ffor_message(
+		&self, request: &crate::sign::ffor::FFORSigningRequest<'_>,
+	) -> Result<Signature, ()> {
+		if self.unavailable_ffor_signer.load(Ordering::Acquire) {
+			return Err(());
+		}
+		self.backing.sign_ffor_message(request)
+	}
+
 	fn get_node_id(&self, recipient: Recipient) -> Result<PublicKey, ()> {
 		self.backing.get_node_id(recipient)
 	}
@@ -1955,6 +1965,7 @@ impl TestKeysInterface {
 	fn build(backing: Box<dyn DynKeysInterfaceTrait<EcdsaSigner = DynSigner>>) -> Self {
 		Self {
 			backing: DynKeysInterface::new(backing),
+			unavailable_ffor_signer: AtomicBool::new(false),
 			unavailable_node_ecdh: AtomicBool::new(false),
 			override_random_bytes: Mutex::new(None),
 			disable_revocation_policy_check: false,

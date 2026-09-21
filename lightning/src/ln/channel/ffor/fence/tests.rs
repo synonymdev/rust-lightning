@@ -215,7 +215,7 @@ fn expect_no_released_updates(updates: MonitorRestoreUpdates) {
 }
 
 #[test]
-fn ffor_fence_preserves_preimage_and_blocks_restart_wire_until_reconciliation() {
+fn ffor_fence_preserves_preimage_and_limits_restart_wire_to_reconciliation() {
 	use crate::chain::{ChannelMonitorUpdateStatus, Watch};
 	for phase in [FFORReceiverFencePhase::Activating, FFORReceiverFencePhase::Active] {
 		for restart_before_completion in [false, true] {
@@ -354,6 +354,9 @@ fn ffor_fence_preserves_preimage_and_blocks_restart_wire_until_reconciliation() 
 			});
 			assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
 			assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+			let restored_token = nodes[1].node.capture_ffor_persistence();
+			let _restored_manager = nodes[1].node.encode();
+			nodes[1].node.ffor_persistence_completed(restored_token).unwrap();
 			for _ in 0..2 {
 				nodes[1]
 					.node
@@ -371,10 +374,8 @@ fn ffor_fence_preserves_preimage_and_blocks_restart_wire_until_reconciliation() 
 				assert_eq!(events.len(), 1, "{events:?}");
 				assert!(matches!(
 					&events[0],
-					MessageSendEvent::HandleError {
-						action: msgs::ErrorAction::DisconnectPeerWithWarning { .. },
-						..
-					}
+					MessageSendEvent::SendChannelReestablish { msg, .. }
+						if msg.ffor_reestablish.is_some()
 				));
 				nodes[1].node.peer_disconnected(nodes[0].node.get_our_node_id());
 				with_channel(&nodes[1], &nodes[0], id, |channel| {

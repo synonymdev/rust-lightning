@@ -102,7 +102,7 @@ use super::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBase
 mod ffor;
 #[cfg(test)]
 pub(crate) use ffor::ffor_setup_test_messages;
-pub(crate) use ffor::{FFORReceiverFencePhase, FFORReceiverSetup};
+pub(crate) use ffor::{FFORReceiverFencePhase, FFORReceiverSetup, FFORReestablishOutcome};
 
 #[cfg(any(test, feature = "_test_utils"))]
 #[allow(unused)]
@@ -2168,6 +2168,7 @@ where
 					holder_commitment_point,
 					pending_splice: None,
 					quiescent_action: None,
+					ffor_reconnect_outcome: None,
 				};
 				let res = funded_channel.initial_commitment_signed_v2(msg, best_block, signer_provider, logger)
 					.map(|monitor| (Some(monitor), None))
@@ -4079,7 +4080,7 @@ where
 	/// is_usable() and considers things like the channel being temporarily disabled.
 	/// Allowed in any state (including after shutdown)
 	pub fn is_live(&self) -> bool {
-		self.is_usable() && !self.channel_state.is_peer_disconnected()
+		self.is_usable() && !self.channel_state.is_peer_disconnected() && !self.is_ffor_frozen()
 	}
 
 	/// Returns true if the peer for this channel is currently connected and we're not waiting on
@@ -4091,6 +4092,7 @@ where
 	/// Returns false if our last broadcasted channel_update message has the "channel disabled" bit set
 	pub fn is_enabled(&self) -> bool {
 		self.is_usable()
+			&& !self.is_ffor_frozen()
 			&& match self.channel_update_status {
 				ChannelUpdateStatus::Enabled | ChannelUpdateStatus::DisabledStaged(_) => true,
 				ChannelUpdateStatus::Disabled | ChannelUpdateStatus::EnabledStaged(_) => false,
@@ -6825,6 +6827,8 @@ where
 	/// initiator we may be able to merge this action into what the counterparty wanted to do (e.g.
 	/// in the case of splicing).
 	quiescent_action: Option<QuiescentAction>,
+	/// Unsigned peer observation valid only for the current authenticated connection.
+	ffor_reconnect_outcome: Option<ffor::FFORReestablishOutcome>,
 }
 
 #[cfg(any(test, fuzzing))]
@@ -9334,6 +9338,7 @@ where
 	/// May return `Err(())`, which implies [`ChannelContext::force_shutdown`] should be called immediately.
 	#[rustfmt::skip]
 	fn remove_uncommitted_htlcs_and_mark_paused<L: Deref>(&mut self, logger: &L) -> Result<(), ()> where L::Target: Logger {
+		self.ffor_reconnect_outcome = None;
 		assert!(!matches!(self.context.channel_state, ChannelState::ShutdownComplete));
 		if !self.context.can_resume_on_reconnect() {
 			return Err(())
@@ -9931,61 +9936,10 @@ where
 		NS::Target: NodeSigner,
 		CBP: Fn(u64) -> BlindedMessagePath
 	{
-		self.context.check_ffor_mutation()?;
-		if !self.context.channel_state.is_peer_disconnected() {
-			// While BOLT 2 doesn't indicate explicitly we should error this channel here, it
-			// almost certainly indicates we are going to end up out-of-sync in some way, so we
-			// just close here instead of trying to recover.
-			return Err(ChannelError::close("Peer sent a loose channel_reestablish not after reconnect".to_owned()));
+		if self.context.is_ffor_frozen() {
+			return self.ffor_handle_reestablish(msg, logger);
 		}
-
-		// A node:
-		//   - if `next_commitment_number` is zero:
-		//     - MUST immediately fail the channel and broadcast any relevant latest commitment
-		//       transaction.
-		if msg.next_local_commitment_number == 0
-			|| msg.next_local_commitment_number >= INITIAL_COMMITMENT_NUMBER
-			|| msg.next_remote_commitment_number >= INITIAL_COMMITMENT_NUMBER
-		{
-			return Err(ChannelError::close("Peer sent an invalid channel_reestablish to force close in a non-standard way".to_owned()));
-		}
-
-		let our_commitment_transaction = INITIAL_COMMITMENT_NUMBER - self.holder_commitment_point.current_transaction_number();
-		if msg.next_remote_commitment_number > 0 {
-			let expected_point = self.context.holder_signer.as_ref()
-				.get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - msg.next_remote_commitment_number + 1, &self.context.secp_ctx)
-				.expect("TODO: async signing is not yet supported for per commitment points upon channel reestablishment");
-			let given_secret = SecretKey::from_slice(&msg.your_last_per_commitment_secret)
-				.map_err(|_| ChannelError::close("Peer sent a garbage channel_reestablish with unparseable secret key".to_owned()))?;
-			if expected_point != PublicKey::from_secret_key(&self.context.secp_ctx, &given_secret) {
-				return Err(ChannelError::close("Peer sent a garbage channel_reestablish with secret key not matching the commitment height provided".to_owned()));
-			}
-			if msg.next_remote_commitment_number > our_commitment_transaction {
-				macro_rules! log_and_panic {
-					($err_msg: expr) => {
-						log_error!(logger, $err_msg);
-						panic!($err_msg);
-					}
-				}
-				log_and_panic!("We have fallen behind - we have received proof that if we broadcast our counterparty is going to claim all our funds.\n\
-					This implies you have restarted with lost ChannelMonitor and ChannelManager state, the first of which is a violation of the LDK chain::Watch requirements.\n\
-					More specifically, this means you have a bug in your implementation that can cause loss of funds, or you are running with an old backup, which is unsafe.\n\
-					If you have restored from an old backup and wish to claim any available funds, you should restart with\n\
-					an empty ChannelManager and no ChannelMonitors, reconnect to peer(s), ensure they've force-closed all of your\n\
-					previous channels and that the closure transaction(s) have confirmed on-chain,\n\
-					then restart with an empty ChannelManager and the latest ChannelMonitors that you do have.");
-			}
-		}
-
-		// Before we change the state of the channel, we check if the peer is sending a very old
-		// commitment transaction number, if yes we send a warning message.
-		if msg.next_remote_commitment_number + 1 < our_commitment_transaction {
-			return Err(ChannelError::Warn(format!(
-				"Peer attempted to reestablish channel with a very old local commitment transaction: {} (received) vs {} (expected)",
-				msg.next_remote_commitment_number,
-				our_commitment_transaction
-			)));
-		}
+		let our_commitment_transaction = self.validate_reestablish_prefix(msg, logger)?;
 
 		// Go ahead and unmark PeerDisconnected as various calls we may make check for it (and all
 		// remaining cases either succeed or ErrorMessage-fail).
@@ -11976,7 +11930,7 @@ where
 	#[rustfmt::skip]
 	fn get_channel_reestablish<L: Deref>(&mut self, logger: &L) -> Result<msgs::ChannelReestablish, msgs::WarningMessage> where L::Target: Logger {
 		if self.context.is_ffor_frozen() {
-			return Err(msgs::WarningMessage { channel_id: self.context.channel_id(), data: ffor::FFOR_FROZEN_MESSAGE.to_owned() });
+			return self.ffor_get_reestablish(logger);
 		}
 		assert!(self.context.channel_state.is_peer_disconnected());
 		assert_ne!(self.context.counterparty_next_commitment_transaction_number, INITIAL_COMMITMENT_NUMBER);
@@ -12003,6 +11957,7 @@ where
 			[0;32]
 		};
 		Ok(msgs::ChannelReestablish {
+			ffor_reestablish: None,
 			channel_id: self.context.channel_id(),
 			// The protocol has two different commitment number concepts - the "commitment
 			// transaction number", which starts from 0 and counts up, and the "revocation key
@@ -13846,6 +13801,7 @@ where
 			holder_commitment_point,
 			pending_splice: None,
 			quiescent_action: None,
+			ffor_reconnect_outcome: None,
 		};
 
 		let need_channel_ready = channel.check_get_channel_ready(0, logger).is_some()
@@ -14135,6 +14091,7 @@ where
 			holder_commitment_point,
 			pending_splice: None,
 			quiescent_action: None,
+			ffor_reconnect_outcome: None,
 		};
 		let need_channel_ready = channel.check_get_channel_ready(0, logger).is_some()
 			|| channel.context.signer_pending_channel_ready;
@@ -15885,6 +15842,7 @@ where
 			holder_commitment_point,
 			pending_splice,
 			quiescent_action,
+			ffor_reconnect_outcome: None,
 		};
 		channel.ffor_restored()?;
 		channel.restore_ffor_receiver_quiescence()?;

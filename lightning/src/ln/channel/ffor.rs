@@ -1,7 +1,9 @@
 use super::*;
 
+mod activation;
 mod fence;
 mod quiescence;
+mod reestablish;
 mod setup;
 use crate::ln::ffor::{
 	self as verification, FFORCommitmentError, FFORMonitorSnapshot, FFORReceiverAbortReason,
@@ -11,6 +13,7 @@ use crate::ln::ffor::{
 use fence::FFORReceiverFence;
 pub(crate) use fence::{FFORReceiverFencePhase, FFOR_FROZEN_MESSAGE};
 pub(crate) use quiescence::FFORReceiverQuiescence;
+pub(crate) use reestablish::FFORReestablishOutcome;
 #[cfg(test)]
 pub(crate) use setup::ffor_setup_test_messages;
 pub(crate) use setup::FFORReceiverSetup;
@@ -317,11 +320,15 @@ where
 			.received
 			.iter()
 			.filter_map(|received| {
+				let claimed = self.context.holding_cell_htlc_updates.iter().any(|update| {
+					matches!(update, HTLCUpdateAwaitingACK::ClaimHTLC { htlc_id, .. }
+						if *htlc_id == received.voucher.htlc_id)
+				});
 				let committed = self.context.pending_inbound_htlcs.iter().any(|htlc| {
 					htlc.htlc_id == received.voucher.htlc_id
 						&& matches!(htlc.state, InboundHTLCState::Committed)
 				});
-				if committed {
+				if committed && !claimed {
 					received.failure.clone().map(|failure| (received.voucher.htlc_id, failure))
 				} else {
 					None

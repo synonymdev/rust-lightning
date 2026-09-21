@@ -8,6 +8,8 @@ use crate::ln::types::ChannelId;
 use crate::util::ser::Readable;
 use lightning_ffor::wire::{Activate, Tlv};
 
+mod aborted;
+
 // Synthetic transaction identities exercise archive authentication only. Real monitor and
 // channel evidence are exercised by the manager tests; these values never activate a channel.
 fn evidence(maximum_size: bool) -> (FFORReceiverSetup, FFORReceiverActivation) {
@@ -49,6 +51,7 @@ fn evidence_for_identity(
 	let record = FFORReceiverActivation {
 		activate_wire: message.encode().unwrap(),
 		ack_wire: None,
+		abort: None,
 		receiver_number: 4,
 		receiver_txid,
 		settlement_number: 4,

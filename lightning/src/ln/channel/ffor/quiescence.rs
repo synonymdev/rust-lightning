@@ -22,6 +22,16 @@ impl<SP: Deref> FundedChannel<SP>
 where
 	SP::Target: SignerProvider,
 {
+	/// Whether the original completed STFU session still owns this connection.
+	/// A delayed signed acknowledgement is historical evidence and must not reapply the deadline.
+	pub(crate) fn has_ffor_receiver_quiescence(&self, epoch_id: [u8; 32]) -> bool {
+		self.context.is_connected()
+			&& self.context.channel_state.is_quiescent()
+			&& matches!(self.quiescent_action.as_ref(),
+				Some(QuiescentAction::FFORReceiver(request))
+				if request.epoch_id == epoch_id && request.completed)
+	}
+
 	pub(crate) fn request_ffor_receiver_quiescence<L: Deref>(
 		&mut self, epoch_id: [u8; 32], monitor: FFORMonitorSnapshot, current_height: u32,
 		logger: &L,

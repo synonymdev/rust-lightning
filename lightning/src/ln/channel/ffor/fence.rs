@@ -1,8 +1,8 @@
 //! A private durable mutation fence, independent of connection-scoped STFU flags.
 //!
-//! There is deliberately no production installation or reconciliation entry point. A future
-//! activation owner must first archive the exact signed evidence, then install this fence under
-//! the same channel/manager persistence boundary. This module does not authenticate activation transcripts.
+//! The private manager activation owner archives exact signed evidence and installs the fence
+//! under the same channel/manager persistence boundary. No public activation or reconciliation
+//! entry point is exposed. This module does not authenticate activation transcripts.
 
 use super::*;
 
@@ -13,16 +13,18 @@ pub(crate) const FFOR_FROZEN_MESSAGE: &str =
 pub(crate) enum FFORReceiverFencePhase {
 	Activating,
 	Active,
+	Aborting,
 }
 
 impl_writeable_tlv_based_enum!(FFORReceiverFencePhase,
 	(0, Activating) => {},
 	(2, Active) => {},
+	(4, Aborting) => {},
 );
 
 pub(super) struct FFORReceiverFence {
-	phase: FFORReceiverFencePhase,
-	activation_hash: [u8; 32],
+	pub(super) phase: FFORReceiverFencePhase,
+	pub(super) activation_hash: [u8; 32],
 }
 
 impl_writeable_tlv_based!(FFORReceiverFence, {
@@ -104,8 +106,14 @@ where
 			_ => return Ok(()),
 		};
 		let context = &self.context;
+		let abort_matches_phase = match book.fence.as_ref().unwrap().phase {
+			FFORReceiverFencePhase::Aborting => {
+				book.abort_reason == Some(FFORReceiverAbortReason::Disconnected)
+			},
+			_ => book.abort_reason.is_none(),
+		};
 		if book.setup.is_none()
-			|| book.abort_reason.is_some()
+			|| !abort_matches_phase
 			|| !matches!(context.channel_state, ChannelState::ChannelReady(_))
 			|| context.channel_state.is_local_shutdown_sent()
 			|| context.channel_state.is_remote_shutdown_sent()

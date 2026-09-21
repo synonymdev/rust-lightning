@@ -1,8 +1,9 @@
-# Experimental FFOR receiver setup, parking and activation guards
+# Experimental FFOR receiver setup, activation and recovery
 
 This fork targets rust-lightning v0.2.5. The current APIs provide receiver voucher
-parking and point-in-time verification of both commitment views for FFOR Variant D.
-They do not provide an active offline receiving epoch.
+parking and verification of both commitment views for FFOR Variant D. Private manager
+transitions compose activation, reconnect and pre-active abort with ordered storage.
+No production transport or invoice API exposes those transitions yet.
 
 `register_ffor_receiver_setup` authenticates exact signed init and accept messages
 against the manager's actual node identity, chain and current height. It checks the
@@ -81,9 +82,11 @@ Restore reauthenticates records, checks the manager's identity and chain, and re
 every retained channel setup to match its archive entry. The registry is bounded to
 64 records and 8 MiB total, with a 192 KiB setup-only record limit and a 384 KiB
 activation record limit. Capacity is reserved before channel mutation. An Activating
-record also reserves the maximum acknowledgement size, including framing, so other
-records cannot consume its eventual Active storage. This allowance is derived again
-on restore and released when the acknowledgement is retained. The setup-only archive
+record also reserves the larger of a maximum acknowledgement and a terminal abort,
+including framing, so other records cannot consume that transition storage. This
+allowance is derived again on restore and released when either outcome is retained.
+A production close path must also reserve its required evidence before activation.
+The setup-only archive
 version retains no activation or claim authority.
 Fully drained channel tombstones permit subsequent ordinary splicing while retaining
 the original funding context in their archive.
@@ -94,19 +97,51 @@ preparation height and the monitor's original sweep destination. They reauthenti
 the historical transcript and permit only the first acknowledgement to be added.
 A versioned registry prevents setup-only readers from accepting activation evidence.
 Every retained channel fence must match its archive phase and activation hash, even
-when the live channel will be discarded as stale. Restore also requires the original
+when the live channel will be discarded as stale. For unresolved activation, restore also requires the original
 monitor and checks both commitment identities, its destination and the saved update
 floor. A preimage or force-close update may advance that floor without changing the
 frozen commitments. The complete monitor remains necessary for signatures and claims.
 
-The private channel fence persists Activating or Active independently of stock STFU
-flags. It blocks ordinary HTLC updates, commitment and revocation messages, fees,
-splicing, cooperative close, signer retries and ordinary reconnect messages. Valid
+The private channel fence persists Activating, Active or a pending pre-active abort
+independently of stock STFU flags. It blocks ordinary HTLC updates, commitment and
+revocation messages, fees, splicing, cooperative close and signer retries. Frozen
+channels are also excluded from usable-channel listings and ordinary routing. Valid
 owned preimages still enter stock monitor persistence, including delayed writes and
 completion after channel removal. They cannot release an ordinary fulfill while the
 fence is held. Force-close remains available. A required even field makes older
-channel readers refuse fenced state. Installation currently exists only in tests;
-there is no production transition into these phases or recovery driver to leave them.
+channel readers refuse fenced state.
+
+A crate-private manager owner derives and signs activation from the actual completed
+owned STFU handshake and monitor proof. It installs the archive and fence under the
+same consistency boundary, then releases the exact signed bytes at most once after
+that snapshot is durable. Release rechecks the current phase, height and original
+handshake. Its transport callback must atomically validate the authenticated
+connection token with queue insertion, without network I/O or manager callbacks.
+A signed acknowledgement advances the channel and archive together and requests a
+new persistence requirement before Active can be reported. No public runtime invokes
+these private transitions yet.
+
+The native reconnect codec carries Variant D TLV 55001 while retaining the ordinary
+BOLT commitment and revocation counter checks. Frozen reconnect never retransmits
+ordinary commitment traffic. A receiver still Activating can recover a lost signed
+acknowledgement only after the settlement peer reports Active with the same epoch and
+activation hash. An unsigned report alone cannot activate the receiver. Activation
+bytes are never replayed across a disconnect or restart. Active conflicts retain the
+fence for future resolution or force-close.
+
+Other pre-active reconnect outcomes create a permanent abort record and keep the
+channel frozen until that record is durable. Only then can the private manager owner
+release ordinary voucher drain. Known preimages remain ahead of failures, including
+preimages waiting for monitor persistence. Terminal abort evidence survives drain and
+later ordinary payments without requiring the original frozen commitment pair. It
+permanently refuses acknowledgement replay or replacement activation.
+
+Outgoing reconnect reports use the existing per-peer queue. A report and the queue
+suffix behind it wait until the latest retained phase is durable. The FFOR report is
+refreshed at release while the original ordinary reconnect counters are retained.
+Restored managers request a fresh persistence requirement and notify the background
+processor before releasing reports. Disconnect discards connection-specific queued
+reports, and a subsequent connection builds fresh ones.
 
 These are consistency checks, not an authenticated storage envelope. Arbitrarily
 deleting a mismatching add's ownership record after abort can make its nonreserved
@@ -116,8 +151,8 @@ checks do not claim to detect every arbitrary alteration of local storage.
 Similarly, an archive without its original live channel cannot independently prove
 the historical funding context against arbitrary local storage alteration.
 
-No feature bit, production wire activation, invoice readiness, authenticated
-reconnect driver or automatic setup deadline is implemented here. The caller must abort a setup that times out.
+No feature bit, production custom-message transport, invoice readiness or automatic
+setup deadline is implemented here. The caller must abort a setup that times out.
 Ordinary channel updates can invalidate a previously returned `Parked` proof.
 
 `NodeSigner::sign_ffor_message` supplies the protocol's single-SHA256 `ffor/msg`
@@ -165,22 +200,32 @@ quiescence and splice suites also pass with these channel changes.
 
 The private fence tests cover both phases and funding directions, restored pending
 state rejection, preimage retention, cleared STFU flags, signer and monitor callbacks,
-reconnect refusal and force-close. Activation recovery tests use real committed
+frozen reconnect handling and force-close. Activation recovery tests use real committed
 channels and signed transcripts, exercise retained evidence after closure, and reject
 missing monitors, mismatched commitment identities, downgrade attempts and substituted
 transcripts. Capacity tests reload a registry with competing admissions and retain a
-maximum signed acknowledgement from its reserved allowance.
+maximum signed acknowledgement from its reserved allowance. Reconnect tests retain
+stock counter and revocation-secret checks, classify absent or conflicting reports,
+and exercise signed acknowledgement loss across reload. Manager tests cover signer
+refusal, exact retry, phase-specific write barriers, height changes, staged reports,
+disconnect, force-close and terminal abort replay. Eight drain scenarios use two
+actual vouchers in both funding directions, with no known preimage, a known preimage,
+a delayed preimage monitor write, or restart after abort release. They check actual
+fulfill and fail messages, both empty commitment sets, tombstone reload and a later
+ordinary payment.
 
 ## Next boundary
 
 Reusable epochs require durable retired epoch IDs and voucher hashes, with one
-current signed transcript record under the same channel authority. A production
-activation owner must derive and sign the exact transcript from owned quiescence,
-atomically install its archive and fence, and release wire only after the manager
-persistence barrier completes. Acknowledgement handling must authenticate the peer,
-retain Active evidence and recheck the channel phase before reporting durability.
-Reconnect needs the Variant D state comparison and acknowledgement-loss recovery;
-ordinary channel traffic must remain frozen throughout. Witness/mailbox recovery,
-preimage reconciliation, controlled voucher drain and invoice eligibility remain
-separate required boundaries. None can be inferred from a retained setup or the
-private activation fixtures.
+current signed transcript record under the same channel authority. The next native
+boundary is cooperative Active-to-Draining-to-Closed recovery: retain signed close
+and close-ack evidence, persist every known preimage through the stock monitor, allow
+only owned voucher removals and their commitment rounds, and retain that ownership
+through reconnect and restart. Capacity for those terminal records must be reserved
+before an epoch becomes operational.
+
+Production transport must bind the private manager transitions to actual authenticated
+connections and deliver acknowledgement retries in the required order. Witness/mailbox
+recovery, preimage reconciliation, deadline enforcement and invoice eligibility remain
+separate required boundaries. None can be inferred from durable setup, activation or
+a successful private protocol test.

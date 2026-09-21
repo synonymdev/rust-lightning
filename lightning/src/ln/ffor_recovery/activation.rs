@@ -7,12 +7,16 @@
 use alloc::vec::Vec;
 use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Txid};
+use lightning_ffor::reestablish::{Reestablish, ReportedState};
 use lightning_ffor::setup::AuthenticatedSetup;
 use lightning_ffor::transcript;
 use lightning_ffor::wire::{Message, Payload, MAX_MESSAGE_LEN};
 
 use crate::ln::channel::{FFORReceiverSetup, INITIAL_COMMITMENT_NUMBER};
-use crate::ln::ffor::{FFORMonitorRecoveryIdentity, FFORMonitorSnapshot, FFORVoucherCommitments};
+use crate::ln::ffor::{
+	FFORCommitment, FFORMonitorRecoveryIdentity, FFORMonitorSnapshot, FFORReceiverAbortReason,
+	FFORVoucherCommitments,
+};
 use crate::ln::msgs::DecodeError;
 use crate::util::ser::Writeable;
 
@@ -22,6 +26,7 @@ use crate::util::ser::Writeable;
 pub(crate) struct FFORReceiverActivation {
 	activate_wire: Vec<u8>,
 	ack_wire: Option<Vec<u8>>,
+	abort: Option<AbortedActivation>,
 	receiver_number: u64,
 	receiver_txid: Txid,
 	settlement_number: u64,
@@ -41,7 +46,39 @@ impl_writeable_tlv_based!(FFORReceiverActivation, {
 	(12, monitor_update_id, required),
 	(14, preparation_height, required),
 	(16, destination_script, required),
+	(18, abort, option),
 });
+
+/// A manager-observed reconnect outcome, not a signed statement from the peer. The transition
+/// owner must authenticate the connection before constructing this terminal consistency record.
+#[derive(Clone)]
+struct AbortedActivation {
+	reason: FFORReceiverAbortReason,
+	peer_report: Option<Vec<u8>>,
+}
+
+impl_writeable_tlv_based!(AbortedActivation, {
+	(0, reason, required),
+	(2, peer_report, option),
+});
+
+impl AbortedActivation {
+	fn validate(&self) -> Result<(), DecodeError> {
+		if self.reason != FFORReceiverAbortReason::Disconnected {
+			return Err(DecodeError::InvalidValue);
+		}
+		if let Some(bytes) = self.peer_report.as_ref() {
+			let report = Reestablish::decode(bytes).map_err(|_| DecodeError::InvalidValue)?;
+			if matches!(
+				report.state,
+				ReportedState::Active | ReportedState::Draining | ReportedState::Closed
+			) {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
+		Ok(())
+	}
+}
 
 impl FFORReceiverActivation {
 	/// Called only after the channel rechecks both commitment views under owned quiescence.
@@ -67,6 +104,7 @@ impl FFORReceiverActivation {
 		let record = Self {
 			activate_wire: activate_wire.to_vec(),
 			ack_wire: None,
+			abort: None,
 			receiver_number: commitments.holder.number,
 			receiver_txid: commitments.holder.txid,
 			settlement_number: commitments.counterparty.number,
@@ -109,6 +147,12 @@ impl FFORReceiverActivation {
 		let hash = setup
 			.validate_activation(&activate, self.commitment_hash(), self.preparation_height)
 			.map_err(|_| DecodeError::InvalidValue)?;
+		if let Some(abort) = self.abort.as_ref() {
+			if self.ack_wire.is_some() {
+				return Err(DecodeError::InvalidValue);
+			}
+			abort.validate()?;
+		}
 		if let Some(wire) = self.ack_wire.as_ref() {
 			let ack = Message::decode(wire).map_err(|_| DecodeError::InvalidValue)?;
 			setup.validate_activation_ack(&ack, hash).map_err(|_| DecodeError::InvalidValue)?;
@@ -130,7 +174,8 @@ impl FFORReceiverActivation {
 	pub(crate) fn with_ack(
 		&self, setup: &FFORReceiverSetup, ack_wire: &[u8],
 	) -> Result<Self, DecodeError> {
-		if ack_wire.len() > MAX_MESSAGE_LEN
+		if self.abort.is_some()
+			|| ack_wire.len() > MAX_MESSAGE_LEN
 			|| self.ack_wire.as_ref().map_or(false, |existing| existing != ack_wire)
 		{
 			return Err(DecodeError::InvalidValue);
@@ -145,10 +190,73 @@ impl FFORReceiverActivation {
 		self.ack_wire.is_some()
 	}
 
+	/// Permanently retain a pre-active abort observed on an authenticated reconnect. Absence of
+	/// an epoch or a pre-active/aborted peer report permits this outcome; an active or later report
+	/// leaves the obligation unresolved even if its epoch or hash differs. The report itself is
+	/// unsigned and cannot establish that the caller actually observed that connection.
+	pub(crate) fn abort_after_reestablish(
+		&self, setup: &FFORReceiverSetup, peer_report: Option<Reestablish>,
+	) -> Result<Self, DecodeError> {
+		if self.ack_wire.is_some() {
+			return Err(DecodeError::InvalidValue);
+		}
+		let abort = AbortedActivation {
+			reason: FFORReceiverAbortReason::Disconnected,
+			peer_report: peer_report.map(|report| report.encode().to_vec()),
+		};
+		abort.validate()?;
+		if self.abort.as_ref().map_or(false, |previous| previous.encode() != abort.encode()) {
+			return Err(DecodeError::InvalidValue);
+		}
+		let mut record = self.clone();
+		record.abort = Some(abort);
+		record.validate(&setup.validate_recovery()?)?;
+		Ok(record)
+	}
+
+	pub(crate) fn aborted_reason(&self) -> Option<FFORReceiverAbortReason> {
+		self.abort.as_ref().map(|abort| abort.reason)
+	}
+
+	pub(crate) fn is_aborted(&self) -> bool {
+		self.abort.is_some()
+	}
+
+	pub(crate) fn matches_abort_report(&self, peer_report: Option<Reestablish>) -> bool {
+		self.abort.as_ref().map_or(false, |abort| {
+			abort.peer_report == peer_report.map(|report| report.encode().to_vec())
+		})
+	}
+
+	pub(crate) fn activation_hash(
+		&self, setup: &FFORReceiverSetup,
+	) -> Result<[u8; 32], DecodeError> {
+		self.validate(&setup.validate_recovery()?)
+	}
+
+	pub(crate) fn activate_wire(&self) -> &[u8] {
+		&self.activate_wire
+	}
+
+	pub(crate) fn ack_wire(&self) -> Option<&[u8]> {
+		self.ack_wire.as_deref()
+	}
+
+	pub(crate) fn commitments(&self) -> FFORVoucherCommitments {
+		FFORVoucherCommitments {
+			holder: FFORCommitment { number: self.receiver_number, txid: self.receiver_txid },
+			counterparty: FFORCommitment {
+				number: self.settlement_number,
+				txid: self.settlement_txid,
+			},
+		}
+	}
+
 	pub(super) fn validate_monitor(
 		&self, setup: &FFORReceiverSetup, monitor: &FFORMonitorRecoveryIdentity,
 	) -> Result<(), DecodeError> {
-		if monitor.channel_id.0 != setup.validate_recovery()?.header().channel_id
+		if self.abort.is_some()
+			|| monitor.channel_id.0 != setup.validate_recovery()?.header().channel_id
 			|| monitor.funding_txo != setup.funding_txo()
 			|| monitor.update_id < self.monitor_update_id
 			|| INITIAL_COMMITMENT_NUMBER.checked_sub(monitor.holder_number)
@@ -164,17 +272,22 @@ impl FFORReceiverActivation {
 		Ok(())
 	}
 
-	/// The only upgrade preserves every byte except adding the first acknowledgement.
+	/// The only upgrade adds the first acknowledgement or terminal abort, preserving every byte
+	/// of the activation. Neither terminal outcome can be replaced by another transition.
 	pub(super) fn can_replace(&self, next: &Self) -> bool {
 		if self.encode() == next.encode() {
 			return true;
 		}
-		if self.ack_wire.is_some() || next.ack_wire.is_none() {
+		if self.ack_wire.is_some()
+			|| self.abort.is_some()
+			|| (next.ack_wire.is_none() && next.abort.is_none())
+		{
 			return false;
 		}
-		let mut without_ack = next.clone();
-		without_ack.ack_wire = None;
-		self.encode() == without_ack.encode()
+		let mut without_outcome = next.clone();
+		without_outcome.ack_wire = None;
+		without_outcome.abort = None;
+		self.encode() == without_outcome.encode()
 	}
 }
 

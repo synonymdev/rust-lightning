@@ -138,6 +138,8 @@ pub enum FFORReceiverError {
 	PersistenceUnavailable,
 	/// Retained recovery storage is full or conflicts with an existing setup.
 	RecoveryUnavailable,
+	/// The node signer could not supply an authentic signature for the prepared transition.
+	SignerUnavailable,
 }
 
 impl From<FFORCommitmentError> for FFORReceiverError {
@@ -155,6 +157,7 @@ impl fmt::Display for FFORReceiverError {
 			Self::UnknownEpoch => f.write_str("unknown FFOR receiver epoch"),
 			Self::PersistenceUnavailable => f.write_str("FFOR persistence revision exhausted"),
 			Self::RecoveryUnavailable => f.write_str("FFOR recovery record cannot be retained"),
+			Self::SignerUnavailable => f.write_str("FFOR node signature unavailable"),
 		}
 	}
 }

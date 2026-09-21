@@ -13,7 +13,7 @@ use bitcoin::secp256k1::PublicKey;
 
 use crate::io;
 use crate::ln::channel::{FFORReceiverFencePhase, FFORReceiverSetup};
-use crate::ln::ffor::FFORMonitorRecoveryIdentity;
+use crate::ln::ffor::{FFORMonitorRecoveryIdentity, FFORReceiverAbortReason};
 use crate::ln::msgs::DecodeError;
 use crate::ln::types::ChannelId;
 use crate::util::ser::{FixedLengthReader, Readable, Writeable, Writer};
@@ -21,6 +21,8 @@ use crate::util::ser::{FixedLengthReader, Readable, Writeable, Writer};
 const SETUP_ONLY_VERSION: u8 = 0;
 // Setup-only readers must never silently discard a possibly active epoch's evidence.
 const ACTIVATION_VERSION: u8 = 1;
+// Earlier activation readers do not understand a retained abort or its relaxed monitor binding.
+const ABORTED_ACTIVATION_VERSION: u8 = 2;
 const MAX_RECORDS: usize = 64;
 const MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
 // Two maximum wire messages, a 483-slot canonical book, and fixed admission fields fit here.
@@ -32,6 +34,7 @@ const RECORD_LENGTH_BYTES: usize = 4;
 // Includes the maximum acknowledgement plus its vector/TLV framing and growth of the enclosing
 // activation and record length prefixes. The fixed outer record prefix does not grow.
 const ACK_RESERVATION_BYTES: usize = lightning_ffor::wire::MAX_MESSAGE_LEN + 64;
+const ABORT_RESERVATION_BYTES: usize = lightning_ffor::reestablish::VALUE_LEN + 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FFORRecoveryKey {
@@ -99,8 +102,10 @@ impl Entry {
 	}
 
 	fn ack_reservation(record: &StoredSetup) -> usize {
-		if record.activation.as_ref().map_or(false, |activation| !activation.is_active()) {
-			ACK_RESERVATION_BYTES
+		if record.activation.as_ref().map_or(false, |activation| {
+			!activation.is_active() && activation.aborted_reason().is_none()
+		}) {
+			core::cmp::max(ACK_RESERVATION_BYTES, ABORT_RESERVATION_BYTES)
 		} else {
 			0
 		}
@@ -187,6 +192,15 @@ impl FFORRecoveryRegistry {
 	pub(crate) fn validate_channel_fence(
 		&self, setup: &FFORReceiverSetup, fence: Option<(FFORReceiverFencePhase, [u8; 32])>,
 	) -> Result<(), DecodeError> {
+		self.validate_channel_outcome(setup, fence, None)
+	}
+
+	/// A terminal abort must match the channel's retained reason. Its Aborting fence remains
+	/// until the manager persists that outcome; only then may stock voucher drain release it.
+	pub(crate) fn validate_channel_outcome(
+		&self, setup: &FFORReceiverSetup, fence: Option<(FFORReceiverFencePhase, [u8; 32])>,
+		abort_reason: Option<FFORReceiverAbortReason>,
+	) -> Result<(), DecodeError> {
 		if !self.contains_exact(setup) {
 			return Err(DecodeError::InvalidValue);
 		}
@@ -196,9 +210,28 @@ impl FFORRecoveryRegistry {
 			FFORRecoveryKey { channel_id: ChannelId(header.channel_id), epoch_id: header.epoch_id };
 		match (self.get_activation(&key), fence) {
 			(None, None) => Ok(()),
+			(Some(record), fence) if record.aborted_reason().is_some() => {
+				if record.aborted_reason() != abort_reason {
+					return Err(DecodeError::InvalidValue);
+				}
+				match fence {
+					None => Ok(()),
+					Some((FFORReceiverFencePhase::Aborting, hash))
+						if record.validate(&authenticated)? == hash =>
+					{
+						Ok(())
+					},
+					_ => Err(DecodeError::InvalidValue),
+				}
+			},
 			(Some(record), Some((phase, hash)))
 				if record.validate(&authenticated)? == hash
-					&& record.is_active() == (phase == FFORReceiverFencePhase::Active) =>
+					&& abort_reason.is_none()
+					&& matches!(
+						(record.is_active(), phase),
+						(false, FFORReceiverFencePhase::Activating)
+							| (true, FFORReceiverFencePhase::Active)
+					) =>
 			{
 				Ok(())
 			},
@@ -206,11 +239,27 @@ impl FFORRecoveryRegistry {
 		}
 	}
 
-	/// A possibly active epoch requires its original persisted monitor even without a live channel.
-	pub(crate) fn activation_channels(&self) -> Vec<ChannelId> {
+	/// Every retained activation identity, including terminal outcomes.
+	pub(crate) fn activation_keys(&self) -> Vec<FFORRecoveryKey> {
 		self.entries
 			.iter()
 			.filter(|entry| entry.record.activation.is_some())
+			.map(|entry| entry.key)
+			.collect()
+	}
+
+	/// Only unresolved activation evidence requires its original frozen monitor pair. After a
+	/// retained pre-active abort, live channel recovery follows ordinary monitor and splice rules.
+	pub(crate) fn activation_channels(&self) -> Vec<ChannelId> {
+		self.entries
+			.iter()
+			.filter(|entry| {
+				entry
+					.record
+					.activation
+					.as_ref()
+					.map_or(false, |activation| activation.aborted_reason().is_none())
+			})
 			.map(|entry| entry.key.channel_id)
 			.collect()
 	}
@@ -265,9 +314,9 @@ impl FFORRecoveryRegistry {
 		Ok(FFORRecoveryInsertion { registry: self, entry: Some(entry) })
 	}
 
-	/// Upgrade an existing identical setup to ACTIVATING, then add only its exact signed ack.
+	/// Upgrade an existing identical setup to ACTIVATING, then retain its exact ack or abort.
 	/// The caller must install the corresponding native fence while retaining this permit.
-	/// ACTIVATING reserves capacity for a maximum acknowledgement until its exact bytes arrive.
+	/// ACTIVATING reserves capacity for either terminal outcome until its exact bytes arrive.
 	pub(crate) fn prepare_activation(
 		&mut self, setup: &FFORReceiverSetup, activation: &FFORReceiverActivation,
 	) -> Result<FFORRecoveryUpgrade<'_>, FFORRecoveryError> {
@@ -287,7 +336,7 @@ impl FFORRecoveryRegistry {
 		if existing.record.setup.encode() != setup.encode()
 			|| match existing.record.activation.as_ref() {
 				Some(previous) => !previous.can_replace(activation),
-				None => activation.is_active(),
+				None => activation.is_active() || activation.aborted_reason().is_some(),
 			} {
 			return Err(FFORRecoveryError::ConflictingRecord);
 		}
@@ -311,7 +360,15 @@ impl FFORRecoveryRegistry {
 	}
 
 	fn version(&self) -> u8 {
-		if self.entries.iter().any(|entry| entry.record.activation.is_some()) {
+		if self.entries.iter().any(|entry| {
+			entry
+				.record
+				.activation
+				.as_ref()
+				.map_or(false, |activation| activation.aborted_reason().is_some())
+		}) {
+			ABORTED_ACTIVATION_VERSION
+		} else if self.entries.iter().any(|entry| entry.record.activation.is_some()) {
 			ACTIVATION_VERSION
 		} else {
 			SETUP_ONLY_VERSION
@@ -352,7 +409,10 @@ impl Writeable for FFORRecoveryRegistry {
 impl Readable for FFORRecoveryRegistry {
 	fn read<R: io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
 		let version = u8::read(reader)?;
-		if version != SETUP_ONLY_VERSION && version != ACTIVATION_VERSION {
+		if version != SETUP_ONLY_VERSION
+			&& version != ACTIVATION_VERSION
+			&& version != ABORTED_ACTIVATION_VERSION
+		{
 			return Err(DecodeError::UnknownRequiredFeature);
 		}
 		let count = u16::read(reader)? as usize;

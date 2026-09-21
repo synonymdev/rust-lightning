@@ -909,6 +909,47 @@ pub struct UpdateFee {
 	pub feerate_per_kw: u32,
 }
 
+/// The fixed Variant D reconnect report carried by TLV 55001.
+///
+/// This unsigned peer statement grants no activation or payment authority. Locally emitted
+/// reports must come from the channel engine's retained epoch. The ordinary BOLT 2 counters
+/// in [`ChannelReestablish`] still require their normal validation.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct FFORChannelReestablish([u8; lightning_ffor::reestablish::VALUE_LEN]);
+
+impl FFORChannelReestablish {
+	/// Wrap a structurally valid Variant D report, preserving its reported hash exactly.
+	/// This constructor does not authenticate the report or authorize a channel transition.
+	pub fn new(report: lightning_ffor::reestablish::Reestablish) -> Self {
+		Self(report.encode())
+	}
+
+	/// Read the reported epoch and state. This is untrusted peer data until the engine checks it.
+	pub fn report(&self) -> lightning_ffor::reestablish::Reestablish {
+		lightning_ffor::reestablish::Reestablish::decode(&self.0)
+			.expect("FFOR reconnect wrapper contains a validated fixed value")
+	}
+}
+
+impl Writeable for FFORChannelReestablish {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		writer.write_all(&self.0)
+	}
+	fn serialized_length(&self) -> usize {
+		lightning_ffor::reestablish::VALUE_LEN
+	}
+}
+
+impl Readable for FFORChannelReestablish {
+	fn read<R: io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		let mut value = [0; lightning_ffor::reestablish::VALUE_LEN];
+		reader.read_exact(&mut value)?;
+		lightning_ffor::reestablish::Reestablish::decode(&value)
+			.map_err(|_| DecodeError::InvalidValue)?;
+		Ok(Self(value))
+	}
+}
+
 /// A [`channel_reestablish`] message to be sent to or received from a peer.
 ///
 /// [`channel_reestablish`]: https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#message-retransmission
@@ -946,6 +987,8 @@ pub struct ChannelReestablish {
 	///
 	/// Also contains a bitfield indicating which messages should be retransmitted.
 	pub my_current_funding_locked: Option<FundingLocked>,
+	/// The optional unsigned FFOR Variant D epoch report, carried in TLV 55001.
+	pub ffor_reestablish: Option<FFORChannelReestablish>,
 }
 
 /// Information exchanged during channel reestablishment about the next funding from interactive
@@ -2937,6 +2980,7 @@ impl_writeable_msg!(ChannelReestablish, {
 }, {
 	(1, next_funding, option),
 	(5, my_current_funding_locked, option),
+	(55001, ffor_reestablish, option),
 });
 
 impl_writeable!(NextFunding, {
@@ -3671,7 +3715,8 @@ where
 						}),
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some() || total_msat.is_some()
+						|| cltv_value.is_some()
+						|| total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 					{
@@ -3821,7 +3866,8 @@ where
 						}),
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some() || total_msat.is_some()
+						|| cltv_value.is_some()
+						|| total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 					{
@@ -4411,6 +4457,7 @@ mod tests {
 		};
 
 		let cr = msgs::ChannelReestablish {
+			ffor_reestablish: None,
 			channel_id: ChannelId::from_bytes([
 				4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
 				0, 0, 0, 0,
@@ -4457,6 +4504,7 @@ mod tests {
 		};
 
 		let cr = msgs::ChannelReestablish {
+			ffor_reestablish: None,
 			channel_id: ChannelId::from_bytes([
 				4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
 				0, 0, 0, 0,
@@ -4516,6 +4564,7 @@ mod tests {
 		};
 
 		let cr = msgs::ChannelReestablish {
+			ffor_reestablish: None,
 			channel_id: ChannelId::from_bytes([
 				4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
 				0, 0, 0, 0,
@@ -6753,3 +6802,6 @@ mod tests {
 		.is_err());
 	}
 }
+
+#[cfg(test)]
+mod ffor_reestablish_tests;

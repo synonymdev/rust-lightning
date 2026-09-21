@@ -69,7 +69,7 @@ pub(crate) fn install_ffor_activation_for_test(
 		)
 		.unwrap();
 		let mut recovery = receiver.node.ffor_recovery.lock().unwrap();
-		let _requirement = receiver.node.ffor_persistence.lock().unwrap().request().unwrap();
+		let requirement = receiver.node.ffor_persistence.lock().unwrap().request().unwrap();
 		let insertion = recovery.prepare_activation(&setup, &activating).unwrap();
 		channel
 			.install_ffor_fence_for_test(phase, hash, &monitor, current_height, &receiver.logger)
@@ -86,6 +86,11 @@ pub(crate) fn install_ffor_activation_for_test(
 			let active = activating.with_ack(&setup, &ack.encode().unwrap()).unwrap();
 			recovery.prepare_activation(&setup, &active).unwrap().commit();
 		}
+		receiver.node.ffor_activation.lock().unwrap().record(
+			FFORRecoveryKey { channel_id, epoch_id: authenticated.header().epoch_id },
+			requirement,
+			false,
+		);
 	}
 	let token = receiver.node.capture_ffor_persistence();
 	let _persisted = receiver.node.encode();
@@ -171,7 +176,7 @@ fn register(sender: &Node, receiver: &Node, channel_id: ChannelId) -> FFORReceiv
 		.unwrap()
 }
 
-fn restore<'a, 'b, 'c>(
+pub(crate) fn restore<'a, 'b, 'c>(
 	node: &Node<'a, 'b, 'c>, manager: &[u8], monitor: &[u8],
 ) -> Result<TestChannelManager<'b, 'c>, DecodeError> {
 	let (_, monitor) = <(BlockHash, ChannelMonitor<TestChannelSigner>)>::read(
