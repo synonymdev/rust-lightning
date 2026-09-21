@@ -325,6 +325,11 @@ where
 		}
 	}
 
+	/// Scheduling observation only. The opaque final proof still checks both views and monitor.
+	pub(crate) fn ffor_receiver_drain_pending(&self) -> bool {
+		!self.context.pending_inbound_htlcs.is_empty() || self.check_ffor_synchronized().is_err()
+	}
+
 	pub(crate) fn ffor_receiver_drain_enabled(&self) -> bool {
 		self.context.ffor_drain_enabled()
 	}
@@ -602,6 +607,11 @@ where
 		}
 		drain.closed = true;
 		book.fence = None;
+		// The same completed Closed proof releases pre-init interception, if this epoch used it.
+		// No separate gate flag may authorize ordinary traffic before the final barrier.
+		if book.request.is_some() {
+			book.request_gate_released = Some(true);
+		}
 		Ok(())
 	}
 }

@@ -1,6 +1,6 @@
 //! Private composition of receiver activation, retained evidence and ordered persistence.
 //!
-//! No public activation or invoice API is exposed until reconnect and controlled drain are wired.
+//! The experimental driver selects transitions; no observation authorizes invoice exposure.
 
 use super::*;
 use crate::ln::channel::{FFORReceiverFencePhase, FFORReestablishOutcome};
@@ -106,18 +106,33 @@ where
 	L::Target: Logger,
 {
 	/// Derive and sign from the actual quiescent channel. This returns no outbound bytes.
+	#[cfg(test)]
 	pub(crate) fn prepare_ffor_receiver_activation(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
 		monitor: &FFORMonitorSnapshot,
 	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
+		self.prepare_ffor_receiver_activation_on_connection(
+			channel_id,
+			counterparty_node_id,
+			epoch_id,
+			monitor,
+			None,
+		)
+	}
+
+	pub(crate) fn prepare_ffor_receiver_activation_on_connection(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		monitor: &FFORMonitorSnapshot, connection: Option<&crate::ln::ffor::FFORPeerConnection>,
+	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
 		let _guard = PersistenceNotifierGuard::notify_on_drop(self);
-		let current_height = self.best_block.read().unwrap().height;
 		let peers = self.per_peer_state.read().unwrap();
 		let mut peer = peers
 			.get(counterparty_node_id)
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?
 			.lock()
 			.unwrap();
+		self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
+		let current_height = self.best_block.read().unwrap().height;
 		let channel = peer
 			.channel_by_id
 			.get_mut(channel_id)
@@ -214,9 +229,26 @@ where
 	/// Enqueue at most once to the original connection after its exact snapshot is durable.
 	/// The callback must check its authenticated transport token atomically with queue insertion.
 	/// It must not call back into the manager, acquire a monitor, or perform network I/O.
+	#[cfg(test)]
 	pub(crate) fn release_ffor_receiver_activation<C>(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
 		enqueue: C,
+	) -> Result<bool, FFORReceiverError>
+	where
+		C: FnOnce(&[u8]) -> Result<(), ()>,
+	{
+		self.release_ffor_receiver_activation_on_connection(
+			channel_id,
+			counterparty_node_id,
+			epoch_id,
+			enqueue,
+			None,
+		)
+	}
+
+	pub(crate) fn release_ffor_receiver_activation_on_connection<C>(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		enqueue: C, connection: Option<&crate::ln::ffor::FFORPeerConnection>,
 	) -> Result<bool, FFORReceiverError>
 	where
 		C: FnOnce(&[u8]) -> Result<(), ()>,
@@ -228,6 +260,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?
 			.lock()
 			.unwrap();
+		self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
 		let channel = peer
 			.channel_by_id
 			.get(channel_id)
@@ -267,9 +300,23 @@ where
 
 	/// Retain an exact authenticated S acknowledgement under the same phase and archive authority.
 	/// The caller must supply the peer identity from the current authenticated transport callback.
+	#[cfg(test)]
 	pub(crate) fn accept_ffor_receiver_activation_ack(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
 		ack_wire: &[u8],
+	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
+		self.accept_ffor_receiver_activation_ack_on_connection(
+			channel_id,
+			counterparty_node_id,
+			epoch_id,
+			ack_wire,
+			None,
+		)
+	}
+
+	pub(crate) fn accept_ffor_receiver_activation_ack_on_connection(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		ack_wire: &[u8], connection: Option<&crate::ln::ffor::FFORPeerConnection>,
 	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
 		let _guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let peers = self.per_peer_state.read().unwrap();
@@ -278,6 +325,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?
 			.lock()
 			.unwrap();
+		self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
 		let channel = peer
 			.channel_by_id
 			.get_mut(channel_id)
@@ -398,8 +446,21 @@ where
 	}
 
 	/// Release only a durably recorded pre-active abort. Existing monitor claims remain ahead of failures.
+	#[cfg(test)]
 	pub(crate) fn release_ffor_receiver_reconnect_abort(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+	) -> Result<bool, FFORReceiverError> {
+		self.release_ffor_receiver_reconnect_abort_on_connection(
+			channel_id,
+			counterparty_node_id,
+			epoch_id,
+			None,
+		)
+	}
+
+	pub(crate) fn release_ffor_receiver_reconnect_abort_on_connection(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		connection: Option<&crate::ln::ffor::FFORPeerConnection>,
 	) -> Result<bool, FFORReceiverError> {
 		let _guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let peers = self.per_peer_state.read().unwrap();
@@ -408,6 +469,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?
 			.lock()
 			.unwrap();
+		self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
 		let channel = peer
 			.channel_by_id
 			.get_mut(channel_id)

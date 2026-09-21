@@ -84,17 +84,30 @@ impl FFORReceiverId {
 	}
 }
 
-/// Current progress of experimental setup, without activation or invoice readiness.
+/// Current native receiver progress. No variant authorizes invoice exposure or witness work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FFORReceiverProgress {
 	/// The ordered manager persister has not yet completed the protected revision.
 	AwaitingPersistence,
 	/// Exact outgoing bytes remain owned by the engine because the transport queue refused them.
 	Backpressured,
-	/// Init has been enqueued on its original connection; no retry is emitted on another one.
+	/// Native state awaits an authenticated peer message or the existing stock handshake.
 	AwaitingPeer,
 	/// Exact accepted vouchers are owned natively and await their stock commitment rounds.
 	AwaitingVoucherCommitments,
+	/// Obtain an opaque snapshot from the monitor, drop its guard, and use the with-monitor entry.
+	NeedsMonitorSnapshot,
+	/// The exact signed activation acknowledgement is durable and native frozen state is intact.
+	/// This may be observed after the settlement deadline and is not invoice readiness.
+	Active,
+	/// A durable close acknowledgement owns the stock voucher removal rounds.
+	Draining,
+	/// Both voucher views are empty and the final Closed manager barrier has completed.
+	Closed,
+	/// A fresh connection and native reestablish reconciliation are required before more work.
+	ReconnectRequired,
+	/// Conflicting retained peer evidence requires explicit recovery; the fence is retained.
+	ResolutionRequired,
 	/// The pending request was irreversibly aborted. The gate remains until controlled release.
 	Aborted {
 		/// First retained native reason.

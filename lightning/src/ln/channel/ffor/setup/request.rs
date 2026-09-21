@@ -307,7 +307,7 @@ where
 		if let Some(setup) = book.setup.as_ref() {
 			if !request.validates_setup(setup)
 				|| (book.request_gate_released.unwrap_or(false)
-					&& (book.abort_reason.is_none() || book.fence.is_some()))
+					&& ((book.abort_reason.is_none() && !book.is_closed()) || book.fence.is_some()))
 			{
 				return Err(DecodeError::InvalidValue);
 			}

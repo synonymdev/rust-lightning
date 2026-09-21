@@ -1,12 +1,12 @@
 # Experimental FFOR receiver setup, activation and recovery
 
 This fork targets rust-lightning v0.2.5. The current APIs provide receiver voucher
-parking and verification of both commitment views for FFOR Variant D. Private manager
+parking and verification of both commitment views for FFOR Variant D. Native manager
 transitions compose activation, reconnect, pre-active abort and cooperative voucher drain
 with ordered storage.
-An experimental public setup facade now owns pre-init admission and synchronous
-Accept processing. No production transport or invoice API exposes the complete
-activation and recovery path yet.
+An experimental public receiver facade owns pre-init admission, synchronous peer input,
+activation and cooperative close advancement. Production transport orchestration and
+invoice readiness remain unfinished.
 
 `prepare_ffor_receiver` checks the current authenticated native peer generation,
 derives a fresh protocol epoch and signs the exact Init. Before any bytes leave,
@@ -15,6 +15,29 @@ it installs a channel-owned interception gate and reserves bounded recovery stor
 completes, the original connection remains current and the settlement deadline has
 not passed. Backpressure preserves the exact retry; successful queue insertion
 consumes this one-shot send. Disconnect and restart never replay Init.
+
+After Accept, the same advancement API chooses the next action from native lifecycle
+state. It requests an opaque monitor snapshot when proof is needed; callers must drop
+the monitor guard before `advance_ffor_receiver_with_monitor`. Complete voucher proof
+starts the owned STFU exchange, then a fresh matching snapshot permits activation
+preparation. Every transition rechecks the authenticated connection generation under
+its own native peer lock. Persisted exact Activate is released at most once, and an
+authentic ActivateAck enters the existing persistence-gated Active transition.
+
+`request_ffor_receiver_close` retains an exact signed close intent. Subsequent advances
+release it after persistence, import acknowledged preimages before enabling failures,
+drive stock removal rounds and verify the final empty commitment pair before Closed.
+Restored Draining and Closed may complete their local persistence gates before stock
+reestablish finishes; their outgoing reports depend on that completion. Conflicting
+reports retain the fence. An exact CloseAck after a required close replay requests a
+fresh reconnect so stock commitment replay can reconcile the new report.
+
+New setup, STFU and activation releases check the current settlement deadline.
+Historical signed acknowledgements and close recovery remain usable after that
+deadline. An ambiguous activation is reconciled through a fresh connection, never
+replayed. Progress values such as Active, Draining or Closed do not authorize invoices
+or witness provisioning. Callers must continue stock peer events, commitment rounds
+and monitor/manager persistence between advances.
 
 The application's stable `local_request_id` is local correlation, not a protocol
 epoch or channel authority. An exact retry returns the retained native selector;
@@ -149,15 +172,15 @@ completion after channel removal. They cannot release an ordinary fulfill while 
 fence is held. Force-close remains available. A required even field makes older
 channel readers refuse fenced state.
 
-A crate-private manager owner derives and signs activation from the actual completed
+The native manager derives and signs activation from the actual completed
 owned STFU handshake and monitor proof. It installs the archive and fence under the
 same consistency boundary, then releases the exact signed bytes at most once after
 that snapshot is durable. Release rechecks the current phase, height and original
 handshake. Its transport callback must atomically validate the authenticated
 connection token with queue insertion, without network I/O or manager callbacks.
 A signed acknowledgement advances the channel and archive together and requests a
-new persistence requirement before Active can be reported. No public runtime invokes
-these private transitions yet.
+new persistence requirement before Active can be reported. The public receiver facade
+selects and invokes these transitions without granting application readiness.
 
 The native reconnect codec carries Variant D TLV 55001 while retaining the ordinary
 BOLT commitment and revocation counter checks. Activating and Active reconnect never
@@ -197,7 +220,7 @@ Draining permits only owned voucher removals and their commitment, revocation, m
 and signer work. Adds, fees, STFU, splicing and ordinary cooperative close remain blocked.
 A matching peer Draining or Closed report uses normal BOLT replay once permission is
 released. A matching Active report enters control-message-only recovery for exact
-retained close retransmission. After its signed reply the private caller must reconnect
+retained close retransmission. After its signed reply the facade requests a reconnect
 to rebuild ordinary replay obligations; same-connection drain stays disabled. Conflicting
 reports retain the fence for resolution. Outgoing Draining reports otherwise remain
 queued until native drain permission is enabled, even when the archive write is complete.
@@ -241,8 +264,11 @@ Similarly, an archive without its original live channel cannot independently pro
 the historical funding context against arbitrary local storage alteration.
 
 No feature bit, production custom-message transport, invoice readiness or background
-deadline service is implemented here. The facade rechecks the deadline before Init
-release and Accept processing; the caller must also cancel a stalled setup.
+deadline service is implemented here. The facade rechecks deadlines before new Init,
+Accept, STFU and activation work; its caller must continue advancing and may cancel
+a stalled pre-activation setup. Cancellation of an owned STFU handshake requests a
+native disconnect. Automatic voucher failures wait for controlled release after the
+abort revision is durable.
 Ordinary channel updates can invalidate a previously returned `Parked` proof.
 
 `NodeSigner::sign_ffor_message` supplies the protocol's single-SHA256 `ffor/msg`
@@ -328,6 +354,15 @@ replies, deadline crossing, retry identity after restore, missing archive eviden
 capacity refusal, witness policy, cancellation and normal payment after controlled
 gate release on a fresh connection.
 
+The lifecycle facade tests advance through real voucher and STFU rounds, durable
+activation, close, both settled and failed drain, and final Closed in both funding
+directions. They cover delayed monitor writes, exact retries, sent or unsent activation
+expiry, signed Abort while activation is ambiguous, lost acknowledgements and late
+recovery, stale generations, conflicting reports, and close replay followed by a fresh
+connection. Both Closed serialization boundaries reload, and ordinary payment works
+after the final completion releases the request gate. Owned-STFU cancellation before
+abort persistence cannot send voucher failures after an early reconnect.
+
 Native witness tests use four pinned Beignet records to compare ECDH, HKDF, plaintext and
 preimages; they reject signed ciphertext, ephemeral-key, AAD, manifest and plaintext-term
 substitution. The shared crate separately covers all six reference scenarios and arbitrary
@@ -336,12 +371,12 @@ body bytes. These tests do not exercise production witness transport or key stor
 ## Next boundary
 
 Reusable epochs require durable retired epoch IDs and voucher hashes, with one
-current signed transcript record under the same channel authority. Cooperative close
-now has private archive and channel transitions, but no production driver invokes them.
-That driver must retain witness keys and receipts, reconcile every recovered preimage
+current signed transcript record under the same channel authority. The public facade
+now composes the native activation and cooperative-close transitions. Production
+orchestration must retain witness keys and receipts, reconcile every recovered preimage
 through the stock monitor, and enforce the configured deadline before claim safety ends.
 
-Production transport must bind the private manager transitions to actual authenticated
+Production transport must bind the receiver facade to actual authenticated
 connections and deliver acknowledgement retries in the required order. Durable witness
 mailbox recovery, preimage reconciliation, deadline enforcement and invoice eligibility remain
 separate required boundaries. None can be inferred from durable setup, activation or

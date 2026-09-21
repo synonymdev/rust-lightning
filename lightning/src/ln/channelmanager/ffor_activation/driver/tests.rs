@@ -598,3 +598,6 @@ fn ffor_driver_accept_rechecks_current_deadline_before_promotion() {
 		.unwrap()
 		.is_none());
 }
+
+#[path = "advance_tests.rs"]
+mod lifecycle;

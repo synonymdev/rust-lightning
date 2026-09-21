@@ -7,6 +7,8 @@ use crate::ln::ffor::{
 };
 use lightning_ffor::wire::Header;
 
+mod advance;
+
 impl<
 		M: Deref,
 		T: Deref,
@@ -29,13 +31,30 @@ where
 	MR::Target: MessageRouter,
 	L::Target: Logger,
 {
+	pub(in crate::ln::channelmanager) fn require_current_ffor_connection(
+		&self, peer: &PeerState<SP>, node_id: &PublicKey, connection: Option<&FFORPeerConnection>,
+	) -> Result<(), FFORReceiverError> {
+		// Legacy in-module channel tests exercise private transitions without a transport. Every
+		// non-test call must carry actual native connection authority, including crate-internal use.
+		#[cfg(not(test))]
+		if connection.is_none() {
+			return Err(FFORCommitmentError::ChannelUnavailable.into());
+		}
+		if let Some(connection) = connection {
+			if !peer.is_connected || !connection.matches(*node_id, peer.ffor_connection.as_ref()) {
+				return Err(FFORCommitmentError::ChannelUnavailable.into());
+			}
+		}
+		Ok(())
+	}
+
 	/// Stage receiver-owned interception and exact signed Init before any peer traffic is released.
 	///
 	/// The supplied connection must be the current authenticated native generation. The channel
 	/// must be supported, empty and synchronized. The engine generates the epoch, checks native
 	/// limits and reserves bounded storage for the eventual accepted transcript and terminal state.
 	/// No bytes are returned. Call `advance_ffor_receiver` after ordered manager persistence.
-	/// This experimental setup facade does not activate offline receiving or authorize invoices.
+	/// This experimental facade does not authorize invoices or advertise offline readiness.
 	pub fn prepare_ffor_receiver(
 		&self, channel_id: &ChannelId, connection: &FFORPeerConnection,
 		parameters: FFORReceiverParameters,
@@ -153,7 +172,7 @@ where
 	/// manager. Returning `Err(())` preserves the exact retry; `Ok(())` consumes this one-shot send.
 	/// A disconnected or restored negotiation never sends Init again. Accepted setup reports only
 	/// voucher-round progress here; activation and invoice readiness are not exposed by this slice.
-	pub fn advance_ffor_receiver<C>(
+	fn advance_ffor_receiver_setup<C>(
 		&self, id: &FFORReceiverId, connection: &FFORPeerConnection, enqueue: C,
 	) -> Result<FFORReceiverProgress, FFORReceiverError>
 	where
@@ -257,7 +276,7 @@ where
 	/// A durable pre-init gate already prevents a stale-manager crash from exposing these as normal
 	/// payments. A malformed or incompatible setup irreversibly aborts pending requests for this peer.
 	/// This bounded facade currently handles Accept and signed pre-accept Abort only.
-	pub fn handle_ffor_receiver_message(
+	fn handle_ffor_receiver_setup_message(
 		&self, connection: &FFORPeerConnection, wire: &[u8],
 	) -> Result<FFORReceiverProgress, FFORReceiverError> {
 		let _guard = PersistenceNotifierGuard::notify_on_drop(self);
@@ -386,6 +405,7 @@ where
 
 	/// Irreversibly cancel a setup before activation, retaining its interception gate.
 	/// After persistence, reconnect and advance again to release the gate for ordinary traffic.
+	/// If FFOR already owns an STFU handshake, this queues the required native disconnect warning.
 	/// This cannot cancel an activation that may already have reached the peer.
 	pub fn cancel_ffor_receiver_setup(
 		&self, id: &FFORReceiverId, connection: &FFORPeerConnection,
@@ -435,7 +455,20 @@ where
 			.ok_or(FFORReceiverError::RecoveryUnavailable)?;
 		entry.requirement = requirement;
 		entry.may_send_init = false;
+		let reconnect = channel.release_ffor_receiver_quiescence();
 		channel.ffor_queue_aborted_vouchers(&self.logger);
+		if reconnect {
+			peer.pending_msg_events.push(MessageSendEvent::HandleError {
+				node_id: connection.peer,
+				action: msgs::ErrorAction::DisconnectPeerWithWarning {
+					msg: msgs::WarningMessage {
+						channel_id: id.channel_id,
+						data: "FFOR setup cancellation requires reconnect before voucher drain"
+							.to_owned(),
+					},
+				},
+			});
+		}
 		Ok(FFORReceiverProgress::AwaitingPersistence)
 	}
 

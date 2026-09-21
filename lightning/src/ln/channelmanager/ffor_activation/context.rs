@@ -154,7 +154,7 @@ where
 		Ok(())
 	}
 
-	fn ffor_active_context_locked(
+	pub(in crate::ln::channelmanager) fn ffor_active_context_locked(
 		&self, channel: &FundedChannel<SP>, recovery: &FFORRecoveryRegistry, key: &FFORRecoveryKey,
 	) -> Result<FFORReceiverActiveContext, FFORReceiverError> {
 		channel

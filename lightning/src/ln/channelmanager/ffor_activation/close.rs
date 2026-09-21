@@ -25,9 +25,52 @@ where
 	MR::Target: MessageRouter,
 	L::Target: Logger,
 {
+	fn validate_ffor_close_transition(
+		&self, channel: &FundedChannel<SP>, recovery: &FFORRecoveryRegistry,
+		allow_close_replay: bool,
+	) -> Result<(), FFORReceiverError> {
+		let setup = channel
+			.ffor_receiver_setup_record()
+			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?
+			.ok_or(FFORReceiverError::NotRegistered)?;
+		recovery
+			.validate_channel_lifecycle(
+				&setup,
+				channel.ffor_receiver_fence(),
+				channel.ffor_receiver_abort_reason(),
+				channel.ffor_receiver_drain_binding(),
+				channel.ffor_receiver_closed_completion_hash(),
+				channel.ffor_receiver_drain_activation_hash(),
+			)
+			.map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
+		match channel.ffor_receiver_reconnect_outcome() {
+			Some(FFORReestablishOutcome::ResolutionRequired { .. })
+			| Some(FFORReestablishOutcome::AbortRequired { .. }) => {
+				Err(FFORCommitmentError::PendingUpdates.into())
+			},
+			Some(FFORReestablishOutcome::CloseReplayRequired { .. }) if !allow_close_replay => {
+				Err(FFORCommitmentError::PendingUpdates.into())
+			},
+			_ => Ok(()),
+		}
+	}
+
 	/// Sign and retain close intent. Exact retries reuse the existing bytes and barrier.
+	#[cfg(test)]
 	pub(crate) fn prepare_ffor_receiver_close(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
+		self.prepare_ffor_receiver_close_on_connection(
+			channel_id,
+			counterparty_node_id,
+			epoch_id,
+			None,
+		)
+	}
+
+	pub(crate) fn prepare_ffor_receiver_close_on_connection(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		connection: Option<&crate::ln::ffor::FFORPeerConnection>,
 	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
 		let _guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let peers = self.per_peer_state.read().unwrap();
@@ -36,6 +79,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?
 			.lock()
 			.unwrap();
+		self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
 		let channel = peer
 			.channel_by_id
 			.get(channel_id)
@@ -43,6 +87,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
 		let key = FFORRecoveryKey { channel_id: *channel_id, epoch_id };
 		let mut recovery = self.ffor_recovery.lock().unwrap();
+		self.validate_ffor_close_transition(channel, &recovery, true)?;
 		let setup = recovery.get(&key).ok_or(FFORReceiverError::UnknownEpoch)?.clone();
 		let previous = recovery.get_activation(&key).ok_or(FFORReceiverError::NotRegistered)?;
 		let hash = previous
@@ -97,9 +142,26 @@ where
 
 	/// Exact close retransmission is allowed after reconnect. The callback atomically verifies the
 	/// current authenticated connection and enqueues a bounded message without manager reentry or I/O.
+	#[cfg(test)]
 	pub(crate) fn release_ffor_receiver_close<C>(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
 		enqueue: C,
+	) -> Result<bool, FFORReceiverError>
+	where
+		C: FnOnce(&[u8]) -> Result<(), ()>,
+	{
+		self.release_ffor_receiver_close_on_connection(
+			channel_id,
+			counterparty_node_id,
+			epoch_id,
+			enqueue,
+			None,
+		)
+	}
+
+	pub(crate) fn release_ffor_receiver_close_on_connection<C>(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		enqueue: C, connection: Option<&crate::ln::ffor::FFORPeerConnection>,
 	) -> Result<bool, FFORReceiverError>
 	where
 		C: FnOnce(&[u8]) -> Result<(), ()>,
@@ -111,6 +173,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?
 			.lock()
 			.unwrap();
+		self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
 		let channel = peer
 			.channel_by_id
 			.get(channel_id)
@@ -166,9 +229,23 @@ where
 	}
 
 	/// Authenticate an exact settlement response and install the still-disabled channel drain.
+	#[cfg(test)]
 	pub(crate) fn accept_ffor_receiver_close_ack(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
 		ack_wire: &[u8],
+	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
+		self.accept_ffor_receiver_close_ack_on_connection(
+			channel_id,
+			counterparty_node_id,
+			epoch_id,
+			ack_wire,
+			None,
+		)
+	}
+
+	pub(crate) fn accept_ffor_receiver_close_ack_on_connection(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		ack_wire: &[u8], connection: Option<&crate::ln::ffor::FFORPeerConnection>,
 	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
 		let _guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let peers = self.per_peer_state.read().unwrap();
@@ -177,6 +254,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?
 			.lock()
 			.unwrap();
+		self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
 		let channel = peer
 			.channel_by_id
 			.get_mut(channel_id)
@@ -184,6 +262,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
 		let key = FFORRecoveryKey { channel_id: *channel_id, epoch_id };
 		let mut recovery = self.ffor_recovery.lock().unwrap();
+		self.validate_ffor_close_transition(channel, &recovery, true)?;
 		let setup = recovery.get(&key).ok_or(FFORReceiverError::UnknownEpoch)?.clone();
 		let previous = recovery.get_activation(&key).ok_or(FFORReceiverError::NotRegistered)?;
 		let next = previous
@@ -209,8 +288,21 @@ where
 
 	/// Import every signed preimage before enabling any failure. Repeated calls and restart use
 	/// the stock idempotent claim path, whose own monitor persistence gates fulfill wire.
+	#[cfg(test)]
 	pub(crate) fn release_ffor_receiver_drain(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+	) -> Result<bool, FFORReceiverError> {
+		self.release_ffor_receiver_drain_on_connection(
+			channel_id,
+			counterparty_node_id,
+			epoch_id,
+			None,
+		)
+	}
+
+	pub(crate) fn release_ffor_receiver_drain_on_connection(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		connection: Option<&crate::ln::ffor::FFORPeerConnection>,
 	) -> Result<bool, FFORReceiverError> {
 		let _guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let key = FFORRecoveryKey { channel_id: *channel_id, epoch_id };
@@ -221,12 +313,14 @@ where
 				.ok_or(FFORCommitmentError::ChannelUnavailable)?
 				.lock()
 				.unwrap();
+			self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
 			let channel = peer
 				.channel_by_id
 				.get(channel_id)
 				.and_then(Channel::as_funded)
 				.ok_or(FFORCommitmentError::ChannelUnavailable)?;
 			let recovery = self.ffor_recovery.lock().unwrap();
+			self.validate_ffor_close_transition(channel, &recovery, false)?;
 			let setup = recovery.get(&key).ok_or(FFORReceiverError::UnknownEpoch)?;
 			let activation =
 				recovery.get_activation(&key).ok_or(FFORReceiverError::NotRegistered)?;
@@ -271,12 +365,14 @@ where
 				.ok_or(FFORCommitmentError::ChannelUnavailable)?
 				.lock()
 				.unwrap();
+			self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
 			let channel = peer
 				.channel_by_id
 				.get_mut(channel_id)
 				.and_then(Channel::as_funded_mut)
 				.ok_or(FFORCommitmentError::ChannelUnavailable)?;
 			let recovery = self.ffor_recovery.lock().unwrap();
+			self.validate_ffor_close_transition(channel, &recovery, false)?;
 			let activation =
 				recovery.get_activation(&key).ok_or(FFORReceiverError::NotRegistered)?;
 			if activation.is_closed()
@@ -299,9 +395,23 @@ where
 	}
 
 	/// Capture both empty commitment views and retain Closed before releasing ordinary updates.
+	#[cfg(test)]
 	pub(crate) fn prepare_ffor_receiver_closed(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
 		monitor: &FFORMonitorSnapshot,
+	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
+		self.prepare_ffor_receiver_closed_on_connection(
+			channel_id,
+			counterparty_node_id,
+			epoch_id,
+			monitor,
+			None,
+		)
+	}
+
+	pub(crate) fn prepare_ffor_receiver_closed_on_connection(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		monitor: &FFORMonitorSnapshot, connection: Option<&crate::ln::ffor::FFORPeerConnection>,
 	) -> Result<FFORPersistenceRequirement, FFORReceiverError> {
 		let _guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let peers = self.per_peer_state.read().unwrap();
@@ -310,6 +420,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?
 			.lock()
 			.unwrap();
+		self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
 		let channel = peer
 			.channel_by_id
 			.get_mut(channel_id)
@@ -317,6 +428,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
 		let key = FFORRecoveryKey { channel_id: *channel_id, epoch_id };
 		let mut recovery = self.ffor_recovery.lock().unwrap();
+		self.validate_ffor_close_transition(channel, &recovery, false)?;
 		let setup = recovery.get(&key).ok_or(FFORReceiverError::UnknownEpoch)?.clone();
 		let previous = recovery.get_activation(&key).ok_or(FFORReceiverError::NotRegistered)?;
 		if previous.is_closed() {
@@ -341,8 +453,21 @@ where
 		Ok(requirement)
 	}
 
+	#[cfg(test)]
 	pub(crate) fn release_ffor_receiver_closed(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+	) -> Result<bool, FFORReceiverError> {
+		self.release_ffor_receiver_closed_on_connection(
+			channel_id,
+			counterparty_node_id,
+			epoch_id,
+			None,
+		)
+	}
+
+	pub(crate) fn release_ffor_receiver_closed_on_connection(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, epoch_id: [u8; 32],
+		connection: Option<&crate::ln::ffor::FFORPeerConnection>,
 	) -> Result<bool, FFORReceiverError> {
 		let _guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let peers = self.per_peer_state.read().unwrap();
@@ -351,6 +476,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?
 			.lock()
 			.unwrap();
+		self.require_current_ffor_connection(&peer, counterparty_node_id, connection)?;
 		let channel = peer
 			.channel_by_id
 			.get_mut(channel_id)
@@ -358,6 +484,7 @@ where
 			.ok_or(FFORCommitmentError::ChannelUnavailable)?;
 		let key = FFORRecoveryKey { channel_id: *channel_id, epoch_id };
 		let recovery = self.ffor_recovery.lock().unwrap();
+		self.validate_ffor_close_transition(channel, &recovery, false)?;
 		let activation = recovery.get_activation(&key).ok_or(FFORReceiverError::NotRegistered)?;
 		let close = activation.close_record().ok_or(FFORCommitmentError::PendingUpdates)?;
 		let digest = close.completion_hash().ok_or(FFORCommitmentError::PendingUpdates)?;

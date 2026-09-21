@@ -354,7 +354,13 @@ where
 	{
 		self.ffor_abort_revealed_secret_reuse();
 		let book = match self.context.ffor_receiver_book.as_ref() {
-			Some(book) if book.abort_reason.is_some() && book.fence.is_none() => book,
+			Some(book)
+				if book.abort_reason.is_some()
+					&& book.fence.is_none()
+					&& (book.request.is_none() || book.request_gate_released.unwrap_or(false)) =>
+			{
+				book
+			},
 			_ => return,
 		};
 		let failures: Vec<_> = book
