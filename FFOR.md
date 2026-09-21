@@ -183,6 +183,18 @@ Witness observation amounts and timestamps carry no payment authority. This help
 borrows the caller's epoch key; protected key storage, durable receipt retention and
 monitor reconciliation remain runtime responsibilities.
 
+Public read-only receiver contexts let an application join protected records to native
+history. Historical contexts expose authenticated setup, exact activation messages,
+original funding and commitment identities, and a stable digest which survives ACK,
+close, channel removal and restart. They do not assert a current phase. Active contexts
+are opaque observations tied to this manager instance and the exact completed persistence
+requirement. Capture checks the live Active fence, original commitment pair, signed ACK,
+absence of close intent and absence of conflicting reconnect state. Close, removal,
+conflict or restore invalidates an old observation. A point-in-time validation call does
+not authorize later work; the future driver must recheck under its transition locks.
+A retained Active phase can outlive the settlement deadline, so neither context grants
+provisioning permission or invoice readiness.
+
 These are consistency checks, not an authenticated storage envelope. Arbitrarily
 deleting a mismatching add's ownership record after abort can make its nonreserved
 hash indistinguishable from an ordinary post-abort payment. No valid writer creates
@@ -265,6 +277,10 @@ after reload, while missing-monitor recovery is rejected. Conflicting reconnect 
 cannot release a close message.
 Archive tests reject phase skips, changed signatures, wrong bitmaps, preimages and completion
 metadata while preserving maximum-message transition capacity through competing admissions.
+
+Read-only context tests cover both funders, absent ACK, pending and current persistence,
+foreign/restored manager rejection, offline Active observation, conflicting reconnect,
+and stable historical binding through close and archive-only force-close recovery.
 
 Native witness tests use four pinned Beignet records to compare ECDH, HKDF, plaintext and
 preimages; they reject signed ciphertext, ephemeral-key, AAD, manifest and plaintext-term

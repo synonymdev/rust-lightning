@@ -115,6 +115,9 @@ impl FFORReceiverSetup {
 	pub(crate) fn receiver(&self) -> PublicKey {
 		self.receiver
 	}
+	pub(crate) fn settlement(&self) -> PublicKey {
+		self.settlement
+	}
 	pub(crate) fn chain_hash(&self) -> ChainHash {
 		self.chain_hash
 	}

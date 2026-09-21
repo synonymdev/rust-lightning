@@ -5,6 +5,7 @@
 //! persistence before releasing wire. No production activation entry point exists yet.
 
 mod close;
+mod context;
 pub(crate) use close::FFORReceiverCloseRecord;
 
 use alloc::vec::Vec;

@@ -25,6 +25,9 @@ use crate::prelude::*;
 use crate::sign::{NodeSigner, Recipient};
 use crate::types::payment::PaymentHash;
 
+pub(crate) mod context;
+pub use context::{FFORReceiverActiveContext, FFORReceiverRecoveryContext};
+
 mod witness;
 pub use witness::{decrypt_ffor_witness_record, FFORWitnessDecryptionError, FFORWitnessReceipt};
 

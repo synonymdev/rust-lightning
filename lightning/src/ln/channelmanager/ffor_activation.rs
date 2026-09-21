@@ -10,6 +10,7 @@ use lightning_ffor::transcript;
 use lightning_ffor::wire::{Activate, Message as FFORMessage, Payload};
 
 mod close;
+mod context;
 mod reestablish;
 
 struct RuntimeEntry {
