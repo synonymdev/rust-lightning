@@ -25,6 +25,9 @@ use crate::prelude::*;
 use crate::sign::{NodeSigner, Recipient};
 use crate::types::payment::PaymentHash;
 
+mod witness;
+pub use witness::{decrypt_ffor_witness_record, FFORWitnessDecryptionError, FFORWitnessReceipt};
+
 /// Which channel participant offers every voucher HTLC in the book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FFORSettlementParty {

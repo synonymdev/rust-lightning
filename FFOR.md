@@ -2,7 +2,8 @@
 
 This fork targets rust-lightning v0.2.5. The current APIs provide receiver voucher
 parking and verification of both commitment views for FFOR Variant D. Private manager
-transitions compose activation, reconnect and pre-active abort with ordered storage.
+transitions compose activation, reconnect, pre-active abort and cooperative voucher drain
+with ordered storage.
 No production transport or invoice API exposes those transitions yet.
 
 `register_ffor_receiver_setup` authenticates exact signed init and accept messages
@@ -80,14 +81,13 @@ Authenticated setup also enters a manager-owned recovery registry in required TL
 explicit closure, monitor-triggered closure and disposal of a stale manager channel.
 Restore reauthenticates records, checks the manager's identity and chain, and requires
 every retained channel setup to match its archive entry. The registry is bounded to
-64 records and 8 MiB total, with a 192 KiB setup-only record limit and a 384 KiB
+64 records and 8 MiB total, with a 192 KiB setup-only record limit and a 512 KiB
 activation record limit. Capacity is reserved before channel mutation. An Activating
-record also reserves the larger of a maximum acknowledgement and a terminal abort,
-including framing, so other records cannot consume that transition storage. This
-allowance is derived again on restore and released when either outcome is retained.
-A production close path must also reserve its required evidence before activation.
-The setup-only archive
-version retains no activation or claim authority.
+record reserves its maximum acknowledgement, both maximum close messages and final
+completion evidence, including framing, so competing admissions cannot consume its
+remaining transition storage. Each later phase retains the allowance for its remaining
+transitions, recomputed on restore. A terminal abort releases that reservation.
+The setup-only archive version retains no activation or claim authority.
 Fully drained channel tombstones permit subsequent ordinary splicing while retaining
 the original funding context in their archive.
 
@@ -102,9 +102,10 @@ monitor and checks both commitment identities, its destination and the saved upd
 floor. A preimage or force-close update may advance that floor without changing the
 frozen commitments. The complete monitor remains necessary for signatures and claims.
 
-The private channel fence persists Activating, Active or a pending pre-active abort
-independently of stock STFU flags. It blocks ordinary HTLC updates, commitment and
-revocation messages, fees, splicing, cooperative close and signer retries. Frozen
+The private channel fence persists Activating, Active, Draining, pending Closed or
+a pending pre-active abort independently of stock STFU flags. Activating and Active block
+ordinary HTLC updates, commitment and revocation messages, fees, splicing, cooperative
+close and signer retries. Frozen
 channels are also excluded from usable-channel listings and ordinary routing. Valid
 owned preimages still enter stock monitor persistence, including delayed writes and
 completion after channel removal. They cannot release an ordinary fulfill while the
@@ -122,8 +123,9 @@ new persistence requirement before Active can be reported. No public runtime inv
 these private transitions yet.
 
 The native reconnect codec carries Variant D TLV 55001 while retaining the ordinary
-BOLT commitment and revocation counter checks. Frozen reconnect never retransmits
-ordinary commitment traffic. A receiver still Activating can recover a lost signed
+BOLT commitment and revocation counter checks. Activating and Active reconnect never
+retransmit ordinary commitment traffic. Draining can replay only its owned removals
+through the normal commitment protocol after its durable release grants permission. A receiver still Activating can recover a lost signed
 acknowledgement only after the settlement peer reports Active with the same epoch and
 activation hash. An unsigned report alone cannot activate the receiver. Activation
 bytes are never replayed across a disconnect or restart. Active conflicts retain the
@@ -142,6 +144,44 @@ refreshed at release while the original ordinary reconnect counters are retained
 Restored managers request a fresh persistence requirement and notify the background
 processor before releasing reports. Disconnect discards connection-specific queued
 reports, and a subsequent connection builds fresh ones.
+
+Cooperative close retains exact signed receiver intent and settlement acknowledgement,
+including the settled bitmap and all acknowledged preimages. These records use archive
+version 3 and a required even activation field. Exact control-message replay remains
+idempotent through later phases; different bytes cannot replace retained evidence.
+The private manager persists the close acknowledgement before enabling Draining.
+Its native permission is instance-local and resets to false on restore. Known preimages
+enter the stock monitor before any eligible voucher failures are queued. Settled slots
+and slots with known preimages cannot receive new failure decisions. An unsent failure
+can become a fulfill; a preimage learned after a signed failure still reaches the monitor
+without rewriting an already committed removal.
+
+Draining permits only owned voucher removals and their commitment, revocation, monitor
+and signer work. Adds, fees, STFU, splicing and ordinary cooperative close remain blocked.
+A matching peer Draining or Closed report uses normal BOLT replay once permission is
+released. A matching Active report enters control-message-only recovery for exact
+retained close retransmission. After its signed reply the private caller must reconnect
+to rebuild ordinary replay obligations; same-connection drain stays disabled. Conflicting
+reports retain the fence for resolution. Outgoing Draining reports otherwise remain
+queued until native drain permission is enabled, even when the archive write is complete.
+
+Closed requires a fresh proof that both actual commitment transactions have no HTLCs,
+all removal rounds and monitor writes completed, and funding and claim signatures match.
+The archived completion binds the funding outpoint, both transaction IDs and commitment
+numbers, acknowledgement, activation and monitor update identity. The final write must
+complete before the manager clears the fence or advertises Closed. Ordinary payments
+and later splices then work while the permanent epoch and voucher tombstone remains.
+
+Witness fetch codecs authenticate encrypted records against the provisioned identity,
+mailbox, activation digest, canonical book entry, ciphertext hash and low-S signature.
+The shared body verifier checks exact framing, epoch, slot, payment terms and the
+preimage hash. It accepts already decrypted bytes and does not itself establish AEAD
+provenance. The native `decrypt_ffor_witness_record` adapter uses the existing secp256k1,
+HKDF-SHA256 and ChaCha20-Poly1305 implementations to verify the key, associated data and
+authentication tag before exposing a receipt. Its Debug output redacts the preimage.
+Witness observation amounts and timestamps carry no payment authority. This helper
+borrows the caller's epoch key; protected key storage, durable receipt retention and
+monitor reconciliation remain runtime responsibilities.
 
 These are consistency checks, not an authenticated storage envelope. Arbitrarily
 deleting a mismatching add's ownership record after abort can make its nonreserved
@@ -214,18 +254,33 @@ a delayed preimage monitor write, or restart after abort release. They check act
 fulfill and fail messages, both empty commitment sets, tombstone reload and a later
 ordinary payment.
 
+Cooperative close tests cover ten two-voucher scenarios across both funders, including
+signed settled preimages, an already known unset-bit preimage, delayed monitor writes,
+and restart after a signed removal flight is lost. They verify normal BOLT retransmission,
+matching Active close replay, same-connection drain refusal, final monitor proof, retained
+ACK replay and Closed release before ordinary payments. Native claim tests cover preimage
+priority over unsent failures and monitor persistence after an already signed failure.
+Force-close during unresolved drain retains exact archive evidence and monitor preimages
+after reload, while missing-monitor recovery is rejected. Conflicting reconnect state
+cannot release a close message.
+Archive tests reject phase skips, changed signatures, wrong bitmaps, preimages and completion
+metadata while preserving maximum-message transition capacity through competing admissions.
+
+Native witness tests use four pinned Beignet records to compare ECDH, HKDF, plaintext and
+preimages; they reject signed ciphertext, ephemeral-key, AAD, manifest and plaintext-term
+substitution. The shared crate separately covers all six reference scenarios and arbitrary
+body bytes. These tests do not exercise production witness transport or key storage.
+
 ## Next boundary
 
 Reusable epochs require durable retired epoch IDs and voucher hashes, with one
-current signed transcript record under the same channel authority. The next native
-boundary is cooperative Active-to-Draining-to-Closed recovery: retain signed close
-and close-ack evidence, persist every known preimage through the stock monitor, allow
-only owned voucher removals and their commitment rounds, and retain that ownership
-through reconnect and restart. Capacity for those terminal records must be reserved
-before an epoch becomes operational.
+current signed transcript record under the same channel authority. Cooperative close
+now has private archive and channel transitions, but no production driver invokes them.
+That driver must retain witness keys and receipts, reconcile every recovered preimage
+through the stock monitor, and enforce the configured deadline before claim safety ends.
 
 Production transport must bind the private manager transitions to actual authenticated
-connections and deliver acknowledgement retries in the required order. Witness/mailbox
-recovery, preimage reconciliation, deadline enforcement and invoice eligibility remain
+connections and deliver acknowledgement retries in the required order. Durable witness
+mailbox recovery, preimage reconciliation, deadline enforcement and invoice eligibility remain
 separate required boundaries. None can be inferred from durable setup, activation or
 a successful private protocol test.
