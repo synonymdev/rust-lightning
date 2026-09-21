@@ -1,5 +1,6 @@
 #![no_main]
 
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
 use libfuzzer_sys::fuzz_target;
 use lightning_ffor::setup::AuthenticatedSetup;
@@ -64,5 +65,39 @@ fuzz_target!(|data: &[u8]| {
 	}
 	if let Ok(provision) = Provision::decode(candidate, &setup) {
 		assert_eq!(provision.encode(), candidate);
+	}
+	// Length-prefixed signed manifest and record leave arbitrary plaintext bytes for the
+	// consistency checker. This does not attempt decryption or claim authenticated plaintext.
+	if candidate.len() < 4 {
+		return;
+	}
+	let manifest_length = usize::from(u16::from_be_bytes([candidate[0], candidate[1]]));
+	let record_length = usize::from(u16::from_be_bytes([candidate[2], candidate[3]]));
+	let Some(manifest) = candidate.get(4..4 + manifest_length) else {
+		return;
+	};
+	let Some(record) = candidate.get(4 + manifest_length..4 + manifest_length + record_length)
+	else {
+		return;
+	};
+	let Some(body) = candidate.get(4 + manifest_length + record_length..) else {
+		return;
+	};
+	let (Ok(manifest), Ok(record)) =
+		(SignedManifest::decode(manifest, &setup), EncryptedRecord::decode(record))
+	else {
+		return;
+	};
+	let witness = record.header().witness;
+	let Ok(record) = record.authenticate(&manifest, witness) else {
+		return;
+	};
+	if let Ok(verified) = record.verify_body(&manifest, body) {
+		assert_eq!(body.len(), lightning_ffor::witness::RECORD_BODY_LEN);
+		assert_eq!(verified.slot(), record.record().header().slot);
+		assert_eq!(
+			sha256::Hash::hash(&verified.preimage()).to_byte_array(),
+			verified.payment_hash()
+		);
 	}
 });

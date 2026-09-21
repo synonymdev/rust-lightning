@@ -10,7 +10,8 @@
 //! Refusal text is bounded opaque bytes and need not be UTF-8.
 //! Fetch messages preserve canonical unknown odd TLVs and reject unknown even fields. Records
 //! define no extension stream and reject reserved flags. Authenticated encrypted records prove
-//! their witness signature and manifest binding only: no AEAD or plaintext verification exists.
+//! their witness signature and manifest binding only. Plaintext body verification is separate
+//! from AEAD authentication, which must be performed by the caller's decryption boundary.
 //!
 //! ```
 //! use lightning_ffor::witness::{Acknowledgement, AcknowledgementResult};
@@ -32,6 +33,7 @@ mod fetch_correlation;
 mod manifest;
 mod messages;
 mod record;
+mod record_body;
 
 pub use correlation::{CheckedAcknowledgement, PendingProvision, WitnessConnection};
 pub use fetch::{FetchParameters, FetchResponse, FetchResult, SignedFetch, UnsignedFetch};
@@ -41,6 +43,7 @@ pub use messages::{Acknowledgement, AcknowledgementResult, Provision};
 pub use record::{
 	AuthenticatedEncryptedRecord, EncryptedRecord, RecordHeader, CIPHERTEXT_LEN, RECORD_HEADER_LEN,
 };
+pub use record_body::{RecordBodyContext, VerifiedRecordBody, RECORD_BODY_LEN};
 
 /// Appendix F.1 receiver-to-witness provisioning message, including its two-byte type.
 pub const PROVISION_MESSAGE_TYPE: u16 = 55055;
@@ -98,6 +101,8 @@ pub enum WitnessError {
 	Mailbox,
 	/// The slot or canonical book entry differs from this manifest.
 	Terms,
+	/// The supplied body preimage does not hash to the canonical payment hash.
+	Preimage,
 	/// A response is unordered, repeats a slot, or has an invalid pagination cursor.
 	Pagination,
 	/// A request identifier or nonce was already used in this bounded fetch traversal.

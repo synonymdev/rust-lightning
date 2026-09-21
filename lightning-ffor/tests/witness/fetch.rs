@@ -5,6 +5,9 @@ use lightning_ffor::witness::{
 	UnsignedFetch, CIPHERTEXT_LEN, RECORD_HEADER_LEN,
 };
 
+#[path = "body.rs"]
+mod body;
+
 #[derive(Deserialize)]
 struct FetchReference {
 	source_revision: String,

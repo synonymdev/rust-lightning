@@ -2,13 +2,13 @@ use alloc::vec::Vec;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
 
-use super::{Reader, SignedManifest, WitnessError, MAX_MESSAGE_LEN};
+use super::{Reader, SignedManifest, WitnessError, MAX_MESSAGE_LEN, RECORD_BODY_LEN};
 use crate::transcript;
 
 /// Appendix F.2 fixed version 1 record header length.
 pub const RECORD_HEADER_LEN: usize = 235;
 /// Compressed ephemeral key, 142-byte version 1 body, and 16-byte Poly1305 tag.
-pub const CIPHERTEXT_LEN: usize = 33 + 142 + 16;
+pub const CIPHERTEXT_LEN: usize = 33 + RECORD_BODY_LEN + 16;
 const MAX_RECORD_LEN: usize = MAX_MESSAGE_LEN - 2 - 16 - 1 - 2 - 2;
 
 /// Public signed record metadata. These claims do not prove that its body decrypts.
@@ -181,11 +181,18 @@ impl EncryptedRecord {
 	pub fn authenticate(
 		self, manifest: &SignedManifest, expected_witness: PublicKey,
 	) -> Result<AuthenticatedEncryptedRecord, WitnessError> {
-		let m = manifest.unsigned();
-		let p = m.parameters();
 		if self.header.witness != expected_witness {
 			return Err(WitnessError::Witness);
 		}
+		self.checked_entry(manifest)?;
+		Ok(AuthenticatedEncryptedRecord { record: self })
+	}
+
+	pub(super) fn checked_entry<'a>(
+		&self, manifest: &'a SignedManifest,
+	) -> Result<&'a [u8], WitnessError> {
+		let m = manifest.unsigned();
+		let p = m.parameters();
 		if self.header.mailbox_id != p.mailbox_id
 			|| self.header.encryption_public_key != p.encryption_public_key
 		{
@@ -199,14 +206,14 @@ impl EncryptedRecord {
 		if transcript::hash_parts(b"ffor/terms", &[entry]) != self.header.terms_hash {
 			return Err(WitnessError::Terms);
 		}
-		Ok(AuthenticatedEncryptedRecord { record: self })
+		Ok(entry)
 	}
 }
 
 /// Authenticated opaque ciphertext bound to one provisioned witness, manifest and book entry.
 ///
-/// This is deliberately not a receipt or preimage authority. A later decryption boundary must
-/// verify AEAD, epoch and all plaintext terms, then SHA256(t) == H_k before using a preimage.
+/// This is deliberately not a receipt or preimage authority. A decryption boundary must verify
+/// AEAD before passing the resulting plaintext to [`Self::verify_body`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthenticatedEncryptedRecord {
 	record: EncryptedRecord,

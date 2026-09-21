@@ -228,11 +228,16 @@ incorrect ciphertext hashes, invalid signatures, truncated fields and extra byte
 attachments are outside the signature and provide no proof of payment or storage. Record
 retrieval remains possible after voucher expiry and therefore has no current-height gate.
 
-There is no Rust ECIES decryptor in this checkpoint. A witness can sign ciphertext with an
-invalid AEAD tag or false plaintext; successful metadata authentication does not prove that
-a payment occurred. A future decryptor must authenticate ChaCha20-Poly1305 and validate
-the epoch, slot, payment hash, amount, expiry, deadline and actual preimage before crediting
-or claiming a voucher. The reference uses SHA256 of the **compressed** ECDH shared point
+`AuthenticatedEncryptedRecord::verify_body` verifies exactly 142 plaintext bytes against
+the retained manifest, including epoch, slot, payment hash, amount, expiry, deadline and
+SHA256(preimage). Its immutable result redacts the preimage in Debug. Observation amounts
+and times remain informational. This shared method does not establish that supplied bytes
+came from authenticated decryption. The native `lightning::ln::ffor` decryptor checks the
+AEAD tag before invoking it and exposes a separate receipt type. Neither helper mutates
+channel state or proves payment settlement. A witness can sign ciphertext with an invalid
+AEAD tag or false plaintext, so signature checking alone is insufficient.
+
+The reference uses SHA256 of the **compressed** ECDH shared point
 once, then HKDF-SHA256 extract/expand with empty salt and `ffor/witness/body` as info.
 The nonce is 12 zero bytes, the Poly1305 tag is appended, and AAD is the exact header with
 only its final ciphertext-hash field zeroed. Applying another SHA256 to the reference
@@ -243,13 +248,15 @@ Beignet and the six public Appendix D setups. Deterministic fixture keys and eph
 keys are public test inputs only. The generator invokes the actual reference codecs and
 encryption helper, verifies witness signatures, decrypts every generated record and checks
 the published preimages. Rust tests independently compare bytes, domains, AAD and the
-secp256k1 ECDH hash, but do not perform decryption. The existing witness fuzz target also
-checks these new codecs and is seeded with requests, pages and signed encrypted records.
+secp256k1 ECDH hash. Shared tests check plaintext against all six scenarios; native tests
+add actual decryption of four records from the first two scenarios, exported by
+`generate_native_witness_fixtures.py`. The witness fuzz target also checks candidate bodies
+against authenticated manifests and record terms.
 
-The fetch checkpoint passes 88 tests and five doctests, no_std, all-target Clippy with
-warnings denied, and actual Rust 1.63 checks with and without std. The seeded witness fuzz
-target completed 1,431,038 inputs in 31 seconds without a crash. These bounded checks do
-not establish successful decryption, runtime storage safety or offline invoice readiness.
+The body-verification checkpoint passes 95 tests and five doctests, no_std, all-target
+Clippy with warnings denied, and actual Rust 1.63 checks with and without std. The extended
+seeded witness fuzz target completed 987,022 inputs in 31 seconds without a crash. These
+bounded checks do not establish runtime storage safety or offline invoice readiness.
 
 The requested settlement baseline is LND v0.21.3-beta. LND implementation work is
 kept local. This unpublished workspace crate does not change a binding version or

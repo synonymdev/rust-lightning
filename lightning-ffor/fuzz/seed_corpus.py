@@ -37,9 +37,16 @@ print("Seeded 24 witness manifest/provision/acknowledgement cases")
 
 fetches = json.loads((crate / "tests/data/beignet-witness-fetch.json").read_text())
 for index, fixture in enumerate(fetches["fixtures"]):
+    init = bytes.fromhex(fixtures[index]["init_wire"])
+    accept = bytes.fromhex(fixtures[index]["accept_wire"])
+    manifest = bytes.fromhex(witnesses["fixtures"][index]["manifest"])
+    prefix = len(init).to_bytes(2, "big") + len(accept).to_bytes(2, "big") + init + accept
     for field in ("first_request", "continuation_request", "odd_request", "first_response",
                   "continuation_response", "empty_response", "refusal"):
         (witness_corpus / f"fetch-{index}-{field}").write_bytes(bytes.fromhex(fixture[field]))
     for slot, record in enumerate(fixture["records"]):
         (witness_corpus / f"record-{index}-{slot}").write_bytes(bytes.fromhex(record["record"]))
+        wire = bytes.fromhex(record["record"])
+        candidate = len(manifest).to_bytes(2, "big") + len(wire).to_bytes(2, "big") + manifest + wire
+        (witness_corpus / f"body-{index}-{slot}").write_bytes(prefix + candidate + bytes.fromhex(record["body"]))
 print("Seeded fetch pages and signed encrypted records from all six reference scenarios")
