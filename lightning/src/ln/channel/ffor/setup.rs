@@ -352,6 +352,7 @@ where
 	/// Validate before the reader converts a live setup into an aborted restart tombstone.
 	pub(in crate::ln::channel) fn ffor_restored(&mut self) -> Result<(), DecodeError> {
 		self.ffor_validate_receiver_setup()?;
+		self.validate_ffor_fence()?;
 		if let Some(book) = self.context.ffor_receiver_book.as_mut() {
 			book.abort(FFORReceiverAbortReason::Restarted);
 		}

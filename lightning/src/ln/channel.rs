@@ -102,7 +102,7 @@ use super::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBase
 mod ffor;
 #[cfg(test)]
 pub(crate) use ffor::ffor_setup_test_messages;
-pub(crate) use ffor::FFORReceiverSetup;
+pub(crate) use ffor::{FFORReceiverFencePhase, FFORReceiverSetup};
 
 #[cfg(any(test, feature = "_test_utils"))]
 #[allow(unused)]
@@ -1171,6 +1171,7 @@ pub(super) struct ReestablishResponses {
 
 /// The first message we send to our peer after connection
 pub(super) enum ReconnectionMsg {
+	FFORFrozen(msgs::WarningMessage),
 	Reestablish(msgs::ChannelReestablish),
 	Open(OpenChannelMessage),
 	None,
@@ -1683,8 +1684,10 @@ where
 	) -> ReconnectionMsg where L::Target: Logger {
 		match &mut self.phase {
 			ChannelPhase::Undefined => unreachable!(),
-			ChannelPhase::Funded(chan) =>
-				ReconnectionMsg::Reestablish(chan.get_channel_reestablish(logger)),
+			ChannelPhase::Funded(chan) => match chan.get_channel_reestablish(logger) {
+				Ok(message) => ReconnectionMsg::Reestablish(message),
+				Err(warning) => ReconnectionMsg::FFORFrozen(warning),
+			},
 			ChannelPhase::UnfundedOutboundV1(chan) => {
 				chan.get_open_channel(chain_hash, logger)
 					.map(|msg| ReconnectionMsg::Open(OpenChannelMessage::V1(msg)))
@@ -1789,6 +1792,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context().check_ffor_mutation().map_err(|error| (error, None))?;
 		match self.interactive_tx_constructor_mut() {
 			Some(interactive_tx_constructor) => interactive_tx_constructor
 				.handle_tx_add_input(msg)
@@ -1808,6 +1812,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context().check_ffor_mutation().map_err(|error| (error, None))?;
 		match self.interactive_tx_constructor_mut() {
 			Some(interactive_tx_constructor) => interactive_tx_constructor
 				.handle_tx_add_output(msg)
@@ -1827,6 +1832,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context().check_ffor_mutation().map_err(|error| (error, None))?;
 		match self.interactive_tx_constructor_mut() {
 			Some(interactive_tx_constructor) => interactive_tx_constructor
 				.handle_tx_remove_input(msg)
@@ -1846,6 +1852,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context().check_ffor_mutation().map_err(|error| (error, None))?;
 		match self.interactive_tx_constructor_mut() {
 			Some(interactive_tx_constructor) => interactive_tx_constructor
 				.handle_tx_remove_output(msg)
@@ -1868,6 +1875,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context().check_ffor_mutation().map_err(|error| (error, None))?;
 		let tx_complete_action = match self.interactive_tx_constructor_mut() {
 			Some(interactive_tx_constructor) => interactive_tx_constructor
 				.handle_tx_complete(msg)
@@ -1911,6 +1919,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context().check_ffor_mutation()?;
 		// If we have not sent a `tx_abort` message for this negotiation previously, we need to echo
 		// back a tx_abort message according to the spec:
 		//   https://github.com/lightning/bolts/blob/247e83d/02-peer-protocol.md?plain=1#L560-L561
@@ -7331,6 +7340,11 @@ where
 	where
 		L::Target: Logger,
 	{
+		if self.context.is_ffor_frozen()
+			&& !self.context.ffor_owns_preimage(htlc_id_arg, &payment_preimage_arg)
+		{
+			return UpdateFulfillFetch::DuplicateClaim {};
+		}
 		// Either ChannelReady got set (which means it won't be unset) or there is no way any
 		// caller thought we could have something claimed (cause we wouldn't have accepted in an
 		// incoming HTLC anyway). If we got to ShutdownComplete, callers aren't allowed to call us,
@@ -7398,7 +7412,9 @@ where
 			channel_id: Some(self.context.channel_id()),
 		};
 
-		if !self.context.channel_state.can_generate_new_commitment() {
+		if self.context.is_ffor_frozen()
+			|| !self.context.channel_state.can_generate_new_commitment()
+		{
 			// Note that this condition is the same as the assertion in
 			// `claim_htlc_while_disconnected_dropping_mon_update` and must match exactly -
 			// `claim_htlc_while_disconnected_dropping_mon_update` would not work correctly if we
@@ -7506,7 +7522,9 @@ where
 				// already queued, we have to insert it into the pending queue and update the
 				// update_ids of all the following monitors.
 				if release_cs_monitor && !update_blocked {
-					let mut additional_update = self.build_commitment_no_status_check(logger);
+					let mut additional_update = self
+						.build_commitment_no_status_check(logger)
+						.expect("Commitment mutation was checked before entering this path");
 					// build_commitment_no_status_check may bump latest_monitor_id but we want them
 					// to be strictly increasing by one, so decrement it here.
 					self.context.latest_monitor_update_id = monitor_update.update_id;
@@ -7522,7 +7540,9 @@ where
 					}
 					if !update_blocked {
 						debug_assert!(false, "If there is a pending blocked monitor we should have MonitorUpdateInProgress set");
-						let update = self.build_commitment_no_status_check(logger);
+						let update = self
+							.build_commitment_no_status_check(logger)
+							.expect("Commitment mutation was checked before entering this path");
 						self.context
 							.blocked_monitor_updates
 							.push(PendingChannelMonitorUpdate { update });
@@ -7576,6 +7596,7 @@ where
 		&mut self, htlc_id_arg: u64, err_contents: E, mut force_holding_cell: bool,
 		logger: &L
 	) -> Result<Option<E::Message>, ChannelError> where L::Target: Logger {
+		if self.context.is_ffor_frozen() { return Err(ChannelError::Ignore(ffor::FFOR_FROZEN_MESSAGE.to_owned())); }
 		if !matches!(self.context.channel_state, ChannelState::ChannelReady(_)) {
 			panic!("Was asked to fail an HTLC when channel was not in an operational state");
 		}
@@ -7690,6 +7711,7 @@ where
 		NS::Target: NodeSigner,
 		L::Target: Logger
 	{
+		self.context.check_ffor_mutation()?;
 		if self.context.channel_state.is_peer_disconnected() {
 			self.context.workaround_lnd_bug_4006 = Some(msg.clone());
 			return Err(ChannelError::Ignore("Peer sent channel_ready when we needed a channel_reestablish. The peer is likely lnd, see https://github.com/lightningnetwork/lnd/issues/4006".to_owned()));
@@ -7767,6 +7789,7 @@ where
 	pub fn update_add_htlc<F: Deref>(
 		&mut self, msg: &msgs::UpdateAddHTLC, fee_estimator: &LowerBoundedFeeEstimator<F>,
 	) -> Result<(), ChannelError> where F::Target: FeeEstimator {
+		self.context.check_ffor_mutation()?;
 		if self.context.channel_state.is_remote_stfu_sent() || self.context.channel_state.is_quiescent() {
 			return Err(ChannelError::WarnAndDisconnect("Got add HTLC message while quiescent".to_owned()));
 		}
@@ -7816,6 +7839,7 @@ where
 	#[inline]
 	#[rustfmt::skip]
 	fn mark_outbound_htlc_removed(&mut self, htlc_id: u64, outcome: OutboundHTLCOutcome) -> Result<&OutboundHTLCOutput, ChannelError> {
+		self.context.check_ffor_mutation()?;
 		for htlc in self.context.pending_outbound_htlcs.iter_mut() {
 			if htlc.htlc_id == htlc_id {
 				if let OutboundHTLCOutcome::Success(ref payment_preimage, ..) = outcome {
@@ -7842,6 +7866,7 @@ where
 	pub fn update_fulfill_htlc(
 		&mut self, msg: &msgs::UpdateFulfillHTLC,
 	) -> Result<(HTLCSource, u64, Option<u64>, Option<Duration>), ChannelError> {
+		self.context.check_ffor_mutation()?;
 		if self.context.channel_state.is_remote_stfu_sent()
 			|| self.context.channel_state.is_quiescent()
 		{
@@ -7869,6 +7894,7 @@ where
 
 	#[rustfmt::skip]
 	pub fn update_fail_htlc(&mut self, msg: &msgs::UpdateFailHTLC, fail_reason: HTLCFailReason) -> Result<(), ChannelError> {
+		self.context.check_ffor_mutation()?;
 		if self.context.channel_state.is_remote_stfu_sent() || self.context.channel_state.is_quiescent() {
 			return Err(ChannelError::WarnAndDisconnect("Got fail HTLC message while quiescent".to_owned()));
 		}
@@ -7885,6 +7911,7 @@ where
 
 	#[rustfmt::skip]
 	pub fn update_fail_malformed_htlc(&mut self, msg: &msgs::UpdateFailMalformedHTLC, fail_reason: HTLCFailReason) -> Result<(), ChannelError> {
+		self.context.check_ffor_mutation()?;
 		if self.context.channel_state.is_remote_stfu_sent() || self.context.channel_state.is_quiescent() {
 			return Err(ChannelError::WarnAndDisconnect("Got fail malformed HTLC message while quiescent".to_owned()));
 		}
@@ -7905,6 +7932,7 @@ where
 	) -> Result<ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>, ChannelError>
 	where L::Target: Logger
 	{
+		self.context.check_ffor_mutation()?;
 		if let Some(signing_session) = self.context.interactive_tx_signing_session.as_ref() {
 			if signing_session.has_received_tx_signatures() {
 				let msg = "Received initial commitment_signed after peer's tx_signatures received!";
@@ -7951,6 +7979,7 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		debug_assert!(self
 			.context
 			.interactive_tx_signing_session
@@ -8058,6 +8087,7 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		self.commitment_signed_check_state()?;
 
 		if !self.pending_funding().is_empty() {
@@ -8102,6 +8132,7 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		self.commitment_signed_check_state()?;
 
 		let mut messages = BTreeMap::new();
@@ -8171,6 +8202,7 @@ where
 	}
 
 	fn commitment_signed_check_state(&self) -> Result<(), ChannelError> {
+		self.context.check_ffor_mutation()?;
 		if self.context.channel_state.is_quiescent() {
 			return Err(ChannelError::WarnAndDisconnect(
 				"Got commitment_signed message while quiescent".to_owned(),
@@ -8205,6 +8237,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		if self
 			.holder_commitment_point
 			.advance(&self.context.holder_signer, &self.context.secp_ctx, logger)
@@ -8302,7 +8335,7 @@ where
 				// the corresponding HTLC status updates so that
 				// get_last_commitment_update_for_send includes the right HTLCs.
 				self.context.monitor_pending_commitment_signed = true;
-				let mut additional_update = self.build_commitment_no_status_check(logger);
+				let mut additional_update = self.build_commitment_no_status_check(logger)?;
 				// build_commitment_no_status_check may bump latest_monitor_id but we want them to be
 				// strictly increasing by one, so decrement it here.
 				self.context.latest_monitor_update_id = monitor_update.update_id;
@@ -8318,7 +8351,7 @@ where
 				// If we're AwaitingRemoteRevoke we can't send a new commitment here, but that's ok -
 				// we'll send one right away when we get the revoke_and_ack when we
 				// free_holding_cell_htlcs().
-				let mut additional_update = self.build_commitment_no_status_check(logger);
+				let mut additional_update = self.build_commitment_no_status_check(logger)?;
 				// build_commitment_no_status_check may bump latest_monitor_id but we want them to be
 				// strictly increasing by one, so decrement it here.
 				self.context.latest_monitor_update_id = monitor_update.update_id;
@@ -8351,6 +8384,9 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
+		if self.context.is_ffor_frozen() {
+			return (None, Vec::new());
+		}
 		if matches!(self.context.channel_state, ChannelState::ChannelReady(_))
 			&& self.context.channel_state.can_generate_new_commitment()
 		{
@@ -8369,6 +8405,9 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
+		if self.context.is_ffor_frozen() {
+			return (None, Vec::new());
+		}
 		assert!(matches!(self.context.channel_state, ChannelState::ChannelReady(_)));
 		assert!(!self.context.channel_state.is_monitor_update_in_progress());
 		assert!(!self.context.channel_state.is_quiescent());
@@ -8528,7 +8567,9 @@ where
 				return (None, htlcs_to_fail);
 			}
 
-			let mut additional_update = self.build_commitment_no_status_check(logger);
+			let mut additional_update = self
+				.build_commitment_no_status_check(logger)
+				.expect("Commitment mutation was checked before entering this path");
 			// build_commitment_no_status_check and get_update_fulfill_htlc may bump latest_monitor_id
 			// but we want them to be strictly increasing by one, so reset it here.
 			self.context.latest_monitor_update_id = monitor_update.update_id;
@@ -8573,6 +8614,7 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		if self.context.channel_state.is_quiescent() {
 			return Err(ChannelError::WarnAndDisconnect(
 				"Got revoke_and_ack message while quiescent".to_owned(),
@@ -8920,7 +8962,7 @@ where
 					// get_last_commitment_update_for_send(), which does not update state, but we're
 					// definitely now awaiting a remote revoke before we can step forward any more,
 					// so set it here.
-					let mut additional_update = self.build_commitment_no_status_check(logger);
+					let mut additional_update = self.build_commitment_no_status_check(logger)?;
 
 					// build_commitment_no_status_check may bump latest_monitor_id but we want them to be
 					// strictly increasing by one, so decrement it here.
@@ -9046,6 +9088,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context.check_ffor_local_mutation()?;
 		let signing_session =
 			if let Some(signing_session) = self.context.interactive_tx_signing_session.as_mut() {
 				if let Some(pending_splice) = self.pending_splice.as_ref() {
@@ -9146,6 +9189,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		let signing_session = if let Some(signing_session) =
 			self.context.interactive_tx_signing_session.as_mut()
 		{
@@ -9239,6 +9283,7 @@ where
 	) -> Option<msgs::UpdateFee>
 	where F::Target: FeeEstimator, L::Target: Logger
 	{
+		if self.context.is_ffor_frozen() { return None; }
 		if !self.funding.is_outbound() {
 			panic!("Cannot send fee from inbound channel");
 		}
@@ -9412,6 +9457,14 @@ where
 		assert!(self.context.channel_state.is_monitor_update_in_progress());
 		self.context.channel_state.clear_monitor_update_in_progress();
 		assert_eq!(self.blocked_monitor_updates_pending(), 0);
+		if self.context.is_ffor_frozen() {
+			return MonitorRestoreUpdates {
+				raa: None, commitment_update: None, commitment_order: self.context.resend_order.clone(),
+				accepted_htlcs: Vec::new(), failed_htlcs: Vec::new(), finalized_claimed_htlcs: Vec::new(),
+				pending_update_adds: Vec::new(), funding_broadcastable: None, channel_ready: None,
+				announcement_sigs: None, tx_signatures: None, channel_ready_order: ChannelReadyOrder::ChannelReadyFirst,
+			};
+		}
 
 		// If we're past (or at) the AwaitingChannelReady stage on an outbound (or V2-established) channel,
 		// try to (re-)broadcast the funding transaction as we may have declined to broadcast it when we
@@ -9538,6 +9591,7 @@ where
 	pub fn update_fee<F: Deref, L: Deref>(&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, msg: &msgs::UpdateFee, logger: &L) -> Result<(), ChannelError>
 		where F::Target: FeeEstimator, L::Target: Logger
 	{
+		self.context.check_ffor_mutation()?;
 		if self.funding.is_outbound() {
 			return Err(ChannelError::close("Non-funding remote tried to update channel fee".to_owned()));
 		}
@@ -9566,6 +9620,14 @@ where
 	pub fn signer_maybe_unblocked<L: Deref, CBP>(
 		&mut self, logger: &L, path_for_release_htlc: CBP
 	) -> SignerResumeUpdates where L::Target: Logger, CBP: Fn(u64) -> BlindedMessagePath {
+		if self.context.is_ffor_frozen() {
+			return SignerResumeUpdates {
+				commitment_update: None, revoke_and_ack: None, open_channel: None,
+				accept_channel: None, funding_created: None, funding_signed: None,
+				channel_ready: None, order: self.context.resend_order.clone(),
+				closing_signed: None, signed_closing_tx: None, shutdown_result: None,
+			};
+		}
 		if !self.holder_commitment_point.can_advance() {
 			log_trace!(logger, "Attempting to update holder per-commitment point...");
 			self.holder_commitment_point.try_resolve_pending(&self.context.holder_signer, &self.context.secp_ctx, logger);
@@ -9678,6 +9740,9 @@ where
 		L::Target: Logger,
 		CBP: Fn(u64) -> BlindedMessagePath,
 	{
+		if self.context.is_ffor_frozen() {
+			return None;
+		}
 		debug_assert!(
 			self.holder_commitment_point.next_transaction_number() <= INITIAL_COMMITMENT_NUMBER - 2
 		);
@@ -9736,6 +9801,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation().map_err(|_| ())?;
 		let mut update_add_htlcs = Vec::new();
 		let mut update_fulfill_htlcs = Vec::new();
 		let mut update_fail_htlcs = Vec::new();
@@ -9838,6 +9904,9 @@ where
 
 	/// Gets the `Shutdown` message we should send our peer on reconnect, if any.
 	pub fn get_outbound_shutdown(&self) -> Option<msgs::Shutdown> {
+		if self.context.is_ffor_frozen() {
+			return None;
+		}
 		if self.context.channel_state.is_local_shutdown_sent() {
 			assert!(self.context.shutdown_scriptpubkey.is_some());
 			Some(msgs::Shutdown {
@@ -9862,6 +9931,7 @@ where
 		NS::Target: NodeSigner,
 		CBP: Fn(u64) -> BlindedMessagePath
 	{
+		self.context.check_ffor_mutation()?;
 		if !self.context.channel_state.is_peer_disconnected() {
 			// While BOLT 2 doesn't indicate explicitly we should error this channel here, it
 			// almost certainly indicates we are going to end up out-of-sync in some way, so we
@@ -10312,6 +10382,9 @@ where
 	/// an Err if no progress is being made and the channel should be force-closed instead.
 	/// Should be called on a one-minute timer.
 	pub fn timer_check_closing_negotiation_progress(&mut self) -> Result<(), ChannelError> {
+		if self.context.is_ffor_frozen() {
+			return Ok(());
+		}
 		if self.closing_negotiation_ready() {
 			if self.context.closing_signed_in_flight {
 				return Err(ChannelError::close(
@@ -10331,6 +10404,9 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
+		if self.context.is_ffor_frozen() {
+			return Ok((None, None));
+		}
 		// If we're waiting on a monitor persistence, that implies we're also waiting to send some
 		// message to our counterparty (probably a `revoke_and_ack`). In such a case, we shouldn't
 		// initiate `closing_signed` negotiation until we're clear of all pending messages. Note
@@ -10415,6 +10491,7 @@ where
 		(Option<msgs::Shutdown>, Option<ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>),
 		ChannelError,
 	> {
+		self.context.check_ffor_mutation()?;
 		if self.context.channel_state.is_peer_disconnected() {
 			return Err(ChannelError::close(
 				"Peer sent shutdown when we needed a channel_reestablish".to_owned(),
@@ -10585,6 +10662,9 @@ where
 	where
 		L::Target: Logger,
 	{
+		if self.context.is_ffor_frozen() {
+			return None;
+		}
 		let sig = match &self.context.holder_signer {
 			ChannelSignerType::Ecdsa(ecdsa) => ecdsa
 				.sign_closing_transaction(
@@ -10647,6 +10727,7 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		if self.is_shutdown_pending_signature() {
 			return Err(ChannelError::Warn(String::from("Remote end sent us a closing_signed while fully shutdown and just waiting on the final closing signature")));
 		}
@@ -10970,6 +11051,12 @@ where
 	/// further blocked monitor update exists after the next.
 	pub fn unblock_next_blocked_monitor_update(&mut self) -> Option<(ChannelMonitorUpdate, bool)> {
 		if self.context.blocked_monitor_updates.is_empty() {
+			return None;
+		}
+		if !self
+			.context
+			.ffor_monitor_update_allowed(&self.context.blocked_monitor_updates[0].update)
+		{
 			return None;
 		}
 		Some((
@@ -11887,7 +11974,10 @@ where
 	/// May panic if called on a channel that wasn't immediately-previously
 	/// self.remove_uncommitted_htlcs_and_mark_paused()'d
 	#[rustfmt::skip]
-	fn get_channel_reestablish<L: Deref>(&mut self, logger: &L) -> msgs::ChannelReestablish where L::Target: Logger {
+	fn get_channel_reestablish<L: Deref>(&mut self, logger: &L) -> Result<msgs::ChannelReestablish, msgs::WarningMessage> where L::Target: Logger {
+		if self.context.is_ffor_frozen() {
+			return Err(msgs::WarningMessage { channel_id: self.context.channel_id(), data: ffor::FFOR_FROZEN_MESSAGE.to_owned() });
+		}
 		assert!(self.context.channel_state.is_peer_disconnected());
 		assert_ne!(self.context.counterparty_next_commitment_transaction_number, INITIAL_COMMITMENT_NUMBER);
 		// This is generally the first function which gets called on any given channel once we're
@@ -11912,7 +12002,7 @@ where
 			log_info!(logger, "Sending a data_loss_protect with no previous remote per_commitment_secret for channel {}", &self.context.channel_id());
 			[0;32]
 		};
-		msgs::ChannelReestablish {
+		Ok(msgs::ChannelReestablish {
 			channel_id: self.context.channel_id(),
 			// The protocol has two different commitment number concepts - the "commitment
 			// transaction number", which starts from 0 and counts up, and the "revocation key
@@ -11936,7 +12026,7 @@ where
 			my_current_per_commitment_point: dummy_pubkey,
 			next_funding: self.maybe_get_next_funding(),
 			my_current_funding_locked: self.maybe_get_my_current_funding_locked(),
-		}
+		})
 	}
 
 	/// Initiate splicing.
@@ -11951,6 +12041,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context.check_ffor_local_mutation()?;
 		if self.holder_commitment_point.current_point().is_none() {
 			return Err(APIError::APIMisuseError {
 				err: format!(
@@ -12113,6 +12204,7 @@ where
 	pub fn abandon_splice(
 		&mut self,
 	) -> Result<(msgs::TxAbort, Option<SpliceFundingFailed>), APIError> {
+		self.context.check_ffor_local_mutation()?;
 		if self.should_reset_pending_splice_state(false) {
 			let tx_abort =
 				msgs::TxAbort { channel_id: self.context.channel_id(), data: Vec::new() };
@@ -12139,6 +12231,7 @@ where
 	pub fn validate_splice_init(
 		&self, msg: &msgs::SpliceInit, our_funding_contribution: SignedAmount,
 	) -> Result<FundingScope, ChannelError> {
+		self.context.check_ffor_mutation()?;
 		if matches!(self.quiescent_action, Some(QuiescentAction::FFORReceiver(_))) {
 			return Err(ChannelError::WarnAndDisconnect(
 				"FFOR receiver owns this quiescence session".to_owned(),
@@ -12328,6 +12421,7 @@ where
 		ES::Target: EntropySource,
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		let our_funding_contribution = SignedAmount::from_sat(our_funding_contribution_satoshis);
 		let splice_funding = self.validate_splice_init(msg, our_funding_contribution)?;
 
@@ -12399,6 +12493,7 @@ where
 		ES::Target: EntropySource,
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		let splice_funding = self.validate_splice_ack(msg)?;
 
 		log_info!(
@@ -12448,6 +12543,7 @@ where
 	}
 
 	fn validate_splice_ack(&self, msg: &msgs::SpliceAck) -> Result<FundingScope, ChannelError> {
+		self.context.check_ffor_mutation()?;
 		// TODO(splicing): Add check that we are the splice (quiescence) initiator
 
 		let pending_splice = self
@@ -12554,6 +12650,7 @@ where
 		NS::Target: NodeSigner,
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		log_info!(
 			logger,
 			"Received splice_locked txid {} from our peer for channel {}",
@@ -12657,6 +12754,12 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
+		if self.context.is_ffor_frozen() {
+			return Err((
+				LocalHTLCFailureReason::ChannelNotReady,
+				ffor::FFOR_FROZEN_MESSAGE.to_owned(),
+			));
+		}
 		if !matches!(self.context.channel_state, ChannelState::ChannelReady(_))
 			|| self.context.channel_state.is_local_shutdown_sent()
 			|| self.context.channel_state.is_remote_shutdown_sent()
@@ -12783,7 +12886,8 @@ where
 	}
 
 	#[rustfmt::skip]
-	fn build_commitment_no_status_check<L: Deref>(&mut self, logger: &L) -> ChannelMonitorUpdate where L::Target: Logger {
+	fn build_commitment_no_status_check<L: Deref>(&mut self, logger: &L) -> Result<ChannelMonitorUpdate, ChannelError> where L::Target: Logger {
+		self.context.check_ffor_mutation()?;
 		log_trace!(logger, "Updating HTLC state for a newly-sent commitment_signed...");
 		// We can upgrade the status of some HTLCs that are waiting on a commitment, even if we
 		// fail to generate this, we still are at least at a position where upgrading their status
@@ -12876,7 +12980,7 @@ where
 			channel_id: Some(self.context.channel_id()),
 		};
 		self.context.channel_state.set_awaiting_remote_revoke();
-		monitor_update
+		Ok(monitor_update)
 	}
 
 	#[rustfmt::skip]
@@ -12916,6 +13020,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		self.context.check_ffor_mutation()?;
 		// Get the fee tests from `build_commitment_no_state_update`
 		#[cfg(any(test, fuzzing))]
 		self.build_commitment_no_state_update(funding, logger);
@@ -13003,7 +13108,7 @@ where
 		// All [`LocalHTLCFailureReason`] errors are temporary, so they are [`ChannelError::Ignore`].
 		let can_add_htlc = send_res.map_err(|(_, msg)| ChannelError::Ignore(msg))?;
 		if can_add_htlc {
-			let monitor_update = self.build_commitment_no_status_check(logger);
+			let monitor_update = self.build_commitment_no_status_check(logger)?;
 			self.monitor_updating_paused(false, true, false, Vec::new(), Vec::new(), Vec::new());
 			Ok(self.push_ret_blockable_mon_update(monitor_update))
 		} else {
@@ -13037,6 +13142,7 @@ where
 		(msgs::Shutdown, Option<ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>),
 		APIError,
 	> {
+		self.context.check_ffor_local_mutation()?;
 		if self.context.channel_state.is_local_stfu_sent()
 			|| self.context.channel_state.is_remote_stfu_sent()
 			|| self.context.channel_state.is_quiescent()
@@ -13184,6 +13290,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		if self.context.is_ffor_frozen() { return Err(ffor::FFOR_FROZEN_MESSAGE); }
 		log_debug!(logger, "Attempting to initiate quiescence");
 
 		if !self.context.is_usable() {
@@ -13223,6 +13330,7 @@ where
 	where
 		L::Target: Logger,
 	{
+		if self.context.is_ffor_frozen() { return Err(ffor::FFOR_FROZEN_MESSAGE); }
 		debug_assert!(!self.context.channel_state.is_local_stfu_sent());
 		debug_assert!(
 			self.context.channel_state.is_awaiting_quiescence()
@@ -13260,6 +13368,7 @@ where
 	pub fn stfu<L: Deref>(
 		&mut self, msg: &msgs::Stfu, logger: &L
 	) -> Result<Option<StfuResponse>, ChannelError> where L::Target: Logger {
+		self.context.check_ffor_mutation()?;
 		if self.context.channel_state.is_quiescent() {
 			return Err(ChannelError::Warn("Channel is already quiescent".to_owned()));
 		}
@@ -13372,6 +13481,9 @@ where
 	where
 		L::Target: Logger,
 	{
+		if self.context.is_ffor_frozen() {
+			return Ok(None);
+		}
 		// We must never see both stfu flags set, we always set the quiescent flag instead.
 		debug_assert!(
 			!(self.context.channel_state.is_local_stfu_sent()
@@ -16204,7 +16316,7 @@ mod tests {
 		// Now disconnect the two nodes and check that the commitment point in
 		// Node B's channel_reestablish message is sane.
 		assert!(node_b_chan.remove_uncommitted_htlcs_and_mark_paused(&&logger).is_ok());
-		let msg = node_b_chan.get_channel_reestablish(&&logger);
+		let msg = node_b_chan.get_channel_reestablish(&&logger).unwrap();
 		assert_eq!(msg.next_local_commitment_number, 1); // now called next_commitment_number
 		assert_eq!(msg.next_remote_commitment_number, 0); // now called next_revocation_number
 		assert_eq!(msg.your_last_per_commitment_secret, [0; 32]);
@@ -16212,7 +16324,7 @@ mod tests {
 		// Check that the commitment point in Node A's channel_reestablish message
 		// is sane.
 		assert!(node_a_chan.remove_uncommitted_htlcs_and_mark_paused(&&logger).is_ok());
-		let msg = node_a_chan.get_channel_reestablish(&&logger);
+		let msg = node_a_chan.get_channel_reestablish(&&logger).unwrap();
 		assert_eq!(msg.next_local_commitment_number, 1); // now called next_commitment_number
 		assert_eq!(msg.next_remote_commitment_number, 0); // now called next_revocation_number
 		assert_eq!(msg.your_last_per_commitment_secret, [0; 32]);

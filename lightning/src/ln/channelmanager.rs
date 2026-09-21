@@ -14288,6 +14288,11 @@ where
 				for (_, chan) in peer_state.channel_by_id.iter_mut() {
 					let logger = WithChannelContext::from(&self.logger, &chan.context(), None);
 					match chan.peer_connected_get_handshake(self.chain_hash, &&logger) {
+						ReconnectionMsg::FFORFrozen(msg) =>
+							pending_msg_events.push(MessageSendEvent::HandleError {
+								node_id: chan.context().get_counterparty_node_id(),
+								action: msgs::ErrorAction::DisconnectPeerWithWarning { msg },
+							}),
 						ReconnectionMsg::Reestablish(msg) =>
 							pending_msg_events.push(MessageSendEvent::SendChannelReestablish {
 								node_id: chan.context().get_counterparty_node_id(),
@@ -17168,7 +17173,7 @@ where
 			)?;
 			channel.ffor_validate_receiver_identity(our_network_pubkey, chain_hash)?;
 			if let Some(setup) = channel.ffor_receiver_setup_record()? {
-				ffor_channel_setups.push(setup);
+				ffor_channel_setups.push((setup, channel.ffor_receiver_fence()));
 			}
 			let logger = WithChannelContext::from(&args.logger, &channel.context, None);
 			let channel_id = channel.context.channel_id();
@@ -17570,10 +17575,12 @@ where
 		});
 		let ffor_recovery = ffor_recovery.unwrap_or_else(FFORRecoveryRegistry::new);
 		ffor_recovery.validate_identity(our_network_pubkey, chain_hash)?;
-		for setup in &ffor_channel_setups {
-			if !ffor_recovery.contains_exact(setup) {
-				return Err(DecodeError::InvalidValue);
-			}
+		for (setup, fence) in &ffor_channel_setups {
+			ffor_recovery.validate_channel_fence(setup, *fence)?;
+		}
+		for channel_id in ffor_recovery.activation_channels() {
+			let monitor = args.channel_monitors.get(&channel_id).ok_or(DecodeError::InvalidValue)?;
+			ffor_recovery.validate_activation_monitor(channel_id, &monitor.ffor_recovery_identity())?;
 		}
 		let mut decode_update_add_htlcs = decode_update_add_htlcs.unwrap_or_else(|| new_hash_map());
 		for peer in per_peer_state.values() {
@@ -18849,7 +18856,7 @@ where
 }
 
 #[cfg(test)]
-mod ffor_recovery_tests;
+pub(crate) mod ffor_recovery_tests;
 
 #[cfg(test)]
 mod tests {

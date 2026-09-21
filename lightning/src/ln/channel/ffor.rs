@@ -1,5 +1,6 @@
 use super::*;
 
+mod fence;
 mod quiescence;
 mod setup;
 use crate::ln::ffor::{
@@ -7,6 +8,8 @@ use crate::ln::ffor::{
 	FFORReceiverError, FFORReceiverStatus, FFORSettlementParty, FFORVoucher,
 	FFORVoucherCommitments, FFORVoucherFailure,
 };
+use fence::FFORReceiverFence;
+pub(crate) use fence::{FFORReceiverFencePhase, FFOR_FROZEN_MESSAGE};
 pub(crate) use quiescence::FFORReceiverQuiescence;
 #[cfg(test)]
 pub(crate) use setup::ffor_setup_test_messages;
@@ -19,6 +22,7 @@ pub(super) struct FFORReceiverBook {
 	received: Vec<FFORReceivedVoucher>,
 	abort_reason: Option<FFORReceiverAbortReason>,
 	setup: Option<FFORReceiverSetup>,
+	fence: Option<FFORReceiverFence>,
 }
 
 struct FFORReceivedVoucher {
@@ -38,11 +42,15 @@ impl_writeable_tlv_based!(FFORReceiverBook, {
 	(6, abort_reason, option),
 	// Readers predating authenticated setup must refuse this record.
 	(8, setup, option),
+	// A reader without the mutation fence must refuse this channel.
+	(10, fence, option),
 });
 
 impl FFORReceiverBook {
 	pub(super) fn abort(&mut self, reason: FFORReceiverAbortReason) {
-		self.abort_reason.get_or_insert(reason);
+		if self.fence.is_none() {
+			self.abort_reason.get_or_insert(reason);
+		}
 	}
 
 	pub(super) fn restored(
@@ -130,6 +138,7 @@ where
 			received: Vec::new(),
 			abort_reason: None,
 			setup: None,
+			fence: None,
 		});
 		Ok(())
 	}
@@ -182,6 +191,9 @@ where
 			self.context.ffor_receiver_book.as_mut().ok_or(FFORReceiverError::NotRegistered)?;
 		if book.epoch_id != epoch_id {
 			return Err(FFORReceiverError::UnknownEpoch);
+		}
+		if book.fence.is_some() {
+			return Err(FFORCommitmentError::PendingUpdates.into());
 		}
 		book.abort(FFORReceiverAbortReason::Requested);
 		Ok(())
@@ -298,7 +310,7 @@ where
 	{
 		self.ffor_abort_revealed_secret_reuse();
 		let book = match self.context.ffor_receiver_book.as_ref() {
-			Some(book) if book.abort_reason.is_some() => book,
+			Some(book) if book.abort_reason.is_some() && book.fence.is_none() => book,
 			_ => return,
 		};
 		let failures: Vec<_> = book

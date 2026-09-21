@@ -3,7 +3,9 @@ use crate::ln::channel::{ffor_setup_test_messages, DISCONNECT_PEER_AWAITING_RESP
 
 const EPOCH: [u8; 32] = [81; 32];
 
-fn register_signed(sender: &Node, receiver: &Node, channel_id: ChannelId, voucher: FFORVoucher) {
+pub(crate) fn register_signed(
+	sender: &Node, receiver: &Node, channel_id: ChannelId, voucher: FFORVoucher,
+) {
 	let (init, accept) = ffor_setup_test_messages(sender, receiver, channel_id, voucher);
 	let requirement = receiver
 		.node
@@ -21,7 +23,9 @@ fn register_signed(sender: &Node, receiver: &Node, channel_id: ChannelId, vouche
 	assert!(receiver.node.is_ffor_state_persisted(&requirement));
 }
 
-fn request(sender: &Node, receiver: &Node, channel_id: ChannelId) -> Result<(), FFORReceiverError> {
+pub(crate) fn request(
+	sender: &Node, receiver: &Node, channel_id: ChannelId,
+) -> Result<(), FFORReceiverError> {
 	receiver.node.request_ffor_receiver_quiescence(
 		&channel_id,
 		&sender.node.get_our_node_id(),
@@ -40,7 +44,7 @@ fn status(
 	)
 }
 
-fn complete_handshake(sender: &Node, receiver: &Node) {
+pub(crate) fn complete_handshake(sender: &Node, receiver: &Node) {
 	let receiver_id = receiver.node.get_our_node_id();
 	let sender_id = sender.node.get_our_node_id();
 	let proposed = get_event_msg!(receiver, MessageSendEvent::SendStfu, sender_id);

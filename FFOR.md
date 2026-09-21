@@ -1,4 +1,4 @@
-# Experimental FFOR receiver setup and parking
+# Experimental FFOR receiver setup, parking and activation guards
 
 This fork targets rust-lightning v0.2.5. The current APIs provide receiver voucher
 parking and point-in-time verification of both commitment views for FFOR Variant D.
@@ -79,10 +79,34 @@ Authenticated setup also enters a manager-owned recovery registry in required TL
 explicit closure, monitor-triggered closure and disposal of a stale manager channel.
 Restore reauthenticates records, checks the manager's identity and chain, and requires
 every retained channel setup to match its archive entry. The registry is bounded to
-64 records, 8 MiB total and 192 KiB per record; capacity is reserved before channel
-mutation. The setup-only archive version retains no activation or claim authority.
+64 records and 8 MiB total, with a 192 KiB setup-only record limit and a 384 KiB
+activation record limit. Capacity is reserved before channel mutation. An Activating
+record also reserves the maximum acknowledgement size, including framing, so other
+records cannot consume its eventual Active storage. This allowance is derived again
+on restore and released when the acknowledgement is retained. The setup-only archive
+version retains no activation or claim authority.
 Fully drained channel tombstones permit subsequent ordinary splicing while retaining
 the original funding context in their archive.
+
+Private activation records now retain the exact signed activate and acknowledgement
+messages, both commitment numbers and transaction IDs, monitor update identity,
+preparation height and the monitor's original sweep destination. They reauthenticate
+the historical transcript and permit only the first acknowledgement to be added.
+A versioned registry prevents setup-only readers from accepting activation evidence.
+Every retained channel fence must match its archive phase and activation hash, even
+when the live channel will be discarded as stale. Restore also requires the original
+monitor and checks both commitment identities, its destination and the saved update
+floor. A preimage or force-close update may advance that floor without changing the
+frozen commitments. The complete monitor remains necessary for signatures and claims.
+
+The private channel fence persists Activating or Active independently of stock STFU
+flags. It blocks ordinary HTLC updates, commitment and revocation messages, fees,
+splicing, cooperative close, signer retries and ordinary reconnect messages. Valid
+owned preimages still enter stock monitor persistence, including delayed writes and
+completion after channel removal. They cannot release an ordinary fulfill while the
+fence is held. Force-close remains available. A required even field makes older
+channel readers refuse fenced state. Installation currently exists only in tests;
+there is no production transition into these phases or recovery driver to leave them.
 
 These are consistency checks, not an authenticated storage envelope. Arbitrarily
 deleting a mismatching add's ownership record after abort can make its nonreserved
@@ -92,8 +116,8 @@ checks do not claim to detect every arbitrary alteration of local storage.
 Similarly, an archive without its original live channel cannot independently prove
 the historical funding context against arbitrary local storage alteration.
 
-No feature bit, wire activation, invoice readiness, commitment freeze, or automatic
-setup deadline is implemented here. The caller must abort a setup that times out.
+No feature bit, production wire activation, invoice readiness, authenticated
+reconnect driver or automatic setup deadline is implemented here. The caller must abort a setup that times out.
 Ordinary channel updates can invalidate a previously returned `Parked` proof.
 
 `NodeSigner::sign_ffor_message` supplies the protocol's single-SHA256 `ffor/msg`
@@ -139,13 +163,24 @@ partial rounds, delayed monitors, changed commitments, deadline equality, initia
 tie loss, pending abort, disconnect, restart and force-close. The ordinary
 quiescence and splice suites also pass with these channel changes.
 
+The private fence tests cover both phases and funding directions, restored pending
+state rejection, preimage retention, cleared STFU flags, signer and monitor callbacks,
+reconnect refusal and force-close. Activation recovery tests use real committed
+channels and signed transcripts, exercise retained evidence after closure, and reject
+missing monitors, mismatched commitment identities, downgrade attempts and substituted
+transcripts. Capacity tests reload a registry with competing admissions and retain a
+maximum signed acknowledgement from its reserved allowance.
+
 ## Next boundary
 
 Reusable epochs require durable retired epoch IDs and voucher hashes, with one
-current signed transcript record under the same channel authority. Activation must
-atomically verify commitment evidence, retain exact signed activation bytes beside
-the existing setup archive, and freeze ordinary mutations. Acknowledgement release
-and invoice eligibility must use the persistence-completion barrier and recheck the
-channel phase. The archive must be extended with active commitment and claim evidence
-for on-chain resolution, including witness and mailbox recovery. None of these later
-guarantees can be inferred from setup retention or parking.
+current signed transcript record under the same channel authority. A production
+activation owner must derive and sign the exact transcript from owned quiescence,
+atomically install its archive and fence, and release wire only after the manager
+persistence barrier completes. Acknowledgement handling must authenticate the peer,
+retain Active evidence and recheck the channel phase before reporting durability.
+Reconnect needs the Variant D state comparison and acknowledgement-loss recovery;
+ordinary channel traffic must remain frozen throughout. Witness/mailbox recovery,
+preimage reconciliation, controlled voucher drain and invoice eligibility remain
+separate required boundaries. None can be inferred from a retained setup or the
+private activation fixtures.

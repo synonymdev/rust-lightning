@@ -7,7 +7,7 @@ use lightning_ffor::wire::{Accept, Header, Init, Message, Payload, Tlv, MAX_MESS
 
 use crate::chain::transaction::OutPoint;
 
-struct Fixture {
+pub(super) struct Fixture {
 	init_wire: Vec<u8>,
 	accept_wire: Vec<u8>,
 	receiver: PublicKey,
@@ -38,7 +38,7 @@ impl_writeable_tlv_based!(Fixture, {
 });
 
 impl Fixture {
-	fn record(&self) -> FFORReceiverSetup {
+	pub(super) fn record(&self) -> FFORReceiverSetup {
 		FFORReceiverSetup::read(&mut &self.encode()[..]).unwrap()
 	}
 }
@@ -47,7 +47,7 @@ fn key(value: u8) -> PublicKey {
 	PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[value; 32]).unwrap())
 }
 
-fn sign(message: &mut Message, value: u8) {
+pub(super) fn sign(message: &mut Message, value: u8) {
 	message.signature = Secp256k1::new()
 		.sign_ecdsa(
 			&SecpMessage::from_digest(message.signature_digest().unwrap()),
@@ -68,7 +68,7 @@ fn message(header: Header, payload: Payload, signer: u8, maximum_size: bool) -> 
 	message
 }
 
-fn fixture(identity: u8, maximum_size: bool) -> Fixture {
+pub(super) fn fixture(identity: u8, maximum_size: bool) -> Fixture {
 	let header = Header { channel_id: [identity; 32], epoch_id: [identity.wrapping_add(1); 32] };
 	let count = if maximum_size { 483 } else { 2 };
 	let init = message(
@@ -124,7 +124,7 @@ fn fixture(identity: u8, maximum_size: bool) -> Fixture {
 
 fn stored(record: FFORReceiverSetup) -> StoredSetup {
 	let book = record.validate_recovery().unwrap().canonical_book().to_vec();
-	StoredSetup { setup: record, canonical_book: book }
+	StoredSetup { setup: record, canonical_book: book, activation: None }
 }
 
 fn frame(records: &[Vec<u8>]) -> Vec<u8> {
@@ -166,6 +166,7 @@ fn ffor_recovery_roundtrip_retains_exact_signed_setup_and_native_identity() {
 	assert_eq!(restored.encode(), encoded);
 	assert!(restored.contains_exact(&record));
 	assert_eq!(restored.encoded_bytes, encoded.len());
+	assert_eq!(restored.reserved_ack_bytes, 0);
 	assert!(restored.validate_identity(record.receiver(), record.chain_hash()).is_ok());
 	assert_eq!(
 		restored.validate_identity(key(43), record.chain_hash()),
@@ -292,7 +293,7 @@ fn ffor_recovery_reader_refuses_future_schema_missing_fields_and_truncation() {
 		assert!(decode(&framed[..length]).is_err(), "accepted prefix {}", length);
 	}
 	let mut future = framed.clone();
-	future[0] = 1;
+	future[0] = 2;
 	assert!(matches!(decode(&future), Err(DecodeError::UnknownRequiredFeature)));
 	// Empty TLV records omit both mandatory fields.
 	assert!(decode(&frame(&[vec![0]])).is_err());
@@ -311,6 +312,7 @@ fn ffor_recovery_reader_bounds_declared_counts_and_lengths_before_reading_record
 	}
 	let mut registry = FFORRecoveryRegistry::new();
 	registry.encoded_bytes = MAX_ENCODED_BYTES;
-	assert_eq!(registry.check_capacity(0), Err(FFORRecoveryError::CapacityExceeded));
-	assert_eq!(registry.check_capacity(usize::MAX), Err(FFORRecoveryError::CapacityExceeded));
+	assert_eq!(registry.check_capacity(0, 0), Err(FFORRecoveryError::CapacityExceeded));
+	assert_eq!(registry.check_capacity(usize::MAX, 0), Err(FFORRecoveryError::CapacityExceeded));
+	assert_eq!(registry.check_capacity(0, usize::MAX), Err(FFORRecoveryError::CapacityExceeded));
 }

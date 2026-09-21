@@ -288,12 +288,27 @@ pub struct FFORMonitorSnapshot {
 	pub(crate) channel_id: ChannelId,
 	pub(crate) funding_txo: OutPoint,
 	pub(crate) update_id: u64,
+	pub(crate) destination_script: bitcoin::ScriptBuf,
 	pub(crate) holder: HolderCommitmentTransaction,
 	pub(crate) holder_number: u64,
 	pub(crate) counterparty_txid: Txid,
 	pub(crate) counterparty_number: u64,
 	pub(crate) counterparty_htlcs: Vec<HTLCOutputInCommitment>,
 	pub(crate) revoked_through: u64,
+}
+
+/// Internal recovery identity captured under one monitor lock, including after force-close.
+/// This is distinct from a live activation snapshot and carries no readiness authority.
+#[derive(Clone)]
+pub(crate) struct FFORMonitorRecoveryIdentity {
+	pub(crate) channel_id: ChannelId,
+	pub(crate) funding_txo: OutPoint,
+	pub(crate) update_id: u64,
+	pub(crate) holder_number: u64,
+	pub(crate) holder_txid: Txid,
+	pub(crate) counterparty_number: u64,
+	pub(crate) counterparty_txid: Option<Txid>,
+	pub(crate) destination_script: bitcoin::ScriptBuf,
 }
 
 pub(crate) fn validate_vouchers(vouchers: &[FFORVoucher]) -> Result<(), FFORCommitmentError> {

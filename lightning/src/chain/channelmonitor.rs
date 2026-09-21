@@ -2135,6 +2135,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 			channel_id: inner.channel_id(),
 			funding_txo: inner.get_funding_txo(),
 			update_id: inner.latest_update_id,
+			destination_script: inner.destination_script.clone(),
 			holder: inner.funding.current_holder_commitment_tx.clone(),
 			holder_number: inner.current_holder_commitment_number,
 			counterparty_txid,
@@ -2142,6 +2143,22 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 			counterparty_htlcs: htlcs.iter().map(|(htlc, _)| htlc.clone()).collect(),
 			revoked_through: inner.commitment_secrets.get_min_seen_secret(),
 		})
+	}
+
+	/// The frozen archive must match the actual monitor, even when force-close prevents obtaining
+	/// a live activation snapshot. Preimage and close updates may advance only the monitor update ID.
+	pub(crate) fn ffor_recovery_identity(&self) -> crate::ln::ffor::FFORMonitorRecoveryIdentity {
+		let inner = self.inner.lock().unwrap();
+		crate::ln::ffor::FFORMonitorRecoveryIdentity {
+			channel_id: inner.channel_id(),
+			funding_txo: inner.get_funding_txo(),
+			update_id: inner.latest_update_id,
+			holder_number: inner.current_holder_commitment_number,
+			holder_txid: inner.funding.current_holder_commitment_tx.trust().txid(),
+			counterparty_number: inner.current_counterparty_commitment_number,
+			counterparty_txid: inner.funding.current_counterparty_commitment_txid,
+			destination_script: inner.destination_script.clone(),
+		}
 	}
 
 	/// Gets the funding transaction outpoint of the channel this ChannelMonitor is monitoring for.
