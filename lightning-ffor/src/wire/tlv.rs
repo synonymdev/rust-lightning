@@ -2,38 +2,38 @@ use alloc::vec::Vec;
 
 use super::{Tlv, WireError, MAX_MESSAGE_LEN, MAX_TLV_COUNT};
 
-pub(super) struct Reader<'a> {
+pub(crate) struct Reader<'a> {
 	remaining: &'a [u8],
 }
 
 impl<'a> Reader<'a> {
-	pub(super) fn new(bytes: &'a [u8]) -> Self {
+	pub(crate) fn new(bytes: &'a [u8]) -> Self {
 		Self { remaining: bytes }
 	}
 
-	pub(super) fn take(&mut self, size: usize) -> Result<&'a [u8], WireError> {
+	pub(crate) fn take(&mut self, size: usize) -> Result<&'a [u8], WireError> {
 		let value = self.remaining.get(..size).ok_or(WireError::Truncated)?;
 		self.remaining = &self.remaining[size..];
 		Ok(value)
 	}
 
-	pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
+	pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
 		self.take(N)?.try_into().map_err(|_| WireError::Truncated)
 	}
 
-	pub(super) fn u8(&mut self) -> Result<u8, WireError> {
+	pub(crate) fn u8(&mut self) -> Result<u8, WireError> {
 		Ok(self.array::<1>()?[0])
 	}
-	pub(super) fn u16(&mut self) -> Result<u16, WireError> {
+	pub(crate) fn u16(&mut self) -> Result<u16, WireError> {
 		Ok(u16::from_be_bytes(self.array()?))
 	}
-	pub(super) fn u32(&mut self) -> Result<u32, WireError> {
+	pub(crate) fn u32(&mut self) -> Result<u32, WireError> {
 		Ok(u32::from_be_bytes(self.array()?))
 	}
-	pub(super) fn u64(&mut self) -> Result<u64, WireError> {
+	pub(crate) fn u64(&mut self) -> Result<u64, WireError> {
 		Ok(u64::from_be_bytes(self.array()?))
 	}
-	pub(super) fn is_empty(&self) -> bool {
+	pub(crate) fn is_empty(&self) -> bool {
 		self.remaining.is_empty()
 	}
 
@@ -51,7 +51,7 @@ impl<'a> Reader<'a> {
 	}
 }
 
-pub(super) fn read_tlvs(reader: &mut Reader<'_>) -> Result<Vec<Tlv>, WireError> {
+pub(crate) fn read_tlvs(reader: &mut Reader<'_>) -> Result<Vec<Tlv>, WireError> {
 	let mut entries = Vec::new();
 	let mut last = None;
 	while !reader.is_empty() {
@@ -70,16 +70,16 @@ pub(super) fn read_tlvs(reader: &mut Reader<'_>) -> Result<Vec<Tlv>, WireError> 
 	Ok(entries)
 }
 
-pub(super) fn required(entries: &mut Vec<Tlv>, kind: u64) -> Result<Vec<u8>, WireError> {
+pub(crate) fn required(entries: &mut Vec<Tlv>, kind: u64) -> Result<Vec<u8>, WireError> {
 	optional(entries, kind).ok_or(WireError::MissingTlv(kind))
 }
 
-pub(super) fn optional(entries: &mut Vec<Tlv>, kind: u64) -> Option<Vec<u8>> {
+pub(crate) fn optional(entries: &mut Vec<Tlv>, kind: u64) -> Option<Vec<u8>> {
 	let position = entries.iter().position(|entry| entry.kind == kind)?;
 	Some(entries.remove(position).value)
 }
 
-pub(super) fn check_extensions(entries: &[Tlv]) -> Result<(), WireError> {
+pub(crate) fn check_extensions(entries: &[Tlv]) -> Result<(), WireError> {
 	if entries.len() > MAX_TLV_COUNT {
 		return Err(WireError::SizeLimit);
 	}
@@ -104,26 +104,26 @@ pub(super) fn check_extensions(entries: &[Tlv]) -> Result<(), WireError> {
 	Ok(())
 }
 
-pub(super) struct Writer(pub(super) Vec<u8>);
+pub(crate) struct Writer(pub(crate) Vec<u8>);
 
 impl Writer {
-	pub(super) fn new() -> Self {
+	pub(crate) fn new() -> Self {
 		Self(Vec::new())
 	}
-	pub(super) fn put(&mut self, bytes: &[u8]) -> Result<(), WireError> {
+	pub(crate) fn put(&mut self, bytes: &[u8]) -> Result<(), WireError> {
 		if bytes.len() > MAX_MESSAGE_LEN - self.0.len() {
 			return Err(WireError::SizeLimit);
 		}
 		self.0.extend_from_slice(bytes);
 		Ok(())
 	}
-	pub(super) fn u16(&mut self, value: u16) -> Result<(), WireError> {
+	pub(crate) fn u16(&mut self, value: u16) -> Result<(), WireError> {
 		self.put(&value.to_be_bytes())
 	}
-	pub(super) fn u32(&mut self, value: u32) -> Result<(), WireError> {
+	pub(crate) fn u32(&mut self, value: u32) -> Result<(), WireError> {
 		self.put(&value.to_be_bytes())
 	}
-	pub(super) fn u64(&mut self, value: u64) -> Result<(), WireError> {
+	pub(crate) fn u64(&mut self, value: u64) -> Result<(), WireError> {
 		self.put(&value.to_be_bytes())
 	}
 
@@ -146,7 +146,7 @@ impl Writer {
 	}
 }
 
-pub(super) fn write_tlvs(
+pub(crate) fn write_tlvs(
 	writer: &mut Writer, known: Vec<Tlv>, extensions: &[Tlv],
 ) -> Result<(), WireError> {
 	check_extensions(extensions)?;
@@ -165,6 +165,6 @@ pub(super) fn write_tlvs(
 	Ok(())
 }
 
-pub(super) fn fixed<const N: usize>(value: Vec<u8>, kind: u64) -> Result<[u8; N], WireError> {
+pub(crate) fn fixed<const N: usize>(value: Vec<u8>, kind: u64) -> Result<[u8; N], WireError> {
 	value.try_into().map_err(|_| WireError::InvalidTlv(kind))
 }

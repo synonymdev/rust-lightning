@@ -371,3 +371,24 @@ proptest! {
 		prop_assert_eq!(setup.validate_activation(&activation, [9; 32], 990), Err(SetupError::Transcript));
 	}
 }
+
+#[test]
+fn close_intent_requires_receiver_signature_exact_epoch_and_activation() {
+	let setup = setup();
+	let hash = [21; 32];
+	let close = message(Payload::Close(hash), 42);
+	assert_eq!(setup.validate_close(&close, hash), Ok(()));
+	assert_eq!(setup.validate_close(&close, [22; 32]), Err(SetupError::Transcript));
+	assert!(setup.validate_close(&message(Payload::Close(hash), 43), hash).is_err());
+	let mut wrong_epoch = close.clone();
+	wrong_epoch.header.epoch_id[0] ^= 1;
+	sign(&mut wrong_epoch, 42);
+	assert_eq!(setup.validate_close(&wrong_epoch, hash), Err(SetupError::Identity));
+	assert_eq!(
+		setup.validate_close(&message(Payload::ActivateAck(hash), 42), hash),
+		Err(SetupError::MessageType)
+	);
+	let mut modified = close;
+	modified.extensions.push(Tlv { kind: 103, value: vec![1] });
+	assert!(setup.validate_close(&modified, hash).is_err());
+}

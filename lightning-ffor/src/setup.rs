@@ -252,6 +252,21 @@ impl AuthenticatedSetup {
 		}
 	}
 
+	/// Authenticate the receiver's close intent against this setup and its accepted activation.
+	///
+	/// This only verifies signed intent. The engine must retain it durably before sending,
+	/// and wait for the settlement peer's signed acknowledgement before removing vouchers.
+	pub fn validate_close(
+		&self, message: &Message, activation_hash: Digest,
+	) -> Result<(), SetupError> {
+		self.authenticate(message, &self.receiver)?;
+		match message.payload {
+			Payload::Close(hash) if hash == activation_hash => Ok(()),
+			Payload::Close(_) => Err(SetupError::Transcript),
+			_ => Err(SetupError::MessageType),
+		}
+	}
+
 	/// Verify close accounting and every disclosed preimage against this signed book.
 	///
 	/// An unset bit never permits discarding a preimage learned from another source. Retain

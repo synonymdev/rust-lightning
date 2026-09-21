@@ -90,7 +90,7 @@ The standalone [fuzz target](fuzz/README.md) exercises parsing, canonical round 
 signatures and authenticated setup with real signed fixture seeds. A bounded local
 run completed 6,359,059 inputs in 121 seconds without a crash; a run including the
 reconnect parser completed 2,118,228 inputs in 31 seconds without a crash. The current
-suite has 66 tests and four doctests. Nightly LLVM instrumentation measured 865/892
+suite at that checkpoint had 66 tests and four doctests. Nightly LLVM instrumentation measured 865/892
 source lines (96.97%) and 198/200 branches (99.00%) covered across this crate. Uncovered
 code includes diagnostic formatting and defensive paths whose preconditions are
 excluded by prior validated bounds. These are measured results, not exhaustive
@@ -170,7 +170,7 @@ fee funding. No production window or witness deployment is chosen by this crate.
 
 ## Receiver witness provisioning primitives
 
-The `witness` module implements only version 1/D-R manifest construction, receiver-side
+The `witness` module implements version 1/D-R manifest construction, receiver-side
 decoding against `AuthenticatedSetup`, fetch-key signature authentication, and Appendix F.1
 `ff_witness_provision`/`ff_witness_ack`. It reuses the authenticated canonical book and transcript
 hashes. Timestamp-style voucher expiries, short retention, mismatched setup/book/activation
@@ -191,7 +191,7 @@ supply transport identity from its actual handshake, persist registration keys a
 manifest before sending, persist the correlated acknowledgement, and bind it to the engine's
 current ACTIVE epoch before any invoice use. The protocol object cannot establish those facts,
 or that a witness will honor its promise. Missing/failed/short acknowledgements remain incomplete.
-Fetch/receipt decryption, witness selection and invoice paths, durable receiver recovery, and a
+Receipt decryption, witness selection and invoice paths, durable receiver recovery, and a
 witness service remain outside this slice.
 
 `tests/data/beignet-witness.json` is generated from Beignet `8aee31d1` using its actual manifest
@@ -200,6 +200,56 @@ key material. `generate_beignet_witness.cjs` verifies the source revision and re
 Appendix D input digest. The fixtures are new cross-implementation examples, not published
 Appendix F vectors. Focused tests cover exact bytes, all truncated prefixes, signature domains,
 retention/height bounds, maximum books, connection changes, retries and bounded arbitrary input.
+
+## Witness fetch and opaque encrypted records
+
+Appendix F.1 types 55059 and 55061 have bounded canonical codecs. `UnsignedFetch` supplies
+the digest for an external fetch-key signer; `SignedFetch` verifies a compact low-S signature.
+The exact signature domain is a single SHA256 of `ffor/witness/fetch`, mailbox ID, nonce and
+the trailing TLV stream. Neither request ID nor wire type is signed. TLV 1 is the two-byte
+pagination slot; unknown odd fields are preserved, while unknown even fields, duplicates,
+nonminimal BigSize values and malformed known lengths fail. A first page with no TLVs
+retains the older unpaged digest exactly. Absence and an explicit zero cursor stay distinct.
+
+`PendingFetch<C>` retains the exact request, signed manifest and actual expected connection.
+It checks the echoed request ID and authenticated transport source before checking each
+record against the provisioned witness, mailbox, H_act, encryption key and canonical book
+entry. `CheckedFetchPage<C>` exposes only authenticated opaque encrypted records. Its next
+request must use the returned cursor and a new request ID and nonce. Slots strictly increase,
+continuation must equal the final returned slot and remain below K, and traversal is capped
+at K pages. Already returned pages remain available if a later page fails. The caller must
+ensure mailbox-wide nonce freshness across traversals and restarts; the witness must
+durably refuse reused nonces. Noise identity routes replies but never authorizes mailbox access.
+
+Version 1 records have a 235-byte header, a compact low-S witness signature over the single
+SHA256 domain `ffor/witness/record`, a 191-byte ciphertext and bounded opaque guardian
+attachments. Record parsing rejects unsupported version/profile/flags, malformed points,
+incorrect ciphertext hashes, invalid signatures, truncated fields and extra bytes. Guardian
+attachments are outside the signature and provide no proof of payment or storage. Record
+retrieval remains possible after voucher expiry and therefore has no current-height gate.
+
+There is no Rust ECIES decryptor in this checkpoint. A witness can sign ciphertext with an
+invalid AEAD tag or false plaintext; successful metadata authentication does not prove that
+a payment occurred. A future decryptor must authenticate ChaCha20-Poly1305 and validate
+the epoch, slot, payment hash, amount, expiry, deadline and actual preimage before crediting
+or claiming a voucher. The reference uses SHA256 of the **compressed** ECDH shared point
+once, then HKDF-SHA256 extract/expand with empty salt and `ffor/witness/body` as info.
+The nonce is 12 zero bytes, the Poly1305 tag is appended, and AAD is the exact header with
+only its final ciphertext-hash field zeroed. Applying another SHA256 to the reference
+ECDH helper's output would derive the wrong key.
+
+`generate_beignet_witness_fetch.cjs` regenerates `beignet-witness-fetch.json` from pinned
+Beignet and the six public Appendix D setups. Deterministic fixture keys and ephemeral
+keys are public test inputs only. The generator invokes the actual reference codecs and
+encryption helper, verifies witness signatures, decrypts every generated record and checks
+the published preimages. Rust tests independently compare bytes, domains, AAD and the
+secp256k1 ECDH hash, but do not perform decryption. The existing witness fuzz target also
+checks these new codecs and is seeded with requests, pages and signed encrypted records.
+
+The fetch checkpoint passes 88 tests and five doctests, no_std, all-target Clippy with
+warnings denied, and actual Rust 1.63 checks with and without std. The seeded witness fuzz
+target completed 1,431,038 inputs in 31 seconds without a crash. These bounded checks do
+not establish successful decryption, runtime storage safety or offline invoice readiness.
 
 The requested settlement baseline is LND v0.21.3-beta. LND implementation work is
 kept local. This unpublished workspace crate does not change a binding version or

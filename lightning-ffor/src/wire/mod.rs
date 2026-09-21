@@ -14,7 +14,7 @@
 mod codec;
 mod lifecycle;
 mod setup;
-mod tlv;
+pub(crate) mod tlv;
 mod types;
 
 use alloc::vec::Vec;

@@ -10,6 +10,9 @@ use lightning_ffor::witness::{
 use proptest::prelude::*;
 use serde::Deserialize;
 
+#[path = "witness/fetch.rs"]
+mod fetch;
+
 fn hex(value: &str) -> Vec<u8> {
 	(0..value.len()).step_by(2).map(|i| u8::from_str_radix(&value[i..i + 2], 16).unwrap()).collect()
 }

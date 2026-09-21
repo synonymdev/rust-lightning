@@ -1,4 +1,4 @@
-//! Receiver-side D-R manifest and provisioning primitives from section 9.6 and Appendix F.1.
+//! Receiver-side D-R provisioning, fetch and opaque record primitives from section 9.6/Appendix F.
 //!
 //! A manifest proves fetch-key control and agreement with a supplied authenticated setup. A
 //! checked acknowledgement only correlates a response with one immutable provisioning request.
@@ -8,6 +8,9 @@
 //! Version 1/profile 1 manifests and the two provisioning messages define no extension stream.
 //! Decoders reject every trailing byte, unknown version/profile, and noncanonical success flag.
 //! Refusal text is bounded opaque bytes and need not be UTF-8.
+//! Fetch messages preserve canonical unknown odd TLVs and reject unknown even fields. Records
+//! define no extension stream and reject reserved flags. Authenticated encrypted records prove
+//! their witness signature and manifest binding only: no AEAD or plaintext verification exists.
 //!
 //! ```
 //! use lightning_ffor::witness::{Acknowledgement, AcknowledgementResult};
@@ -24,17 +27,29 @@ use bitcoin::secp256k1::PublicKey;
 use crate::transcript::SignatureError;
 
 mod correlation;
+mod fetch;
+mod fetch_correlation;
 mod manifest;
 mod messages;
+mod record;
 
 pub use correlation::{CheckedAcknowledgement, PendingProvision, WitnessConnection};
+pub use fetch::{FetchParameters, FetchResponse, FetchResult, SignedFetch, UnsignedFetch};
+pub use fetch_correlation::{CheckedFetchPage, PendingFetch};
 pub use manifest::{ManifestParameters, SignedManifest, UnsignedManifest};
 pub use messages::{Acknowledgement, AcknowledgementResult, Provision};
+pub use record::{
+	AuthenticatedEncryptedRecord, EncryptedRecord, RecordHeader, CIPHERTEXT_LEN, RECORD_HEADER_LEN,
+};
 
 /// Appendix F.1 receiver-to-witness provisioning message, including its two-byte type.
 pub const PROVISION_MESSAGE_TYPE: u16 = 55055;
 /// Appendix F.1 witness-to-receiver provisioning acknowledgement.
 pub const ACK_MESSAGE_TYPE: u16 = 55057;
+/// Appendix F.1 signed mailbox fetch request.
+pub const FETCH_MESSAGE_TYPE: u16 = 55059;
+/// Appendix F.1 paginated encrypted-record response.
+pub const FETCH_RESPONSE_MESSAGE_TYPE: u16 = 55061;
 /// Minimum promised record retention beyond voucher expiry, in blocks.
 pub const RETENTION_MARGIN_BLOCKS: u32 = 144;
 /// BOLT 8's plaintext limit, including the two-byte message type.
@@ -47,7 +62,7 @@ pub enum WitnessError {
 	Truncated,
 	/// A message exceeds the bounded BOLT 8 envelope.
 	SizeLimit,
-	/// The wire type is outside the two supported provisioning messages.
+	/// The wire type is outside the supported witness request/response codecs.
 	MessageType,
 	/// Only manifest version 1 is supported.
 	Version,
@@ -57,7 +72,7 @@ pub enum WitnessError {
 	NonCanonical,
 	/// A compressed secp256k1 public key is invalid.
 	PublicKey,
-	/// The supplied fetch-key signature does not authenticate the exact manifest.
+	/// A compact low-S fetch-key or witness signature is invalid for the exact signed bytes.
 	Signature(SignatureError),
 	/// The manifest differs from the authenticated setup's canonical book.
 	Book,
@@ -73,13 +88,25 @@ pub enum WitnessError {
 	Connection,
 	/// The actual response peer or acknowledgement names another witness.
 	Witness,
-	/// The witness explicitly refused the provisioning request.
+	/// The witness explicitly refused the pending request.
 	Refused,
+	/// A canonical trailing TLV stream is invalid.
+	Tlv(crate::wire::WireError),
+	/// The encrypted record's declared ciphertext hash does not match its bytes.
+	Ciphertext,
+	/// A signed record names another mailbox or encryption key.
+	Mailbox,
+	/// The slot or canonical book entry differs from this manifest.
+	Terms,
+	/// A response is unordered, repeats a slot, or has an invalid pagination cursor.
+	Pagination,
+	/// A request identifier or nonce was already used in this bounded fetch traversal.
+	Replay,
 }
 
 impl fmt::Display for WitnessError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "invalid FFOR witness provisioning: {self:?}")
+		write!(f, "invalid FFOR witness data: {self:?}")
 	}
 }
 
@@ -89,6 +116,12 @@ impl std::error::Error for WitnessError {}
 impl From<SignatureError> for WitnessError {
 	fn from(error: SignatureError) -> Self {
 		Self::Signature(error)
+	}
+}
+
+impl From<crate::wire::WireError> for WitnessError {
+	fn from(error: crate::wire::WireError) -> Self {
+		Self::Tlv(error)
 	}
 }
 
