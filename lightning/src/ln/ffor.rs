@@ -25,6 +25,12 @@ use crate::prelude::*;
 use crate::sign::{NodeSigner, Recipient};
 use crate::types::payment::PaymentHash;
 
+mod driver;
+pub use driver::{FFORReceiverId, FFORReceiverParameters, FFORReceiverProgress};
+
+mod connection;
+pub use connection::FFORPeerConnection;
+
 pub(crate) mod context;
 pub use context::{FFORReceiverActiveContext, FFORReceiverRecoveryContext};
 
@@ -76,6 +82,8 @@ pub enum FFORReceiverAbortReason {
 	CommitmentSecretReused,
 	/// The owned quiescence handshake no longer matched its voucher evidence or deadline.
 	QuiescenceFailed,
+	/// A pending setup received incompatible, malformed, or refused protocol input.
+	SetupRejected,
 }
 
 impl_writeable_tlv_based_enum!(FFORReceiverAbortReason,
@@ -85,6 +93,7 @@ impl_writeable_tlv_based_enum!(FFORReceiverAbortReason,
 	(6, Restarted) => {},
 	(8, CommitmentSecretReused) => {},
 	(10, QuiescenceFailed) => {},
+	(12, SetupRejected) => {},
 );
 
 /// State of the receiver's experimental, connection-scoped STFU handshake.

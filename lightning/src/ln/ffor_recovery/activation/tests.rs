@@ -352,6 +352,7 @@ fn ffor_activation_archive_reserves_maximum_ack_through_competing_admission_and_
 	// A snapshot cannot bypass the reservation by declaring only its smaller current wire size.
 	let (extra_setup, extra_activation) = evidence_for_identity(91, true);
 	let extra = crate::ln::ffor_recovery::Entry::new(crate::ln::ffor_recovery::StoredSetup {
+		request: None,
 		canonical_book: extra_setup.validate_recovery().unwrap().canonical_book().to_vec(),
 		setup: extra_setup,
 		activation: Some(extra_activation),

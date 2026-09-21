@@ -11,12 +11,15 @@ use lightning_ffor::wire::{Activate, Message as FFORMessage, Payload};
 
 mod close;
 mod context;
+mod driver;
 mod reestablish;
 
 struct RuntimeEntry {
 	key: FFORRecoveryKey,
 	requirement: FFORPersistenceRequirement,
 	may_send_activate: bool,
+	request_connection: Option<crate::ln::ffor::FFORPeerConnection>,
+	may_send_init: bool,
 }
 
 /// Bounded by the retained registry's keys. No bytes or phase authority are copied here.
@@ -33,7 +36,12 @@ impl FFORReceiverRuntime {
 		recovery: &FFORRecoveryRegistry, barrier: &mut FFORPersistenceBarrier,
 	) -> Result<Self, DecodeError> {
 		let mut runtime = Self::new();
-		let keys = recovery.activation_keys();
+		let mut keys = recovery.activation_keys();
+		for key in recovery.request_keys() {
+			if !keys.contains(&key) {
+				keys.push(key);
+			}
+		}
 		if !keys.is_empty() {
 			let requirement = barrier.request().map_err(|_| DecodeError::InvalidValue)?;
 			for key in keys {
@@ -54,7 +62,13 @@ impl FFORReceiverRuntime {
 		&mut self, key: FFORRecoveryKey, requirement: FFORPersistenceRequirement,
 		may_send_activate: bool,
 	) {
-		let entry = RuntimeEntry { key, requirement, may_send_activate };
+		let entry = RuntimeEntry {
+			key,
+			requirement,
+			may_send_activate,
+			request_connection: None,
+			may_send_init: false,
+		};
 		if let Some(existing) = self.entries.iter_mut().find(|existing| existing.key == key) {
 			*existing = entry;
 		} else {

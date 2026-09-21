@@ -10,6 +10,9 @@ use lightning_ffor::book::{validate_anchor_book, AnchorChannelLimits};
 use lightning_ffor::setup::AuthenticatedSetup;
 use lightning_ffor::wire::{Message, Payload, MAX_MESSAGE_LEN};
 
+mod request;
+pub(crate) use request::FFORReceiverRequest;
+
 // This experimental admission path scans shachain under the channel lock. Older histories
 // require a future durable digest index; refuse them before doing unbounded work.
 const MAX_SETUP_COMMITMENT_HISTORY: u64 = 4096;
@@ -241,7 +244,23 @@ where
 				cltv_expiry: voucher.expiry,
 			})
 			.collect();
-		self.register_ffor_receiver_book(setup.header().epoch_id, &vouchers)?;
+		if let Some(book) = self.context.ffor_receiver_book.as_ref() {
+			let request = book.request.as_ref().ok_or(FFORReceiverError::AlreadyRegistered)?;
+			if !request.validates_setup(&record)
+				|| book.abort_reason.is_some()
+				|| book.setup.is_some()
+				|| !book.received.is_empty()
+				|| book.request_gate_released.unwrap_or(false)
+			{
+				return Err(invalid_setup());
+			}
+			self.check_ffor_synchronized()?;
+			self.ffor_validate_request(true).map_err(|_| invalid_setup())?;
+			verification::validate_vouchers(&vouchers)?;
+			self.context.ffor_receiver_book.as_mut().unwrap().vouchers = vouchers;
+		} else {
+			self.register_ffor_receiver_book(setup.header().epoch_id, &vouchers)?;
+		}
 		self.context.ffor_receiver_book.as_mut().unwrap().setup = Some(record);
 		Ok(())
 	}
@@ -342,6 +361,11 @@ where
 	pub(crate) fn ffor_validate_receiver_identity(
 		&self, our_node_id: PublicKey, chain_hash: ChainHash,
 	) -> Result<(), DecodeError> {
+		if let Some(request) = self.ffor_receiver_request() {
+			if request.receiver() != our_node_id || request.chain_hash() != chain_hash {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
 		if let Some(record) =
 			self.context.ffor_receiver_book.as_ref().and_then(|book| book.setup.as_ref())
 		{
@@ -366,6 +390,7 @@ where
 	}
 
 	pub(crate) fn ffor_validate_receiver_setup(&self) -> Result<(), DecodeError> {
+		self.ffor_validate_request(false)?;
 		let book = match self.context.ffor_receiver_book.as_ref() {
 			Some(book) => book,
 			None => return Ok(()),

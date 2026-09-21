@@ -4,9 +4,41 @@ This fork targets rust-lightning v0.2.5. The current APIs provide receiver vouch
 parking and verification of both commitment views for FFOR Variant D. Private manager
 transitions compose activation, reconnect, pre-active abort and cooperative voucher drain
 with ordered storage.
-No production transport or invoice API exposes those transitions yet.
+An experimental public setup facade now owns pre-init admission and synchronous
+Accept processing. No production transport or invoice API exposes the complete
+activation and recovery path yet.
 
-`register_ffor_receiver_setup` authenticates exact signed init and accept messages
+`prepare_ffor_receiver` checks the current authenticated native peer generation,
+derives a fresh protocol epoch and signs the exact Init. Before any bytes leave,
+it installs a channel-owned interception gate and reserves bounded recovery storage.
+`advance_ffor_receiver` releases those bytes only after the ordered manager write
+completes, the original connection remains current and the settlement deadline has
+not passed. Backpressure preserves the exact retry; successful queue insertion
+consumes this one-shot send. Disconnect and restart never replay Init.
+
+The application's stable `local_request_id` is local correlation, not a protocol
+epoch or channel authority. An exact retry returns the retained native selector;
+changed channel, peer or policy is refused. A bounded historical lookup recovers
+that selector after restart or live-channel removal without granting permission
+to send or expose an invoice.
+
+The peer may send ordinary voucher adds immediately after Accept.
+`handle_ffor_receiver_message` therefore processes Accept synchronously under the
+native peer lock before custom message handling returns. It installs exact voucher
+ownership before those adds arrive. A pre-Accept add is intercepted and aborts
+negotiation; it can never be relabelled by a later Accept. If a crash leaves newer
+monitor state beside the durable pre-init manager, stock stale-manager recovery
+can force-close without exposing an ordinary claimable or forwarded payment.
+
+The custom handler captures `FFORPeerConnection` only after the native successful
+peer-connected callback and pairs it with its own transport generation. It must not
+hold a transport mutex across a manager call. The release callback runs under native
+authority and may only check its paired token and insert into a bounded queue.
+Malformed or contradictory setup, cancellation, disconnect and restart retain the
+interception gate. Controlled release requires durable abort state and a fresh
+connection, preserving the permanent request and any accepted voucher tombstones.
+
+The lower-level `register_ffor_receiver_setup` authenticates exact signed init and accept messages
 against the manager's actual node identity, chain and current height. It checks the
 empty, connected, synchronized anchor channel, funding terms, commitment number,
 exact next incoming HTLC ID, fees, dust and reserves before installing the book.
@@ -21,9 +53,10 @@ watcher-free eligibility. The setup remains ineligible for offline invoices.
 
 `register_ffor_receiver_book` is the lower-level experimental parking API. It checks
 the public book's structural invariants and exact first incoming HTLC ID, but does
-not retain signed setup evidence and cannot authorize later activation. Both APIs
-request manager persistence without waiting for a durable write. The application
-must persist registration before allowing the settlement peer to send vouchers.
+not retain signed setup evidence and cannot authorize later activation. Both
+low-level registration APIs require an external barrier preventing peer adds until
+registration is durable. The wire protocol provides no post-Accept barrier, so an
+operational receiver must use the pre-init facade instead.
 
 Registration returns an opaque persistence requirement. The background processor
 captures a token before encoding the manager and completes it only after its
@@ -86,7 +119,11 @@ activation record limit. Capacity is reserved before channel mutation. An Activa
 record reserves its maximum acknowledgement, both maximum close messages and final
 completion evidence, including framing, so competing admissions cannot consume its
 remaining transition storage. Each later phase retains the allowance for its remaining
-transitions, recomputed on restore. A terminal abort releases that reservation.
+transitions, recomputed on restore. Legacy registrations release that reservation
+on terminal abort. Facade requests reserve the full 512 KiB record allowance before
+Init and retain it after promotion into accepted setup. Pending requests and their
+local retry identity use archive version 4 and required even channel fields; they
+share the same global count and byte limits with accepted records.
 The setup-only archive version retains no activation or claim authority.
 Fully drained channel tombstones permit subsequent ordinary splicing while retaining
 the original funding context in their archive.
@@ -203,8 +240,9 @@ checks do not claim to detect every arbitrary alteration of local storage.
 Similarly, an archive without its original live channel cannot independently prove
 the historical funding context against arbitrary local storage alteration.
 
-No feature bit, production custom-message transport, invoice readiness or automatic
-setup deadline is implemented here. The caller must abort a setup that times out.
+No feature bit, production custom-message transport, invoice readiness or background
+deadline service is implemented here. The facade rechecks the deadline before Init
+release and Accept processing; the caller must also cancel a stalled setup.
 Ordinary channel updates can invalidate a previously returned `Parked` proof.
 
 `NodeSigner::sign_ffor_message` supplies the protocol's single-SHA256 `ffor/msg`
@@ -281,6 +319,14 @@ metadata while preserving maximum-message transition capacity through competing 
 Read-only context tests cover both funders, absent ACK, pending and current persistence,
 foreign/restored manager rejection, offline Active observation, conflicting reconnect,
 and stable historical binding through close and archive-only force-close recovery.
+
+The setup facade tests use real two-node channels in both funding directions. They
+cover pending or failed storage, exact backpressure retries, synchronous Accept followed
+immediately by stock voucher frames, and a crash after monitor persistence but before
+accepted-manager persistence. Other cases cover pre-Accept adds, contradictory signed
+replies, deadline crossing, retry identity after restore, missing archive evidence,
+capacity refusal, witness policy, cancellation and normal payment after controlled
+gate release on a fresh connection.
 
 Native witness tests use four pinned Beignet records to compare ECDH, HKDF, plaintext and
 preimages; they reject signed ciphertext, ephemeral-key, AAD, manifest and plaintext-term

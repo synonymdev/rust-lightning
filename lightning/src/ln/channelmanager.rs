@@ -1646,6 +1646,8 @@ where
 	/// [`BaseMessageHandler::peer_connected`] and no corresponding
 	/// [`BaseMessageHandler::peer_disconnected`].
 	pub is_connected: bool,
+	/// Transient authenticated generation. Never persisted or numerically reused.
+	ffor_connection: Option<Arc<()>>,
 	/// Holds the peer storage data for the channel partner on a per-peer basis.
 	peer_storage: Vec<u8>,
 }
@@ -4362,8 +4364,11 @@ where
 	/// `claim_margin_blocks` is local deployment policy and must not come from the peer. Invalid
 	/// signatures, incompatible terms, or unsupported channel history leave the book unregistered.
 	///
-	/// Await the returned persistence requirement before telling the peer to send vouchers. This
-	/// retains setup evidence but does not activate or freeze the channel, or authorize an invoice.
+	/// This low-level method requires an external barrier preventing peer HTLCs before registration.
+	/// The wire protocol has no post-Accept barrier; operational callers must instead stage native
+	/// pre-init admission with `prepare_ffor_receiver` and process Accept synchronously with
+	/// `handle_ffor_receiver_message`. This retains setup evidence but does not activate or freeze
+	/// the channel, or authorize an invoice.
 	/// The same abort, restart and one-registration limits as [`Self::register_ffor_receiver_book`]
 	/// apply. Raw-book registration does not supply the authenticated evidence retained here.
 	pub fn register_ffor_receiver_setup(
@@ -14090,6 +14095,7 @@ where
 	fn peer_disconnected(&self, counterparty_node_id: PublicKey) {
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
 			let mut splice_failed_events = Vec::new();
+			let mut ffor_persist = false;
 			let mut failed_channels: Vec<(Result<Infallible, _>, _)> = Vec::new();
 			let mut per_peer_state = self.per_peer_state.write().unwrap();
 			let remove_peer = {
@@ -14101,6 +14107,7 @@ where
 				if let Some(peer_state_mutex) = per_peer_state.get(&counterparty_node_id) {
 					let mut peer_state_lock = peer_state_mutex.lock().unwrap();
 					let peer_state = &mut *peer_state_lock;
+					ffor_persist = self.ffor_receiver_setup_disconnected(peer_state);
 					let pending_msg_events = &mut peer_state.pending_msg_events;
 					peer_state.channel_by_id.retain(|_, chan| {
 						let logger = WithChannelContext::from(&self.logger, &chan.context(), None);
@@ -14194,6 +14201,7 @@ where
 					});
 					debug_assert!(peer_state.is_connected, "A disconnected peer cannot disconnect");
 					peer_state.is_connected = false;
+					peer_state.ffor_connection = None;
 					peer_state.ok_to_remove(true)
 				} else { debug_assert!(false, "Unconnected peer disconnected"); true }
 			};
@@ -14202,7 +14210,7 @@ where
 			}
 			mem::drop(per_peer_state);
 
-			let persist = if splice_failed_events.is_empty() {
+			let persist = if splice_failed_events.is_empty() && !ffor_persist {
 				NotifyOption::SkipPersistHandleEvents
 			} else {
 				let mut pending_events = self.pending_events.lock().unwrap();
@@ -14256,6 +14264,7 @@ where
 							actions_blocking_raa_monitor_updates: BTreeMap::new(),
 							closed_channel_monitor_update_ids: BTreeMap::new(),
 							is_connected: true,
+							ffor_connection: Some(Arc::new(())),
 							peer_storage: Vec::new(),
 						}));
 					},
@@ -14277,6 +14286,7 @@ where
 
 						debug_assert!(!peer_state.is_connected, "A peer shouldn't be connected twice");
 						peer_state.is_connected = true;
+						peer_state.ffor_connection = Some(Arc::new(()));
 					},
 				}
 			}
@@ -17162,10 +17172,12 @@ where
 			closed_channel_monitor_update_ids: BTreeMap::new(),
 			peer_storage: Vec::new(),
 			is_connected: false,
+			ffor_connection: None,
 		};
 
 		let mut failed_htlcs = Vec::new();
 		let mut ffor_channel_setups = Vec::new();
+		let mut ffor_channel_requests = Vec::new();
 		let channel_count: u64 = Readable::read(reader)?;
 		let mut channel_id_set = hash_set_with_capacity(cmp::min(channel_count as usize, 128));
 		let mut per_peer_state = hash_map_with_capacity(cmp::min(
@@ -17185,6 +17197,9 @@ where
 				),
 			)?;
 			channel.ffor_validate_receiver_identity(our_network_pubkey, chain_hash)?;
+			if let Some(request) = channel.ffor_receiver_request() {
+				ffor_channel_requests.push(request.clone());
+			}
 			if let Some(setup) = channel.ffor_receiver_setup_record()? {
 				ffor_channel_setups.push((
 					setup,
@@ -17597,6 +17612,11 @@ where
 		let mut ffor_persistence = FFORPersistenceBarrier::new();
 		let ffor_activation = FFORReceiverRuntime::restored(&ffor_recovery, &mut ffor_persistence)?;
 		ffor_recovery.validate_identity(our_network_pubkey, chain_hash)?;
+		for request in &ffor_channel_requests {
+			if !ffor_recovery.contains_request(request) {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
 		for (setup, fence, abort_reason, drain, completion, drain_hash) in &ffor_channel_setups {
 			ffor_recovery.validate_channel_lifecycle(
 				setup,

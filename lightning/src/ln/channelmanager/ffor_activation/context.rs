@@ -25,6 +25,32 @@ where
 	MR::Target: MessageRouter,
 	L::Target: Logger,
 {
+	/// Capture the generation of an already-authenticated native peer connection.
+	///
+	/// The custom message handler calls this after its native `peer_connected` callback succeeds.
+	/// Supply the result with exact incoming bytes to synchronous receiver handling. A transport
+	/// queue must retain its own connection token as well; this observation alone cannot authorize
+	/// a future queue insertion. Disconnected, rejected and restored peers have no generation.
+	pub fn ffor_peer_connection(
+		&self, counterparty_node_id: &PublicKey,
+	) -> Result<crate::ln::ffor::FFORPeerConnection, FFORReceiverError> {
+		let peers = self.per_peer_state.read().unwrap();
+		let peer = peers
+			.get(counterparty_node_id)
+			.ok_or(FFORCommitmentError::ChannelUnavailable)?
+			.lock()
+			.unwrap();
+		if !peer.is_connected {
+			return Err(FFORCommitmentError::ChannelUnavailable.into());
+		}
+		let generation =
+			peer.ffor_connection.as_ref().ok_or(FFORCommitmentError::ChannelUnavailable)?;
+		Ok(crate::ln::ffor::FFORPeerConnection {
+			peer: *counterparty_node_id,
+			generation: Arc::clone(generation),
+		})
+	}
+
 	/// Return authenticated historical activation evidence, including an archive-only epoch.
 	/// This neither requires nor establishes current Active authority or durable readiness.
 	pub fn ffor_receiver_recovery_context(

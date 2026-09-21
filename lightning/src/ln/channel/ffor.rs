@@ -19,7 +19,7 @@ pub(crate) use quiescence::FFORReceiverQuiescence;
 pub(crate) use reestablish::FFORReestablishOutcome;
 #[cfg(test)]
 pub(crate) use setup::ffor_setup_test_messages;
-pub(crate) use setup::FFORReceiverSetup;
+pub(crate) use setup::{FFORReceiverRequest, FFORReceiverSetup};
 
 /// Channel-owned identity survives the stock inbound HTLC's transition to `Committed`.
 pub(super) struct FFORReceiverBook {
@@ -30,6 +30,8 @@ pub(super) struct FFORReceiverBook {
 	setup: Option<FFORReceiverSetup>,
 	fence: Option<FFORReceiverFence>,
 	drain: Option<FFORReceiverDrain>,
+	request: Option<FFORReceiverRequest>,
+	request_gate_released: Option<bool>,
 }
 
 struct FFORReceivedVoucher {
@@ -53,6 +55,9 @@ impl_writeable_tlv_based!(FFORReceiverBook, {
 	(10, fence, option),
 	// Older readers must not discard drain ownership or a completed epoch tombstone.
 	(12, drain, option),
+	// Pre-init interception must never be discarded by older readers.
+	(14, request, option),
+	(16, request_gate_released, option),
 });
 
 impl FFORReceiverBook {
@@ -65,7 +70,26 @@ impl FFORReceiverBook {
 	pub(super) fn restored(
 		&mut self, inbound_htlcs: &[InboundHTLCOutput],
 	) -> Result<(), DecodeError> {
-		verification::validate_vouchers(&self.vouchers).map_err(|_| DecodeError::InvalidValue)?;
+		if self.request_gate_released == Some(false)
+			|| (self.request_gate_released.is_some() && self.request.is_none())
+		{
+			return Err(DecodeError::InvalidValue);
+		}
+		if self.vouchers.is_empty() {
+			let request = self.request.as_ref().ok_or(DecodeError::InvalidValue)?;
+			let message = request.validate_recovery()?;
+			if self.setup.is_some()
+				|| self.fence.is_some()
+				|| self.drain.is_some()
+				|| message.header.epoch_id != self.epoch_id
+				|| (!self.received.is_empty() && self.abort_reason.is_none())
+			{
+				return Err(DecodeError::InvalidValue);
+			}
+		} else {
+			verification::validate_vouchers(&self.vouchers)
+				.map_err(|_| DecodeError::InvalidValue)?;
+		}
 		let mut ids = alloc::collections::BTreeSet::new();
 		if self.received.len() > 483
 			|| self.received.iter().any(|received| !ids.insert(received.voucher.htlc_id))
@@ -102,7 +126,8 @@ impl FFORReceiverBook {
 				{
 					return Err(DecodeError::InvalidValue);
 				}
-			} else if (self.abort_reason.is_none() && !self.is_closed())
+			} else if (self.request.is_some() && !self.request_gate_released.unwrap_or(false))
+				|| (self.abort_reason.is_none() && !self.is_closed())
 				|| self.vouchers.iter().any(|voucher| voucher.payment_hash == htlc.payment_hash)
 			{
 				// Never restore a live voucher whose channel-owned interception record was lost.
@@ -149,6 +174,8 @@ where
 			setup: None,
 			fence: None,
 			drain: None,
+			request: None,
+			request_gate_released: None,
 		});
 		Ok(())
 	}
@@ -174,6 +201,9 @@ where
 					FFORReceiverStatus::Aborted { reason }
 				},
 			);
+		}
+		if book.setup.is_none() && book.request.is_some() {
+			return Err(FFORCommitmentError::PendingUpdates.into());
 		}
 		let parked = book.received.iter().filter(|received| received.failure.is_some()).count();
 		if parked != book.vouchers.len() {
@@ -202,7 +232,7 @@ where
 		if book.epoch_id != epoch_id {
 			return Err(FFORReceiverError::UnknownEpoch);
 		}
-		if book.fence.is_some() {
+		if book.fence.is_some() || book.request.is_some() {
 			return Err(FFORCommitmentError::PendingUpdates.into());
 		}
 		book.abort(FFORReceiverAbortReason::Requested);
@@ -233,7 +263,11 @@ where
 		});
 		let reserved_hash =
 			book.vouchers.iter().any(|voucher| voucher.payment_hash == msg.payment_hash);
-		if (book.abort_reason.is_some() || book.is_closed()) && !reserved_hash && !owned_pending {
+		if (book.abort_reason.is_some() || book.is_closed())
+			&& !reserved_hash
+			&& !owned_pending
+			&& !(book.request.is_some() && !book.request_gate_released.unwrap_or(false))
+		{
 			return;
 		}
 		let voucher = FFORVoucher {

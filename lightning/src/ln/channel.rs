@@ -104,7 +104,7 @@ mod ffor;
 pub(crate) use ffor::ffor_setup_test_messages;
 pub(crate) use ffor::{
 	ffor_drain_completion_digest, FFORReceiverDrainCompletion, FFORReceiverFencePhase,
-	FFORReceiverSetup, FFORReestablishOutcome,
+	FFORReceiverRequest, FFORReceiverSetup, FFORReestablishOutcome,
 };
 
 #[cfg(any(test, feature = "_test_utils"))]

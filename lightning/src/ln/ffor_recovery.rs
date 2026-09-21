@@ -4,6 +4,9 @@
 //! TLV 22, under the same consistency lock as channel admission and persistence. Admission uses
 //! a borrowed insertion permit so capacity failure cannot leave a channel without its evidence.
 
+mod request;
+use request::PendingRequest;
+
 mod activation;
 pub(crate) use activation::{FFORReceiverActivation, FFORReceiverCloseRecord};
 
@@ -24,6 +27,7 @@ const ACTIVATION_VERSION: u8 = 1;
 // Earlier activation readers do not understand a retained abort or its relaxed monitor binding.
 const ABORTED_ACTIVATION_VERSION: u8 = 2;
 const CLOSE_VERSION: u8 = 3;
+const REQUEST_VERSION: u8 = 4;
 const MAX_RECORDS: usize = 64;
 const MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
 // Two maximum wire messages, a 483-slot canonical book, and fixed admission fields fit here.
@@ -56,12 +60,14 @@ struct StoredSetup {
 	setup: FFORReceiverSetup,
 	canonical_book: Vec<u8>,
 	activation: Option<FFORReceiverActivation>,
+	request: Option<crate::ln::channel::FFORReceiverRequest>,
 }
 
 impl_writeable_tlv_based!(StoredSetup, {
 	(0, setup, required),
 	(2, canonical_book, required_vec),
 	(4, activation, option),
+	(6, request, option),
 });
 
 struct Entry {
@@ -74,6 +80,10 @@ impl Entry {
 	fn new(record: StoredSetup) -> Result<Self, FFORRecoveryError> {
 		let authenticated =
 			record.setup.validate_recovery().map_err(|_| FFORRecoveryError::InvalidRecord)?;
+		if record.request.as_ref().map_or(false, |request| !request.validates_setup(&record.setup))
+		{
+			return Err(FFORRecoveryError::InvalidRecord);
+		}
 		if record.canonical_book != authenticated.canonical_book() {
 			return Err(FFORRecoveryError::InvalidRecord);
 		}
@@ -112,6 +122,9 @@ impl Entry {
 	}
 
 	fn transition_reservation(record: &StoredSetup) -> usize {
+		if record.request.is_some() {
+			return MAX_RECORD_BYTES.saturating_sub(record.serialized_length());
+		}
 		let activation = match &record.activation {
 			Some(activation) if !activation.is_aborted() => activation,
 			_ => return 0,
@@ -138,6 +151,7 @@ impl Entry {
 
 pub(crate) struct FFORRecoveryRegistry {
 	entries: Vec<Entry>,
+	pending_requests: Vec<PendingRequest>,
 	encoded_bytes: usize,
 	// Derived from authenticated phases, never serialized or supplied by a caller.
 	reserved_transition_bytes: usize,
@@ -178,11 +192,16 @@ impl FFORRecoveryUpgrade<'_> {
 
 impl FFORRecoveryRegistry {
 	pub(crate) fn new() -> Self {
-		Self { entries: Vec::new(), encoded_bytes: HEADER_BYTES, reserved_transition_bytes: 0 }
+		Self {
+			entries: Vec::new(),
+			pending_requests: Vec::new(),
+			encoded_bytes: HEADER_BYTES,
+			reserved_transition_bytes: 0,
+		}
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
-		self.entries.is_empty()
+		self.entries.is_empty() && self.pending_requests.is_empty()
 	}
 
 	pub(crate) fn get(&self, key: &FFORRecoveryKey) -> Option<&FFORReceiverSetup> {
@@ -332,7 +351,9 @@ impl FFORRecoveryRegistry {
 	pub(crate) fn validate_identity(
 		&self, receiver: PublicKey, chain_hash: ChainHash,
 	) -> Result<(), DecodeError> {
-		if self.entries.iter().any(|entry| {
+		if self.pending_requests.iter().any(|entry| {
+			entry.record.receiver() != receiver || entry.record.chain_hash() != chain_hash
+		}) || self.entries.iter().any(|entry| {
 			entry.record.setup.receiver() != receiver
 				|| entry.record.setup.chain_hash() != chain_hash
 		}) {
@@ -353,7 +374,15 @@ impl FFORRecoveryRegistry {
 			setup: setup.clone(),
 			canonical_book: authenticated.canonical_book().to_vec(),
 			activation: None,
+			request: None,
 		})?;
+		if self.pending_requests.iter().any(|pending| {
+			pending.key.channel_id == entry.key.channel_id
+				|| (pending.record.chain_hash() == setup.chain_hash()
+					&& pending.record.funding_txo() == setup.funding_txo())
+		}) {
+			return Err(FFORRecoveryError::ConflictingRecord);
+		}
 		if let Some(existing) =
 			self.entries.iter().find(|existing| existing.has_same_identity(&entry))
 		{
@@ -374,10 +403,16 @@ impl FFORRecoveryRegistry {
 	) -> Result<FFORRecoveryUpgrade<'_>, FFORRecoveryError> {
 		let authenticated =
 			setup.validate_recovery().map_err(|_| FFORRecoveryError::InvalidRecord)?;
+		let key = FFORRecoveryKey {
+			channel_id: ChannelId(authenticated.header().channel_id),
+			epoch_id: authenticated.header().epoch_id,
+		};
+		let request = self.get_request(&key).cloned();
 		let entry = Entry::new(StoredSetup {
 			setup: setup.clone(),
 			canonical_book: authenticated.canonical_book().to_vec(),
 			activation: Some(activation.clone()),
+			request,
 		})?;
 		let index = self
 			.entries
@@ -418,6 +453,11 @@ impl FFORRecoveryRegistry {
 	}
 
 	fn version(&self) -> u8 {
+		if !self.pending_requests.is_empty()
+			|| self.entries.iter().any(|entry| entry.record.request.is_some())
+		{
+			return REQUEST_VERSION;
+		}
 		if self.entries.iter().any(|entry| {
 			entry
 				.record
@@ -450,7 +490,7 @@ impl FFORRecoveryRegistry {
 			.and_then(|total| total.checked_add(record_bytes))
 			.and_then(|total| total.checked_add(self.reserved_transition_bytes))
 			.and_then(|total| total.checked_add(reserved_transition_bytes));
-		if self.entries.len() >= MAX_RECORDS
+		if self.entries.len() + self.pending_requests.len() >= MAX_RECORDS
 			|| record_bytes > MAX_RECORD_BYTES
 			|| total.map_or(true, |total| total > MAX_ENCODED_BYTES)
 		{
@@ -468,6 +508,13 @@ impl Writeable for FFORRecoveryRegistry {
 			(entry.encoded_bytes as u32).write(writer)?;
 			entry.record.write(writer)?;
 		}
+		if self.version() == REQUEST_VERSION {
+			(self.pending_requests.len() as u16).write(writer)?;
+			for entry in &self.pending_requests {
+				(entry.encoded_bytes as u32).write(writer)?;
+				entry.record.write(writer)?;
+			}
+		}
 		Ok(())
 	}
 }
@@ -479,6 +526,7 @@ impl Readable for FFORRecoveryRegistry {
 			&& version != ACTIVATION_VERSION
 			&& version != ABORTED_ACTIVATION_VERSION
 			&& version != CLOSE_VERSION
+			&& version != REQUEST_VERSION
 		{
 			return Err(DecodeError::UnknownRequiredFeature);
 		}
@@ -487,6 +535,9 @@ impl Readable for FFORRecoveryRegistry {
 			return Err(DecodeError::InvalidValue);
 		}
 		let mut registry = Self::new();
+		if version == REQUEST_VERSION {
+			registry.encoded_bytes += 2;
+		}
 		for _ in 0..count {
 			let length = u32::read(reader)? as usize;
 			if version == SETUP_ONLY_VERSION && length > MAX_SETUP_RECORD_BYTES {
@@ -501,7 +552,9 @@ impl Readable for FFORRecoveryRegistry {
 			let entry = Entry::new(record).map_err(|_| DecodeError::InvalidValue)?;
 			// Reject ignored storage extensions and alternate framing as well as duplicate keys.
 			// Exact signed optional wire extensions remain inside the retained message bytes.
-			if entry.encoded_bytes != length
+			if entry.record.request.as_ref().map_or(false, |request| {
+				registry.find_request(request.local_request_id()).is_some()
+			}) || entry.encoded_bytes != length
 				|| registry.entries.iter().any(|existing| existing.has_same_identity(&entry))
 			{
 				return Err(DecodeError::InvalidValue);
@@ -512,6 +565,43 @@ impl Readable for FFORRecoveryRegistry {
 			registry.encoded_bytes += RECORD_LENGTH_BYTES + length;
 			registry.reserved_transition_bytes += entry.reserved_transition_bytes();
 			registry.entries.push(entry);
+		}
+		if version == REQUEST_VERSION {
+			let count = u16::read(reader)? as usize;
+			if registry.entries.len() + count > MAX_RECORDS {
+				return Err(DecodeError::InvalidValue);
+			}
+			for _ in 0..count {
+				let length = u32::read(reader)? as usize;
+				if length > MAX_SETUP_RECORD_BYTES {
+					return Err(DecodeError::InvalidValue);
+				}
+				let mut bounded = FixedLengthReader::new(reader, length as u64);
+				let request = crate::ln::channel::FFORReceiverRequest::read(&mut bounded)?;
+				if bounded.bytes_remain() {
+					return Err(DecodeError::InvalidValue);
+				}
+				let entry = PendingRequest::new(request).map_err(|_| DecodeError::InvalidValue)?;
+				if registry.find_request(entry.record.local_request_id()).is_some()
+					|| entry.encoded_bytes != length
+					|| registry.pending_requests.iter().any(|saved| {
+						saved.key.channel_id == entry.key.channel_id
+							|| (saved.record.chain_hash() == entry.record.chain_hash()
+								&& saved.record.funding_txo() == entry.record.funding_txo())
+					}) || registry.entries.iter().any(|saved| {
+					saved.key.channel_id == entry.key.channel_id
+						|| (saved.record.setup.chain_hash() == entry.record.chain_hash()
+							&& saved.record.setup.funding_txo() == entry.record.funding_txo())
+				}) {
+					return Err(DecodeError::InvalidValue);
+				}
+				registry
+					.check_capacity(length, entry.reserved_bytes())
+					.map_err(|_| DecodeError::InvalidValue)?;
+				registry.encoded_bytes += RECORD_LENGTH_BYTES + length;
+				registry.reserved_transition_bytes += entry.reserved_bytes();
+				registry.pending_requests.push(entry);
+			}
 		}
 		if registry.version() != version {
 			return Err(DecodeError::InvalidValue);
