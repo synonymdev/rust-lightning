@@ -2145,6 +2145,35 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		})
 	}
 
+	/// Observe one authenticated witness preimage in this monitor, including after force-close.
+	///
+	/// Drop every monitor guard before passing the result to
+	/// [`ChannelManager::import_ffor_receiver_witness_receipt`]. This captures in-memory state;
+	/// only that manager call can check matching native ownership and outstanding persistence.
+	/// A pending splice is conservatively refused so original funding cannot be substituted.
+	///
+	/// [`ChannelManager::import_ffor_receiver_witness_receipt`]: crate::ln::channelmanager::ChannelManager::import_ffor_receiver_witness_receipt
+	pub fn ffor_witness_receipt_snapshot(
+		&self, receipt: &crate::ln::ffor::FFORWitnessReceipt,
+	) -> Result<crate::ln::ffor::FFORWitnessMonitorSnapshot, FFORCommitmentError> {
+		let inner = self.inner.lock().unwrap();
+		if !inner.pending_funding.is_empty() {
+			return Err(FFORCommitmentError::PendingUpdates);
+		}
+		let payment_hash = PaymentHash(receipt.body().payment_hash());
+		Ok(crate::ln::ffor::FFORWitnessMonitorSnapshot {
+			channel_id: inner.channel_id(),
+			funding_txo: inner.get_funding_txo(),
+			counterparty: inner.counterparty_node_id,
+			update_id: inner.latest_update_id,
+			payment_hash,
+			known_preimage: inner
+				.payment_preimages
+				.get(&payment_hash)
+				.map_or(false, |(preimage, _)| preimage.0 == receipt.body().preimage()),
+		})
+	}
+
 	/// The frozen archive must match the actual monitor, even when force-close prevents obtaining
 	/// a live activation snapshot. Preimage and close updates may advance only the monitor update ID.
 	pub(crate) fn ffor_recovery_identity(&self) -> crate::ln::ffor::FFORMonitorRecoveryIdentity {

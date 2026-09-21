@@ -241,7 +241,7 @@ HKDF-SHA256 and ChaCha20-Poly1305 implementations to verify the key, associated 
 authentication tag before exposing a receipt. Its Debug output redacts the preimage.
 Witness observation amounts and timestamps carry no payment authority. This helper
 borrows the caller's epoch key; protected key storage, durable receipt retention and
-monitor reconciliation remain runtime responsibilities.
+invoking native monitor reconciliation remain runtime responsibilities.
 
 Public read-only receiver contexts let an application join protected records to native
 history. Historical contexts expose authenticated setup, exact activation messages,
@@ -277,6 +277,28 @@ a fresh manager write and rejects an earlier instance's context. Historical regi
 metadata remains inspectable after close or force-close, so missing sidecar keys cannot
 be treated as permission to create a replacement selection. No invoice authority follows.
 
+`ChannelMonitor::ffor_witness_receipt_snapshot` captures opaque evidence for one verified
+receipt. The caller must drop its monitor guard before passing that snapshot, the receipt
+and its historical context to `import_ffor_receiver_witness_receipt`. The manager checks
+the original funding output, channel, settlement identity, canonical slot/hash/amount/D/E
+and registered witness/mailbox/encryption key under the native peer and archive locks.
+Receipt recovery remains valid after deadlines, disconnection, conflicting reports and
+channel removal. Missing monitor ownership, stale counters and changed or pending funding
+are refused. A closed channel's funding identity comes from its actual channel at removal
+or its supplied durable monitor at restore, never from the receipt.
+
+Live vouchers use the existing stock claim and monitor path without ordinary payment
+metadata. Known preimages replace only failures that have not entered a commitment.
+A late preimage for an already failed or removed voucher protects the original monitor
+without reversing that outcome. The native holding cell, in-flight updates and monitor
+own persistence and idempotence; the archive does not duplicate preimage storage.
+`PendingMonitor` requires normal monitor completion processing and a fresh snapshot retry.
+`MonitorPersisted` observes preimage protection under the application's Watch contract;
+it is neither payment credit, successful settlement nor invoice readiness, and no ordinary
+`PaymentClaimed` event is synthesized. As with all stock recovery, manager ReadArgs must
+contain actual durable monitors. Encoding an in-memory monitor does not complete a failed
+or outstanding write.
+
 These are consistency checks, not an authenticated storage envelope. Arbitrarily
 deleting a mismatching add's ownership record after abort can make its nonreserved
 hash indistinguishable from an ordinary post-abort payment. No valid writer creates
@@ -301,6 +323,9 @@ only the allowed envelope type and size; protocol and transition validation rema
 required before requesting a signature.
 
 ## Validation
+
+The current focused native suite passes 145 tests. Native no-default-features and
+documentation builds with broken intra-doc links denied also pass.
 
 The FFOR tests exercise real two-node commitment rounds, both funding directions,
 asymmetric dust limits and contest delays, signature corruption, stale monitors,
@@ -398,16 +423,27 @@ capacity, corrupted metadata, key reuse, missing required evidence and version d
 An opt-in test exporter produces a real Active manager and stock monitor using a public
 Node wallet seed for downstream integration tests; normal test runs do not write fixtures.
 
+Seven receipt-import integration tests exercise both funders, delayed monitor persistence,
+idempotent retries, crash recovery from a failed write using the prior durable monitor,
+missing peer/monitor refusal, unregistered witnesses, changed identities, expired epochs,
+conflicting reconnects and force-close. They drive queued failures into fulfills only when
+the preimage arrives before commitment, preserve already signed failures, and test actual
+Closed to splice to removal recovery without applying old-funding receipts to the new scope.
+Receiver payment events remain absent. Seven ordinary splice tests and the stock force-close
+failure test also pass. A separate opt-in request exporter writes genuine empty and pending
+manager/monitor fixtures only when `FFOR_NODE_REQUEST_FIXTURE_DIR` is set.
+
 ## Next boundary
 
 Reusable epochs require durable retired epoch IDs and voucher hashes, with one
 current signed transcript record under the same channel authority. The public facade
 now composes the native activation and cooperative-close transitions. Production
 orchestration must retain witness keys and receipts, reconcile every recovered preimage
-through the stock monitor, and enforce the configured deadline before claim safety ends.
+through the native import API to completed monitor protection, and enforce the configured
+deadline before claim safety ends.
 
 Production transport must bind the receiver facade to actual authenticated
 connections and deliver acknowledgement retries in the required order. Durable witness
-mailbox recovery, preimage reconciliation, deadline enforcement and invoice eligibility remain
+mailbox recovery, receipt-import orchestration, deadline enforcement and invoice eligibility remain
 separate required boundaries. None can be inferred from durable setup, activation or
 a successful private protocol test.

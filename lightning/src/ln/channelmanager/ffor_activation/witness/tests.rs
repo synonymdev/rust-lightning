@@ -409,3 +409,71 @@ fn ffor_witness_release_waits_for_owned_preimage_monitor_and_refuses_close() {
 		))
 		.is_err());
 }
+
+/// Opt-in public fixture for the Node request store, before vouchers or activation exist.
+#[test]
+fn ffor_export_node_request_fixture() {
+	let directory = match std::env::var_os("FFOR_NODE_REQUEST_FIXTURE_DIR") {
+		Some(path) => std::path::PathBuf::from(path),
+		None => return,
+	};
+	let mut configs = create_chanmon_cfgs(2);
+	let wallet_root =
+		bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Testnet, &[91; 64]).unwrap();
+	configs[1].keys_manager = crate::util::test_utils::TestKeysInterface::new(
+		&wallet_root.private_key.secret_bytes(),
+		bitcoin::Network::Testnet,
+	);
+	let mut node_cfgs = create_node_cfgs(2, &configs);
+	node_cfgs[1].node_seed = wallet_root.private_key.secret_bytes();
+	let config = anchor_config();
+	let managers = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &managers);
+	let id = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 40_000_000).2;
+	let (sender, receiver) = (&nodes[0], &nodes[1]);
+	std::fs::create_dir_all(&directory).unwrap();
+	std::fs::write(directory.join("empty-manager.bin"), persist(receiver.node)).unwrap();
+	let monitor = get_monitor!(receiver, id).encode();
+	std::fs::write(directory.join("empty-monitor.bin"), &monitor).unwrap();
+	let local_id = Sha256::hash(
+		&[
+			b"ldk-node/ffor/request-id/v1".as_slice(),
+			&receiver.node.chain_hash.to_bytes(),
+			&receiver.node.get_our_node_id().serialize(),
+			&15u16.to_be_bytes(),
+			b"request-fixture",
+		]
+		.concat(),
+	)
+	.to_byte_array();
+	let height = receiver.node.current_best_block().height;
+	let connection = receiver.node.ffor_peer_connection(&sender.node.get_our_node_id()).unwrap();
+	let request = receiver
+		.node
+		.prepare_ffor_receiver(
+			&id,
+			&connection,
+			crate::ln::ffor::FFORReceiverParameters {
+				local_request_id: local_id,
+				amounts_msat: vec![2_000_000],
+				minimum_payment_msat: 2_000_000,
+				settlement_deadline: height + 100,
+				voucher_expiry: height + 144,
+				fee_base_msat: 0,
+				fee_proportional_millionths: 0,
+				claim_margin_blocks: 20,
+				witness_peers: None,
+				hash_chain: false,
+			},
+		)
+		.unwrap();
+	std::fs::write(directory.join("pending-manager.bin"), persist(receiver.node)).unwrap();
+	std::fs::write(directory.join("pending-monitor.bin"), monitor).unwrap();
+	let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+	let funding = get_monitor!(receiver, id).get_funding_txo();
+	std::fs::write(directory.join("fixture.txt"), format!(
+		"network=testnet\nwallet_seed={}\nchannel_id={}\nepoch_id={}\nreceiver={}\nsettlement={}\nfunding_txid={}\nfunding_vout={}\nheight={}\nclient_request_id=request-fixture\nlocal_request_id={}\namounts_msat=2000000\nminimum_payment_msat=2000000\nsettlement_deadline={}\nvoucher_expiry={}\nfee_base_msat=0\nfee_proportional_millionths=0\nclaim_margin_blocks=20\nwitness_peers=none\nhash_chain=false\ngenerator=ffor_export_node_request_fixture\nbase_revision=7ed8161b7\n",
+		hex(&[91; 64]), hex(&id.0), hex(&request.epoch_id()), receiver.node.get_our_node_id(),
+		sender.node.get_our_node_id(), funding.txid, funding.index, height, hex(&local_id), height + 100, height + 144,
+	)).unwrap();
+}

@@ -72,7 +72,6 @@ use crate::ln::ffor::{
 use crate::ln::ffor_persistence::FFORPersistenceBarrier;
 pub use crate::ln::ffor_persistence::{FFORPersistenceRequirement, FFORPersistenceToken};
 use crate::ln::ffor_recovery::FFORRecoveryRegistry;
-mod ffor_activation;
 use crate::ln::funding::SpliceContribution;
 use crate::ln::inbound_payment;
 use crate::ln::interactivetxs::InteractiveTxMessageSend;
@@ -1642,6 +1641,9 @@ where
 	///
 	/// Note that channels which were closed prior to LDK 0.1 may have a value here of `u64::MAX`.
 	closed_channel_monitor_update_ids: BTreeMap<ChannelId, u64>,
+	// Original monitor ownership for historical receipt imports. Rebuilt from supplied monitors
+	// at restart, and captured from the actual channel when it is removed.
+	closed_channel_monitor_funding: BTreeMap<ChannelId, OutPoint>,
 	/// The peer is currently connected (i.e. we've seen a
 	/// [`BaseMessageHandler::peer_connected`] and no corresponding
 	/// [`BaseMessageHandler::peer_disconnected`].
@@ -3337,6 +3339,7 @@ macro_rules! locked_close_channel {
 		if $funded_chan.funding.get_funding_tx_confirmation_height().is_some() || $funded_chan.context.minimum_depth(&$funded_chan.funding) == Some(0) || update_id > 1 {
 			let chan_id = $funded_chan.context.channel_id();
 			$peer_state.closed_channel_monitor_update_ids.insert(chan_id, update_id);
+			$peer_state.closed_channel_monitor_funding.insert(chan_id, $funded_chan.funding_outpoint());
 		}
 		let mut short_to_chan_info = $self.short_to_chan_info.write().unwrap();
 		if let Some(short_id) = $funded_chan.funding.get_short_channel_id() {
@@ -3846,6 +3849,9 @@ macro_rules! handle_new_monitor_update {
 			})
 	} };
 }
+
+// Receipt imports use the stock monitor update and completion macros above.
+mod ffor_activation;
 
 #[rustfmt::skip]
 macro_rules! process_events_body {
@@ -14263,6 +14269,7 @@ where
 							monitor_update_blocked_actions: BTreeMap::new(),
 							actions_blocking_raa_monitor_updates: BTreeMap::new(),
 							closed_channel_monitor_update_ids: BTreeMap::new(),
+							closed_channel_monitor_funding: BTreeMap::new(),
 							is_connected: true,
 							ffor_connection: Some(Arc::new(())),
 							peer_storage: Vec::new(),
@@ -17170,6 +17177,7 @@ where
 			monitor_update_blocked_actions: BTreeMap::new(),
 			actions_blocking_raa_monitor_updates: BTreeMap::new(),
 			closed_channel_monitor_update_ids: BTreeMap::new(),
+			closed_channel_monitor_funding: BTreeMap::new(),
 			peer_storage: Vec::new(),
 			is_connected: false,
 			ffor_connection: None,
@@ -18557,6 +18565,17 @@ where
 			args.logger.clone(),
 		)
 		.with_async_payments_offers_cache(async_receive_offer_cache);
+
+		// A historical receipt must not bind an old funding output to a post-splice counter.
+		// Only the actual supplied monitor establishes this identity after restart.
+		for (channel_id, monitor) in args.channel_monitors.iter() {
+			if let Some(peer) = per_peer_state.get(&monitor.get_counterparty_node_id()) {
+				let mut peer = peer.lock().unwrap();
+				if peer.closed_channel_monitor_update_ids.contains_key(channel_id) {
+					peer.closed_channel_monitor_funding.insert(*channel_id, monitor.get_funding_txo());
+				}
+			}
+		}
 
 		let channel_manager = ChannelManager {
 			chain_hash,

@@ -79,7 +79,7 @@ where
 			.collect()
 	}
 
-	fn ffor_recovery_context_from_registry(
+	pub(super) fn ffor_recovery_context_from_registry(
 		&self, recovery: &FFORRecoveryRegistry, key: &FFORRecoveryKey,
 	) -> Result<FFORReceiverRecoveryContext, FFORReceiverError> {
 		recovery

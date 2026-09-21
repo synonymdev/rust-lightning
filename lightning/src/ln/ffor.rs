@@ -36,6 +36,8 @@ pub use context::{FFORReceiverActiveContext, FFORReceiverRecoveryContext};
 
 mod witness;
 pub use witness::{decrypt_ffor_witness_record, FFORWitnessDecryptionError, FFORWitnessReceipt};
+mod receipt;
+pub use receipt::{FFORWitnessMonitorSnapshot, FFORWitnessReceiptProgress};
 
 mod provision;
 pub use provision::{FFORReceiverWitnessRegistration, FFORRegisteredWitness};
@@ -160,6 +162,8 @@ pub enum FFORReceiverError {
 	SignerUnavailable,
 	/// Witness selection or exact manifest bytes differ from the native epoch or registration.
 	InvalidWitnessRegistration,
+	/// The authenticated receipt does not belong to the retained native epoch and witness selection.
+	InvalidWitnessReceipt,
 }
 
 impl From<FFORCommitmentError> for FFORReceiverError {
@@ -179,6 +183,7 @@ impl fmt::Display for FFORReceiverError {
 			Self::RecoveryUnavailable => f.write_str("FFOR recovery record cannot be retained"),
 			Self::SignerUnavailable => f.write_str("FFOR node signature unavailable"),
 			Self::InvalidWitnessRegistration => f.write_str("invalid FFOR witness registration"),
+			Self::InvalidWitnessReceipt => f.write_str("invalid FFOR witness receipt"),
 		}
 	}
 }
