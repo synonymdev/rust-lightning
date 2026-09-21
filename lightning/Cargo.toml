@@ -23,7 +23,7 @@ _externalize_tests = ["inventory", "_test_utils"]
 # This is unsafe to use in production because it may result in the counterparty publishing taking our funds.
 unsafe_revoked_tx_signing = []
 
-std = []
+std = ["lightning-ffor/std"]
 
 dnssec = ["dnssec-prover/validation"]
 
@@ -33,6 +33,7 @@ grind_signatures = []
 default = ["std", "grind_signatures"]
 
 [dependencies]
+lightning-ffor = { version = "0.1.0", path = "../lightning-ffor", default-features = false }
 lightning-types = { version = "0.3.5", path = "../lightning-types", default-features = false }
 lightning-invoice = { version = "0.34.0", path = "../lightning-invoice", default-features = false }
 lightning-macros = { version = "0.2.1", path = "../lightning-macros" }

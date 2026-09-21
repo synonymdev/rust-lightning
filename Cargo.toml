@@ -5,6 +5,7 @@ resolver = "2"
 # as in `ci/ci-tests.sh`.
 members = [
     "lightning",
+    "lightning-ffor",
     "lightning-types",
     "lightning-block-sync",
     "lightning-invoice",

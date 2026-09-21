@@ -1,0 +1,47 @@
+name: FFOR protocol primitives
+
+on:
+  pull_request:
+    paths:
+      - 'lightning-ffor/**'
+      - 'Cargo.toml'
+      - 'lightning/Cargo.toml'
+      - '.github/workflows/ffor-protocol.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt -p lightning-ffor -- --check
+      - run: cargo test -p lightning-ffor
+      - run: cargo check -p lightning-ffor --lib --no-default-features
+      - run: cargo clippy -p lightning-ffor --all-targets -- -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.63.0
+      - run: lightning-ffor/ci/check-msrv.sh
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: lightning-ffor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: python3 fuzz/seed_corpus.py
+      - run: cargo fuzz run wire -- -max_len=131072 -max_total_time=30

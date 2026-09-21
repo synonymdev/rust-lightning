@@ -1,0 +1,20 @@
+[package]
+name = "lightning-ffor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.63"
+license = "MIT OR Apache-2.0"
+description = "Experimental FFOR Variant D arithmetic and transcript primitives"
+publish = false
+
+[features]
+default = ["std"]
+std = ["bitcoin/std"]
+
+[dependencies]
+bitcoin = { version = "0.32.7", default-features = false }
+
+[dev-dependencies]
+proptest = "1.0.0"
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
