@@ -21,3 +21,10 @@ path = "fuzz_targets/wire.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "witness"
+path = "fuzz_targets/witness.rs"
+test = false
+doc = false
+bench = false

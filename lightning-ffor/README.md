@@ -168,6 +168,39 @@ invoices, just-in-time liquidity and aggregate multi-channel capacity cannot qua
 The node must enforce the selected offline window, claim margin, chain watching and
 fee funding. No production window or witness deployment is chosen by this crate.
 
+## Receiver witness provisioning primitives
+
+The `witness` module implements only version 1/D-R manifest construction, receiver-side
+decoding against `AuthenticatedSetup`, fetch-key signature authentication, and Appendix F.1
+`ff_witness_provision`/`ff_witness_ack`. It reuses the authenticated canonical book and transcript
+hashes. Timestamp-style voucher expiries, short retention, mismatched setup/book/activation
+digests, malformed keys and noncanonical signatures are refused. There is no extension stream
+in these formats: unknown versions/profiles, non-0/1 success flags and trailing bytes fail.
+Refusal data is bounded opaque bytes. The 65,535-byte wire limit includes the message type.
+
+`UnsignedManifest` supplies canonical bytes and their `ffor/witness/manifest` signing digest
+to an external fetch-key signer. It exports no private key and implements no signing operation.
+`PendingProvision<C>` associates exact signed manifest bytes and request ID with a caller-owned
+authenticated witness connection token. `check_acknowledgement` checks the request, actual
+source node and connection, claimed witness identity and retention promise before returning
+an immutable `CheckedAcknowledgement<C>`. Request IDs must never be reused for different
+manifests. A reconnect requires fresh request correlation with the same retained manifest.
+
+This acknowledgement has no independent signature or H_act field on the wire. The caller must
+supply transport identity from its actual handshake, persist registration keys and the exact
+manifest before sending, persist the correlated acknowledgement, and bind it to the engine's
+current ACTIVE epoch before any invoice use. The protocol object cannot establish those facts,
+or that a witness will honor its promise. Missing/failed/short acknowledgements remain incomplete.
+Fetch/receipt decryption, witness selection and invoice paths, durable receiver recovery, and a
+witness service remain outside this slice.
+
+`tests/data/beignet-witness.json` is generated from Beignet `8aee31d1` using its actual manifest
+and provisioning codecs over the public Appendix D setups, with deterministic test-only fetch
+key material. `generate_beignet_witness.cjs` verifies the source revision and records the
+Appendix D input digest. The fixtures are new cross-implementation examples, not published
+Appendix F vectors. Focused tests cover exact bytes, all truncated prefixes, signature domains,
+retention/height bounds, maximum books, connection changes, retries and bounded arbitrary input.
+
 The requested settlement baseline is LND v0.21.3-beta. LND implementation work is
 kept local. This unpublished workspace crate does not change a binding version or
 a release.

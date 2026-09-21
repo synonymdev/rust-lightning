@@ -18,3 +18,4 @@ pub mod reestablish;
 pub mod setup;
 pub mod transcript;
 pub mod wire;
+pub mod witness;

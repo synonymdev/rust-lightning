@@ -11,14 +11,14 @@ use core::fmt;
 /// A 32-byte SHA256 transcript digest in raw byte order.
 pub type Digest = [u8; 32];
 
-/// Failure to authenticate a compact node-key signature from FFOR section 7.
+/// Failure to authenticate a compact ECDSA signature in an FFOR domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignatureError {
 	/// The signature is not a valid compact ECDSA encoding.
 	Malformed,
 	/// The signature uses a noncanonical high-S scalar.
 	HighS,
-	/// The expected node did not sign this message type and exact unsigned body.
+	/// The expected public key did not sign the exact domain-bound digest.
 	Invalid,
 }
 
@@ -56,6 +56,16 @@ pub fn verify_message_signature(
 	message_type: u16, unsigned_body: &[u8], compact_signature: &[u8; 64],
 	expected_signer: &PublicKey,
 ) -> Result<(), SignatureError> {
+	verify_digest_signature(
+		message_digest(message_type, unsigned_body),
+		compact_signature,
+		expected_signer,
+	)
+}
+
+pub(crate) fn verify_digest_signature(
+	digest: Digest, compact_signature: &[u8; 64], expected_signer: &PublicKey,
+) -> Result<(), SignatureError> {
 	let signature =
 		Signature::from_compact(compact_signature).map_err(|_| SignatureError::Malformed)?;
 	let mut normalized = signature;
@@ -63,13 +73,13 @@ pub fn verify_message_signature(
 	if normalized != signature {
 		return Err(SignatureError::HighS);
 	}
-	let message = Message::from_digest(message_digest(message_type, unsigned_body));
+	let message = Message::from_digest(digest);
 	Secp256k1::verification_only()
 		.verify_ecdsa(&message, &signature, expected_signer)
 		.map_err(|_| SignatureError::Invalid)
 }
 
-fn hash_parts(tag: &[u8], parts: &[&[u8]]) -> Digest {
+pub(crate) fn hash_parts(tag: &[u8], parts: &[&[u8]]) -> Digest {
 	let mut engine = sha256::Hash::engine();
 	engine.input(tag);
 	for part in parts {

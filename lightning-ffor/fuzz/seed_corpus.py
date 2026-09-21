@@ -21,3 +21,16 @@ for fixture in reference["reestablish"]:
     (corpus / f"reestablish-{fixture['state']}").write_bytes(bytes.fromhex(fixture["value"]))
 
 print("Seeded 35 signed reference messages/setup pairs and 7 reconnect reports")
+
+witness_corpus = crate / "fuzz" / "corpus" / "witness"
+witness_corpus.mkdir(parents=True, exist_ok=True)
+witnesses = json.loads((crate / "tests/data/beignet-witness.json").read_text())
+for index, (setup, witness) in enumerate(zip(fixtures, witnesses["fixtures"])):
+    init = bytes.fromhex(setup["init_wire"])
+    accept = bytes.fromhex(setup["accept_wire"])
+    prefix = len(init).to_bytes(2, "big") + len(accept).to_bytes(2, "big") + init + accept
+    for field in ("manifest", "provision"):
+        (witness_corpus / f"witness-{index}-{field}").write_bytes(prefix + bytes.fromhex(witness[field]))
+    for field in ("acknowledgement", "refusal"):
+        (witness_corpus / f"witness-{index}-{field}").write_bytes(bytes.fromhex(witness[field]))
+print("Seeded 24 witness manifest/provision/acknowledgement cases")
