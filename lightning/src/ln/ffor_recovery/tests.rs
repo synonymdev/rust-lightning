@@ -166,7 +166,7 @@ fn ffor_recovery_roundtrip_retains_exact_signed_setup_and_native_identity() {
 	assert_eq!(restored.encode(), encoded);
 	assert!(restored.contains_exact(&record));
 	assert_eq!(restored.encoded_bytes, encoded.len());
-	assert_eq!(restored.reserved_ack_bytes, 0);
+	assert_eq!(restored.reserved_transition_bytes, 0);
 	assert!(restored.validate_identity(record.receiver(), record.chain_hash()).is_ok());
 	assert_eq!(
 		restored.validate_identity(key(43), record.chain_hash()),
@@ -293,7 +293,7 @@ fn ffor_recovery_reader_refuses_future_schema_missing_fields_and_truncation() {
 		assert!(decode(&framed[..length]).is_err(), "accepted prefix {}", length);
 	}
 	let mut future = framed.clone();
-	future[0] = ABORTED_ACTIVATION_VERSION + 1;
+	future[0] = CLOSE_VERSION + 1;
 	assert!(matches!(decode(&future), Err(DecodeError::UnknownRequiredFeature)));
 	// Empty TLV records omit both mandatory fields.
 	assert!(decode(&frame(&[vec![0]])).is_err());

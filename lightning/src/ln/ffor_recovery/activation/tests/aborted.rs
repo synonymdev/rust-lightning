@@ -98,7 +98,7 @@ fn ffor_activation_abort_is_monotonic_atomic_and_permanent() {
 	let before = registry.encode();
 	drop(registry.prepare_activation(&setup, &aborted).unwrap());
 	assert_eq!(registry.encode(), before);
-	assert_eq!(registry.reserved_ack_bytes, ACK_RESERVATION_BYTES);
+	assert_eq!(registry.reserved_transition_bytes, ACK_RESERVATION_BYTES + CLOSE_RESERVATION_BYTES);
 	registry.prepare_activation(&setup, &aborted).unwrap().commit();
 	let terminal = registry.encode();
 	let different = activating
@@ -113,7 +113,7 @@ fn ffor_activation_abort_is_monotonic_atomic_and_permanent() {
 	}
 	registry.prepare_activation(&setup, &aborted).unwrap().commit();
 	assert_eq!(registry.encode(), terminal);
-	assert_eq!(registry.reserved_ack_bytes, 0);
+	assert_eq!(registry.reserved_transition_bytes, 0);
 	let mut active_registry = registered(&setup);
 	active_registry.prepare_activation(&setup, &activating).unwrap().commit();
 	active_registry.prepare_activation(&setup, &active).unwrap().commit();
@@ -133,7 +133,7 @@ fn ffor_activation_abort_restore_requires_terminal_schema_and_matching_channel_r
 	let restored = FFORRecoveryRegistry::read(&mut &bytes[..]).unwrap();
 	assert_eq!(restored.encode(), bytes);
 	assert_eq!(restored.encoded_bytes, bytes.len());
-	assert_eq!(restored.reserved_ack_bytes, 0);
+	assert_eq!(restored.reserved_transition_bytes, 0);
 	assert_eq!(restored.activation_keys(), vec![key(&setup)]);
 	assert!(restored.activation_channels().is_empty());
 	assert!(restored.get_activation(&key(&setup)).unwrap().matches_abort_report(peer_report));
@@ -220,16 +220,22 @@ fn ffor_activation_abort_has_reserved_capacity_after_restart_and_competing_admis
 	fill_ack_capacity(&mut registry);
 	let before = registry.encode();
 	let mut restored = FFORRecoveryRegistry::read(&mut &before[..]).unwrap();
-	let reserved = restored.reserved_ack_bytes;
+	let reserved = restored.reserved_transition_bytes;
 	let aborted = activating
 		.abort_after_reestablish(&setup, Some(report(&setup, ReportedState::Aborted)))
 		.unwrap();
 	restored.prepare_activation(&setup, &aborted).unwrap().commit();
-	assert_eq!(restored.reserved_ack_bytes, reserved - ACK_RESERVATION_BYTES);
+	assert_eq!(
+		restored.reserved_transition_bytes,
+		reserved - ACK_RESERVATION_BYTES - CLOSE_RESERVATION_BYTES
+	);
 	assert!(restored.encoded_bytes - before.len() < ABORT_RESERVATION_BYTES);
-	assert!(restored.encoded_bytes + restored.reserved_ack_bytes <= MAX_ENCODED_BYTES);
+	assert!(restored.encoded_bytes + restored.reserved_transition_bytes <= MAX_ENCODED_BYTES);
 	let terminal = restored.encode();
 	let restored = FFORRecoveryRegistry::read(&mut &terminal[..]).unwrap();
-	assert_eq!(restored.reserved_ack_bytes, reserved - ACK_RESERVATION_BYTES);
+	assert_eq!(
+		restored.reserved_transition_bytes,
+		reserved - ACK_RESERVATION_BYTES - CLOSE_RESERVATION_BYTES
+	);
 	assert_eq!(restored.encode(), terminal);
 }

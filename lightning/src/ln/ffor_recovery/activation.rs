@@ -4,6 +4,9 @@
 //! manager must install the matching channel fence and registry upgrade atomically, then await
 //! persistence before releasing wire. No production activation entry point exists yet.
 
+mod close;
+pub(crate) use close::FFORReceiverCloseRecord;
+
 use alloc::vec::Vec;
 use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Txid};
@@ -27,6 +30,7 @@ pub(crate) struct FFORReceiverActivation {
 	activate_wire: Vec<u8>,
 	ack_wire: Option<Vec<u8>>,
 	abort: Option<AbortedActivation>,
+	close: Option<FFORReceiverCloseRecord>,
 	receiver_number: u64,
 	receiver_txid: Txid,
 	settlement_number: u64,
@@ -47,6 +51,7 @@ impl_writeable_tlv_based!(FFORReceiverActivation, {
 	(14, preparation_height, required),
 	(16, destination_script, required),
 	(18, abort, option),
+	(20, close, option),
 });
 
 /// A manager-observed reconnect outcome, not a signed statement from the peer. The transition
@@ -105,6 +110,7 @@ impl FFORReceiverActivation {
 			activate_wire: activate_wire.to_vec(),
 			ack_wire: None,
 			abort: None,
+			close: None,
 			receiver_number: commitments.holder.number,
 			receiver_txid: commitments.holder.txid,
 			settlement_number: commitments.counterparty.number,
@@ -147,6 +153,9 @@ impl FFORReceiverActivation {
 		let hash = setup
 			.validate_activation(&activate, self.commitment_hash(), self.preparation_height)
 			.map_err(|_| DecodeError::InvalidValue)?;
+		if self.close.is_some() && (self.ack_wire.is_none() || self.abort.is_some()) {
+			return Err(DecodeError::InvalidValue);
+		}
 		if let Some(abort) = self.abort.as_ref() {
 			if self.ack_wire.is_some() {
 				return Err(DecodeError::InvalidValue);
@@ -156,6 +165,14 @@ impl FFORReceiverActivation {
 		if let Some(wire) = self.ack_wire.as_ref() {
 			let ack = Message::decode(wire).map_err(|_| DecodeError::InvalidValue)?;
 			setup.validate_activation_ack(&ack, hash).map_err(|_| DecodeError::InvalidValue)?;
+		}
+		if let Some(close) = &self.close {
+			close.validate_authenticated(setup, hash)?;
+			close.validate_closed_after(
+				self.receiver_number,
+				self.settlement_number,
+				self.monitor_update_id,
+			)?;
 		}
 		Ok(hash)
 	}
@@ -255,7 +272,25 @@ impl FFORReceiverActivation {
 	pub(super) fn validate_monitor(
 		&self, setup: &FFORReceiverSetup, monitor: &FFORMonitorRecoveryIdentity,
 	) -> Result<(), DecodeError> {
+		if self.is_draining() && !self.is_closed() {
+			if monitor.channel_id.0 != setup.validate_recovery()?.header().channel_id
+				|| monitor.funding_txo != setup.funding_txo()
+				|| monitor.update_id < self.monitor_update_id
+				|| monitor.destination_script != self.destination_script
+				|| monitor.counterparty_txid.is_none()
+				|| INITIAL_COMMITMENT_NUMBER
+					.checked_sub(monitor.holder_number)
+					.map_or(true, |number| number < self.receiver_number)
+				|| INITIAL_COMMITMENT_NUMBER
+					.checked_sub(monitor.counterparty_number)
+					.map_or(true, |number| number < self.settlement_number)
+			{
+				return Err(DecodeError::InvalidValue);
+			}
+			return Ok(());
+		}
 		if self.abort.is_some()
+			|| self.is_closed()
 			|| monitor.channel_id.0 != setup.validate_recovery()?.header().channel_id
 			|| monitor.funding_txo != setup.funding_txo()
 			|| monitor.update_id < self.monitor_update_id
@@ -272,22 +307,37 @@ impl FFORReceiverActivation {
 		Ok(())
 	}
 
-	/// The only upgrade adds the first acknowledgement or terminal abort, preserving every byte
-	/// of the activation. Neither terminal outcome can be replaced by another transition.
+	/// Every retained transcript byte is immutable. Only the next lifecycle evidence may be added.
 	pub(super) fn can_replace(&self, next: &Self) -> bool {
 		if self.encode() == next.encode() {
 			return true;
 		}
-		if self.ack_wire.is_some()
-			|| self.abort.is_some()
-			|| (next.ack_wire.is_none() && next.abort.is_none())
-		{
+		if self.abort.is_some() {
 			return false;
 		}
-		let mut without_outcome = next.clone();
-		without_outcome.ack_wire = None;
-		without_outcome.abort = None;
-		self.encode() == without_outcome.encode()
+		if self.ack_wire.is_none() && next.close.is_some() {
+			return false;
+		}
+		if self.close.is_none() && next.is_draining() {
+			return false;
+		}
+		if self.ack_wire.as_ref().map_or(false, |old| next.ack_wire.as_ref() != Some(old)) {
+			return false;
+		}
+		if let Some(close) = &self.close {
+			if !next.close.as_ref().map_or(false, |new| close.can_replace(new)) {
+				return false;
+			}
+		}
+		let mut before = self.clone();
+		let mut after = next.clone();
+		before.ack_wire = None;
+		before.abort = None;
+		before.close = None;
+		after.ack_wire = None;
+		after.abort = None;
+		after.close = None;
+		before.encode() == after.encode()
 	}
 }
 

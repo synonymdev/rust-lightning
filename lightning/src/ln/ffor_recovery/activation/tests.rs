@@ -2,13 +2,15 @@ use super::*;
 use crate::ln::ffor_recovery::tests::{fixture, sign};
 use crate::ln::ffor_recovery::{
 	FFORRecoveryError, FFORRecoveryKey, FFORRecoveryRegistry, ACK_RESERVATION_BYTES,
-	ACTIVATION_VERSION, MAX_ENCODED_BYTES, MAX_RECORDS, SETUP_ONLY_VERSION,
+	ACTIVATION_VERSION, CLOSE_RESERVATION_BYTES, MAX_ENCODED_BYTES, MAX_RECORDS,
+	SETUP_ONLY_VERSION,
 };
 use crate::ln::types::ChannelId;
 use crate::util::ser::Readable;
 use lightning_ffor::wire::{Activate, Tlv};
 
 mod aborted;
+mod close;
 
 // Synthetic transaction identities exercise archive authentication only. Real monitor and
 // channel evidence are exercised by the manager tests; these values never activate a channel.
@@ -52,6 +54,7 @@ fn evidence_for_identity(
 		activate_wire: message.encode().unwrap(),
 		ack_wire: None,
 		abort: None,
+		close: None,
 		receiver_number: 4,
 		receiver_txid,
 		settlement_number: 4,
@@ -110,9 +113,10 @@ fn ffor_activation_archive_roundtrip_preserves_exact_maximum_transcripts() {
 		assert_eq!(bytes.len(), registry.encoded_bytes);
 		let restored = FFORRecoveryRegistry::read(&mut &bytes[..]).unwrap();
 		assert_eq!(restored.encode(), bytes);
-		let reservation = if expected.is_active() { 0 } else { ACK_RESERVATION_BYTES };
-		assert_eq!(registry.reserved_ack_bytes, reservation);
-		assert_eq!(restored.reserved_ack_bytes, reservation);
+		let reservation =
+			CLOSE_RESERVATION_BYTES + if expected.is_active() { 0 } else { ACK_RESERVATION_BYTES };
+		assert_eq!(registry.reserved_transition_bytes, reservation);
+		assert_eq!(restored.reserved_transition_bytes, reservation);
 		assert_eq!(restored.get_activation(&key(&setup)).unwrap().encode(), expected.encode());
 		assert!(restored.contains_exact(&setup));
 	}
@@ -231,26 +235,26 @@ fn ffor_activation_archive_upgrade_is_atomic_idempotent_and_capacity_bounded() {
 	));
 	drop(registry.prepare_activation(&setup, &activating).unwrap());
 	assert_eq!(registry.encode(), original);
-	assert_eq!(registry.reserved_ack_bytes, 0);
-	registry.reserved_ack_bytes = MAX_ENCODED_BYTES - registry.encoded_bytes;
+	assert_eq!(registry.reserved_transition_bytes, 0);
+	registry.reserved_transition_bytes = MAX_ENCODED_BYTES - registry.encoded_bytes;
 	assert!(matches!(
 		registry.prepare_activation(&setup, &activating),
 		Err(FFORRecoveryError::CapacityExceeded)
 	));
 	assert_eq!(registry.encode(), original);
-	assert_eq!(registry.reserved_ack_bytes, MAX_ENCODED_BYTES - registry.encoded_bytes);
-	registry.reserved_ack_bytes = 0;
+	assert_eq!(registry.reserved_transition_bytes, MAX_ENCODED_BYTES - registry.encoded_bytes);
+	registry.reserved_transition_bytes = 0;
 	registry.prepare_activation(&setup, &activating).unwrap().commit();
 	let pending = registry.encode();
 	registry.prepare_activation(&setup, &activating).unwrap().commit();
 	assert_eq!(registry.encode(), pending);
-	assert_eq!(registry.reserved_ack_bytes, ACK_RESERVATION_BYTES);
+	assert_eq!(registry.reserved_transition_bytes, ACK_RESERVATION_BYTES + CLOSE_RESERVATION_BYTES);
 	drop(registry.prepare_activation(&setup, &active).unwrap());
 	assert_eq!(registry.encode(), pending);
-	assert_eq!(registry.reserved_ack_bytes, ACK_RESERVATION_BYTES);
+	assert_eq!(registry.reserved_transition_bytes, ACK_RESERVATION_BYTES + CLOSE_RESERVATION_BYTES);
 	registry.prepare_activation(&setup, &active).unwrap().commit();
 	let completed = registry.encode();
-	assert_eq!(registry.reserved_ack_bytes, 0);
+	assert_eq!(registry.reserved_transition_bytes, CLOSE_RESERVATION_BYTES);
 	assert!(completed.len() - pending.len() < ACK_RESERVATION_BYTES);
 	registry.prepare_activation(&setup, &active).unwrap().commit();
 	assert_eq!(registry.encode(), completed);
@@ -259,7 +263,7 @@ fn ffor_activation_archive_upgrade_is_atomic_idempotent_and_capacity_bounded() {
 		Err(FFORRecoveryError::ConflictingRecord)
 	));
 	assert_eq!(registry.encode(), completed);
-	assert_eq!(registry.reserved_ack_bytes, 0);
+	assert_eq!(registry.reserved_transition_bytes, CLOSE_RESERVATION_BYTES);
 }
 
 // Fill with real authenticated records until a further activation cannot reserve its ack. Large
@@ -305,7 +309,7 @@ fn ffor_activation_archive_reserves_maximum_ack_through_competing_admission_and_
 	fill_ack_capacity(&mut registry);
 	assert!(registry.entries.len() < MAX_RECORDS);
 	let before = registry.encode();
-	let reserved = registry.reserved_ack_bytes;
+	let reserved = registry.reserved_transition_bytes;
 	assert!(matches!(
 		registry.prepare_activation(&competing_setup, &competing_activation),
 		Err(FFORRecoveryError::CapacityExceeded)
@@ -318,23 +322,23 @@ fn ffor_activation_archive_reserves_maximum_ack_through_competing_admission_and_
 		Err(FFORRecoveryError::CapacityExceeded)
 	));
 	assert_eq!(registry.encode(), before);
-	assert_eq!(registry.reserved_ack_bytes, reserved);
+	assert_eq!(registry.reserved_transition_bytes, reserved);
 	let mut restored = FFORRecoveryRegistry::read(&mut &before[..]).unwrap();
-	assert_eq!(restored.reserved_ack_bytes, reserved);
+	assert_eq!(restored.reserved_transition_bytes, reserved);
 	assert_eq!(restored.encoded_bytes, before.len());
 	assert_eq!(restored.encode(), before);
 	restored.prepare_activation(&setup, &activating).unwrap().commit();
-	assert_eq!(restored.reserved_ack_bytes, reserved);
+	assert_eq!(restored.reserved_transition_bytes, reserved);
 	let maximum_ack = acknowledgement(&setup, &activating, true);
 	assert_eq!(maximum_ack.len(), MAX_MESSAGE_LEN);
 	let active = activating.with_ack(&setup, &maximum_ack).unwrap();
 	drop(restored.prepare_activation(&setup, &active).unwrap());
 	assert_eq!(restored.encode(), before);
-	assert_eq!(restored.reserved_ack_bytes, reserved);
+	assert_eq!(restored.reserved_transition_bytes, reserved);
 	restored.prepare_activation(&setup, &active).unwrap().commit();
-	assert_eq!(restored.reserved_ack_bytes, reserved - ACK_RESERVATION_BYTES);
+	assert_eq!(restored.reserved_transition_bytes, reserved - ACK_RESERVATION_BYTES);
 	assert!(restored.encoded_bytes - before.len() < ACK_RESERVATION_BYTES);
-	assert!(restored.encoded_bytes + restored.reserved_ack_bytes <= MAX_ENCODED_BYTES);
+	assert!(restored.encoded_bytes + restored.reserved_transition_bytes <= MAX_ENCODED_BYTES);
 	assert_eq!(
 		restored.get_activation(&key(&setup)).unwrap().ack_wire.as_ref(),
 		Some(&maximum_ack)
@@ -343,7 +347,7 @@ fn ffor_activation_archive_reserves_maximum_ack_through_competing_admission_and_
 	restored.prepare_activation(&setup, &active).unwrap().commit();
 	assert_eq!(restored.encode(), completed);
 	let roundtrip = FFORRecoveryRegistry::read(&mut &completed[..]).unwrap();
-	assert_eq!(roundtrip.reserved_ack_bytes, restored.reserved_ack_bytes);
+	assert_eq!(roundtrip.reserved_transition_bytes, restored.reserved_transition_bytes);
 
 	// A snapshot cannot bypass the reservation by declaring only its smaller current wire size.
 	let (extra_setup, extra_activation) = evidence_for_identity(91, true);
@@ -356,9 +360,9 @@ fn ffor_activation_archive_reserves_maximum_ack_through_competing_admission_and_
 	assert!(restored.encoded_bytes + extra.encoded_bytes + 4 < MAX_ENCODED_BYTES);
 	assert!(
 		restored.encoded_bytes
-			+ restored.reserved_ack_bytes
+			+ restored.reserved_transition_bytes
 			+ extra.encoded_bytes
-			+ extra.reserved_ack_bytes()
+			+ extra.reserved_transition_bytes()
 			+ 4 > MAX_ENCODED_BYTES
 	);
 	restored.entries.push(extra);

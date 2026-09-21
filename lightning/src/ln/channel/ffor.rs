@@ -1,6 +1,7 @@
 use super::*;
 
 mod activation;
+mod drain;
 mod fence;
 mod quiescence;
 mod reestablish;
@@ -10,6 +11,8 @@ use crate::ln::ffor::{
 	FFORReceiverError, FFORReceiverStatus, FFORSettlementParty, FFORVoucher,
 	FFORVoucherCommitments, FFORVoucherFailure,
 };
+use drain::FFORReceiverDrain;
+pub(crate) use drain::{ffor_drain_completion_digest, FFORReceiverDrainCompletion};
 use fence::FFORReceiverFence;
 pub(crate) use fence::{FFORReceiverFencePhase, FFOR_FROZEN_MESSAGE};
 pub(crate) use quiescence::FFORReceiverQuiescence;
@@ -26,6 +29,7 @@ pub(super) struct FFORReceiverBook {
 	abort_reason: Option<FFORReceiverAbortReason>,
 	setup: Option<FFORReceiverSetup>,
 	fence: Option<FFORReceiverFence>,
+	drain: Option<FFORReceiverDrain>,
 }
 
 struct FFORReceivedVoucher {
@@ -47,11 +51,13 @@ impl_writeable_tlv_based!(FFORReceiverBook, {
 	(8, setup, option),
 	// A reader without the mutation fence must refuse this channel.
 	(10, fence, option),
+	// Older readers must not discard drain ownership or a completed epoch tombstone.
+	(12, drain, option),
 });
 
 impl FFORReceiverBook {
 	pub(super) fn abort(&mut self, reason: FFORReceiverAbortReason) {
-		if self.fence.is_none() {
+		if self.fence.is_none() && !self.is_closed() {
 			self.abort_reason.get_or_insert(reason);
 		}
 	}
@@ -96,7 +102,7 @@ impl FFORReceiverBook {
 				{
 					return Err(DecodeError::InvalidValue);
 				}
-			} else if self.abort_reason.is_none()
+			} else if (self.abort_reason.is_none() && !self.is_closed())
 				|| self.vouchers.iter().any(|voucher| voucher.payment_hash == htlc.payment_hash)
 			{
 				// Never restore a live voucher whose channel-owned interception record was lost.
@@ -142,6 +148,7 @@ where
 			abort_reason: None,
 			setup: None,
 			fence: None,
+			drain: None,
 		});
 		Ok(())
 	}
@@ -226,7 +233,7 @@ where
 		});
 		let reserved_hash =
 			book.vouchers.iter().any(|voucher| voucher.payment_hash == msg.payment_hash);
-		if book.abort_reason.is_some() && !reserved_hash && !owned_pending {
+		if (book.abort_reason.is_some() || book.is_closed()) && !reserved_hash && !owned_pending {
 			return;
 		}
 		let voucher = FFORVoucher {

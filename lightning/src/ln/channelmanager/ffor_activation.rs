@@ -9,6 +9,7 @@ use crate::sign::ffor::FFORSigningRequest;
 use lightning_ffor::transcript;
 use lightning_ffor::wire::{Activate, Message as FFORMessage, Payload};
 
+mod close;
 mod reestablish;
 
 struct RuntimeEntry {
@@ -275,7 +276,18 @@ where
 			.with_ack(&setup, ack_wire)
 			.map_err(|_| FFORCommitmentError::InvalidVoucherBook)?;
 		if previous.is_active() {
-			channel.accept_ffor_receiver_activation(&activation)?;
+			// A byte-identical acknowledgement remains idempotent after close or drain.
+			// Check the current lifecycle instead of repeating the earlier phase transition.
+			recovery
+				.validate_channel_lifecycle(
+					&setup,
+					channel.ffor_receiver_fence(),
+					channel.ffor_receiver_abort_reason(),
+					channel.ffor_receiver_drain_binding(),
+					channel.ffor_receiver_closed_completion_hash(),
+					channel.ffor_receiver_drain_activation_hash(),
+				)
+				.map_err(|_| FFORReceiverError::RecoveryUnavailable)?;
 			return Ok(self.ffor_activation.lock().unwrap().get(&key)?.requirement.clone());
 		}
 		let upgrade = recovery
@@ -297,7 +309,7 @@ where
 	pub(super) fn check_ffor_reconnect_archive(
 		&self, channel: &FundedChannel<SP>,
 	) -> Result<(), ChannelError> {
-		if !channel.context.is_ffor_frozen() {
+		if !channel.context.is_ffor_frozen() && channel.ffor_receiver_drain_binding().is_none() {
 			return Ok(());
 		}
 		let invalid = || {
@@ -314,13 +326,22 @@ where
 		};
 		let recovery = self.ffor_recovery.lock().unwrap();
 		recovery
-			.validate_channel_outcome(
+			.validate_channel_lifecycle(
 				&setup,
 				channel.ffor_receiver_fence(),
 				channel.ffor_receiver_abort_reason(),
+				channel.ffor_receiver_drain_binding(),
+				channel.ffor_receiver_closed_completion_hash(),
+				channel.ffor_receiver_drain_activation_hash(),
 			)
 			.map_err(|_| invalid())?;
 		let activation = recovery.get_activation(&key).ok_or_else(invalid)?;
+		if activation.is_draining() {
+			if !activation.is_closed() {
+				channel.validate_ffor_drain().map_err(|_| invalid())?;
+			}
+			return Ok(());
+		}
 		if channel.ffor_frozen_commitments(&self.logger).map_err(|_| invalid())?
 			!= activation.commitments()
 		{

@@ -14,12 +14,16 @@ pub(crate) enum FFORReceiverFencePhase {
 	Activating,
 	Active,
 	Aborting,
+	Draining,
+	ClosedPendingPersistence,
 }
 
 impl_writeable_tlv_based_enum!(FFORReceiverFencePhase,
 	(0, Activating) => {},
 	(2, Active) => {},
 	(4, Aborting) => {},
+	(6, Draining) => {},
+	(8, ClosedPendingPersistence) => {},
 );
 
 pub(super) struct FFORReceiverFence {
@@ -63,6 +67,11 @@ where
 			return true;
 		}
 		update.updates.iter().all(|step| match step {
+			ChannelMonitorUpdateStep::LatestHolderCommitmentTXInfo { .. }
+			| ChannelMonitorUpdateStep::LatestHolderCommitment { .. }
+			| ChannelMonitorUpdateStep::LatestCounterpartyCommitmentTXInfo { .. }
+			| ChannelMonitorUpdateStep::LatestCounterpartyCommitment { .. }
+			| ChannelMonitorUpdateStep::CommitmentSecret { .. } => self.ffor_drain_enabled(),
 			ChannelMonitorUpdateStep::PaymentPreimage { payment_preimage, .. } => {
 				let hash = PaymentHash(Sha256::hash(&payment_preimage.0).to_byte_array());
 				self.ffor_receiver_book
@@ -105,6 +114,15 @@ where
 			Some(book) if book.fence.is_some() => book,
 			_ => return Ok(()),
 		};
+		if book.drain.is_some() {
+			return self.validate_ffor_drain();
+		}
+		if matches!(
+			book.fence.as_ref().unwrap().phase,
+			FFORReceiverFencePhase::Draining | FFORReceiverFencePhase::ClosedPendingPersistence
+		) {
+			return Err(DecodeError::InvalidValue);
+		}
 		let context = &self.context;
 		let abort_matches_phase = match book.fence.as_ref().unwrap().phase {
 			FFORReceiverFencePhase::Aborting => {

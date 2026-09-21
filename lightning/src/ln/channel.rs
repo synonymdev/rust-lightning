@@ -102,7 +102,10 @@ use super::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBase
 mod ffor;
 #[cfg(test)]
 pub(crate) use ffor::ffor_setup_test_messages;
-pub(crate) use ffor::{FFORReceiverFencePhase, FFORReceiverSetup, FFORReestablishOutcome};
+pub(crate) use ffor::{
+	ffor_drain_completion_digest, FFORReceiverDrainCompletion, FFORReceiverFencePhase,
+	FFORReceiverSetup, FFORReestablishOutcome,
+};
 
 #[cfg(any(test, feature = "_test_utils"))]
 #[allow(unused)]
@@ -7349,6 +7352,11 @@ where
 		{
 			return UpdateFulfillFetch::DuplicateClaim {};
 		}
+		if let Some(result) =
+			self.ffor_prepare_drain_claim(htlc_id_arg, payment_preimage_arg, payment_info.clone())
+		{
+			return result;
+		}
 		// Either ChannelReady got set (which means it won't be unset) or there is no way any
 		// caller thought we could have something claimed (cause we wouldn't have accepted in an
 		// incoming HTLC anyway). If we got to ShutdownComplete, callers aren't allowed to call us,
@@ -7416,7 +7424,7 @@ where
 			channel_id: Some(self.context.channel_id()),
 		};
 
-		if self.context.is_ffor_frozen()
+		if self.context.ffor_blocks_commitment_round()
 			|| !self.context.channel_state.can_generate_new_commitment()
 		{
 			// Note that this condition is the same as the assertion in
@@ -7600,7 +7608,7 @@ where
 		&mut self, htlc_id_arg: u64, err_contents: E, mut force_holding_cell: bool,
 		logger: &L
 	) -> Result<Option<E::Message>, ChannelError> where L::Target: Logger {
-		if self.context.is_ffor_frozen() { return Err(ChannelError::Ignore(ffor::FFOR_FROZEN_MESSAGE.to_owned())); }
+		if !self.context.ffor_failure_permitted(htlc_id_arg) { return Err(ChannelError::Ignore(ffor::FFOR_FROZEN_MESSAGE.to_owned())); }
 		if !matches!(self.context.channel_state, ChannelState::ChannelReady(_)) {
 			panic!("Was asked to fail an HTLC when channel was not in an operational state");
 		}
@@ -8091,7 +8099,7 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
-		self.context.check_ffor_mutation()?;
+		self.context.check_ffor_commitment_round()?;
 		self.commitment_signed_check_state()?;
 
 		if !self.pending_funding().is_empty() {
@@ -8136,7 +8144,7 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
-		self.context.check_ffor_mutation()?;
+		self.context.check_ffor_commitment_round()?;
 		self.commitment_signed_check_state()?;
 
 		let mut messages = BTreeMap::new();
@@ -8206,7 +8214,7 @@ where
 	}
 
 	fn commitment_signed_check_state(&self) -> Result<(), ChannelError> {
-		self.context.check_ffor_mutation()?;
+		self.context.check_ffor_commitment_round()?;
 		if self.context.channel_state.is_quiescent() {
 			return Err(ChannelError::WarnAndDisconnect(
 				"Got commitment_signed message while quiescent".to_owned(),
@@ -8241,7 +8249,7 @@ where
 	where
 		L::Target: Logger,
 	{
-		self.context.check_ffor_mutation()?;
+		self.context.check_ffor_commitment_round()?;
 		if self
 			.holder_commitment_point
 			.advance(&self.context.holder_signer, &self.context.secp_ctx, logger)
@@ -8388,7 +8396,7 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
-		if self.context.is_ffor_frozen() {
+		if self.context.ffor_blocks_commitment_round() {
 			return (None, Vec::new());
 		}
 		if matches!(self.context.channel_state, ChannelState::ChannelReady(_))
@@ -8409,7 +8417,7 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
-		if self.context.is_ffor_frozen() {
+		if self.context.ffor_blocks_commitment_round() {
 			return (None, Vec::new());
 		}
 		assert!(matches!(self.context.channel_state, ChannelState::ChannelReady(_)));
@@ -8618,7 +8626,7 @@ where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
 	{
-		self.context.check_ffor_mutation()?;
+		self.context.check_ffor_commitment_round()?;
 		if self.context.channel_state.is_quiescent() {
 			return Err(ChannelError::WarnAndDisconnect(
 				"Got revoke_and_ack message while quiescent".to_owned(),
@@ -9462,7 +9470,7 @@ where
 		assert!(self.context.channel_state.is_monitor_update_in_progress());
 		self.context.channel_state.clear_monitor_update_in_progress();
 		assert_eq!(self.blocked_monitor_updates_pending(), 0);
-		if self.context.is_ffor_frozen() {
+		if self.context.ffor_blocks_commitment_round() {
 			return MonitorRestoreUpdates {
 				raa: None, commitment_update: None, commitment_order: self.context.resend_order.clone(),
 				accepted_htlcs: Vec::new(), failed_htlcs: Vec::new(), finalized_claimed_htlcs: Vec::new(),
@@ -9625,7 +9633,7 @@ where
 	pub fn signer_maybe_unblocked<L: Deref, CBP>(
 		&mut self, logger: &L, path_for_release_htlc: CBP
 	) -> SignerResumeUpdates where L::Target: Logger, CBP: Fn(u64) -> BlindedMessagePath {
-		if self.context.is_ffor_frozen() {
+		if self.context.ffor_blocks_commitment_round() {
 			return SignerResumeUpdates {
 				commitment_update: None, revoke_and_ack: None, open_channel: None,
 				accept_channel: None, funding_created: None, funding_signed: None,
@@ -9745,7 +9753,7 @@ where
 		L::Target: Logger,
 		CBP: Fn(u64) -> BlindedMessagePath,
 	{
-		if self.context.is_ffor_frozen() {
+		if self.context.ffor_blocks_commitment_round() {
 			return None;
 		}
 		debug_assert!(
@@ -9806,7 +9814,7 @@ where
 	where
 		L::Target: Logger,
 	{
-		self.context.check_ffor_mutation().map_err(|_| ())?;
+		self.context.check_ffor_commitment_round().map_err(|_| ())?;
 		let mut update_add_htlcs = Vec::new();
 		let mut update_fulfill_htlcs = Vec::new();
 		let mut update_fail_htlcs = Vec::new();
@@ -9937,7 +9945,11 @@ where
 		CBP: Fn(u64) -> BlindedMessagePath
 	{
 		if self.context.is_ffor_frozen() {
-			return self.ffor_handle_reestablish(msg, logger);
+			if self.ffor_receiver_drain_binding().is_some() {
+				if let Some(response) = self.ffor_check_drain_reestablish(msg, logger)? { return Ok(response); }
+			} else {
+				return self.ffor_handle_reestablish(msg, logger);
+			}
 		}
 		let our_commitment_transaction = self.validate_reestablish_prefix(msg, logger)?;
 
@@ -11929,7 +11941,7 @@ where
 	/// self.remove_uncommitted_htlcs_and_mark_paused()'d
 	#[rustfmt::skip]
 	fn get_channel_reestablish<L: Deref>(&mut self, logger: &L) -> Result<msgs::ChannelReestablish, msgs::WarningMessage> where L::Target: Logger {
-		if self.context.is_ffor_frozen() {
+		if self.context.is_ffor_frozen() && self.ffor_receiver_drain_binding().is_none() {
 			return self.ffor_get_reestablish(logger);
 		}
 		assert!(self.context.channel_state.is_peer_disconnected());
@@ -11957,7 +11969,7 @@ where
 			[0;32]
 		};
 		Ok(msgs::ChannelReestablish {
-			ffor_reestablish: None,
+			ffor_reestablish: self.ffor_drain_reestablish_report(),
 			channel_id: self.context.channel_id(),
 			// The protocol has two different commitment number concepts - the "commitment
 			// transaction number", which starts from 0 and counts up, and the "revocation key
@@ -12842,7 +12854,7 @@ where
 
 	#[rustfmt::skip]
 	fn build_commitment_no_status_check<L: Deref>(&mut self, logger: &L) -> Result<ChannelMonitorUpdate, ChannelError> where L::Target: Logger {
-		self.context.check_ffor_mutation()?;
+		self.context.check_ffor_commitment_round()?;
 		log_trace!(logger, "Updating HTLC state for a newly-sent commitment_signed...");
 		// We can upgrade the status of some HTLCs that are waiting on a commitment, even if we
 		// fail to generate this, we still are at least at a position where upgrading their status
@@ -12975,7 +12987,7 @@ where
 	where
 		L::Target: Logger,
 	{
-		self.context.check_ffor_mutation()?;
+		self.context.check_ffor_commitment_round()?;
 		// Get the fee tests from `build_commitment_no_state_update`
 		#[cfg(any(test, fuzzing))]
 		self.build_commitment_no_state_update(funding, logger);

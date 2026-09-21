@@ -12083,7 +12083,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							|htlc_id| self.path_for_release_held_htlc(htlc_id, outbound_scid_alias, &msg.channel_id, counterparty_node_id)
 						);
 						let responses = try_channel_entry!(self, peer_state, res, chan_entry);
-						if chan.context.is_ffor_frozen() {
+						if chan.context.is_ffor_frozen() && chan.ffor_receiver_drain_binding().is_none() {
 							let transition = self.apply_ffor_reconnect_outcome(chan);
 							try_channel_entry!(self, peer_state, transition, chan_entry);
 							return Ok(());
@@ -17190,6 +17190,9 @@ where
 					setup,
 					channel.ffor_receiver_fence(),
 					channel.ffor_receiver_abort_reason(),
+					channel.ffor_receiver_drain_binding(),
+					channel.ffor_receiver_closed_completion_hash(),
+					channel.ffor_receiver_drain_activation_hash(),
 				));
 			}
 			let logger = WithChannelContext::from(&args.logger, &channel.context, None);
@@ -17594,8 +17597,15 @@ where
 		let mut ffor_persistence = FFORPersistenceBarrier::new();
 		let ffor_activation = FFORReceiverRuntime::restored(&ffor_recovery, &mut ffor_persistence)?;
 		ffor_recovery.validate_identity(our_network_pubkey, chain_hash)?;
-		for (setup, fence, abort_reason) in &ffor_channel_setups {
-			ffor_recovery.validate_channel_outcome(setup, *fence, *abort_reason)?;
+		for (setup, fence, abort_reason, drain, completion, drain_hash) in &ffor_channel_setups {
+			ffor_recovery.validate_channel_lifecycle(
+				setup,
+				*fence,
+				*abort_reason,
+				drain.clone(),
+				*completion,
+				*drain_hash,
+			)?;
 		}
 		for channel_id in ffor_recovery.activation_channels() {
 			let monitor =

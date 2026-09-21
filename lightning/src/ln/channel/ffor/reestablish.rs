@@ -12,6 +12,8 @@ use lightning_ffor::reestablish::{Reestablish, ReportedState};
 pub(crate) enum FFORReestablishOutcome {
 	/// The peer reports the exact active epoch. A matching signed acknowledgement is still needed.
 	MatchingActive { peer_report: Reestablish },
+	/// The peer needs the retained close transcript before a fresh reconnect can replay stock rounds.
+	CloseReplayRequired { peer_report: Reestablish },
 	/// Setup did not complete. Retain the fence until the manager durably records the abort.
 	AbortRequired { peer_report: Option<Reestablish> },
 	/// Possibly active evidence conflicts or needs a signed close response. Retain the fence.
@@ -114,6 +116,9 @@ where
 			FFORReceiverFencePhase::Activating => (ReportedState::Activating, [0; 32]),
 			FFORReceiverFencePhase::Active => (ReportedState::Active, hash),
 			FFORReceiverFencePhase::Aborting => (ReportedState::Aborted, [0; 32]),
+			FFORReceiverFencePhase::Draining | FFORReceiverFencePhase::ClosedPendingPersistence => {
+				return Err(unavailable())
+			},
 		};
 		let counterparty_next = self.context.counterparty_next_commitment_transaction_number;
 		let next_local_commitment_number = INITIAL_COMMITMENT_NUMBER

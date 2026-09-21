@@ -25,7 +25,7 @@ fn sign(message: &mut FFORMessage, node: &Node) {
 }
 
 /// Reserve two actual outgoing payment hashes before delivering either voucher to the receiver.
-fn park_two(sender: &Node, receiver: &Node, id: ChannelId) -> ([FFORVoucher; 2], PaymentPreimage) {
+pub(super) fn park_two(sender: &Node, receiver: &Node, id: ChannelId) -> ([FFORVoucher; 2], PaymentPreimage) {
 	let preimage = PaymentPreimage([*receiver.network_payment_count.as_ref().borrow(); 32]);
 	let (first, voucher, _) = offer_voucher(sender, receiver, 2_000_000);
 	let (mut route, hash, _, secret) = get_route_and_payment_hash!(sender, receiver, 2_000_000);
@@ -112,7 +112,7 @@ fn assert_no_update_wire(node: &Node) {
 }
 
 /// Complete native commitment and revoke rounds, recording the actual terminal wire for every HTLC.
-fn drain<'a, 'b, 'c>(
+pub(super) fn drain<'a, 'b, 'c>(
 	sender: &Node<'a, 'b, 'c>, receiver: &Node<'a, 'b, 'c>,
 ) -> (Vec<u64>, Vec<u64>) {
 	let mut fulfilled = Vec::new();

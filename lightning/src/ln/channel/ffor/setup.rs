@@ -353,6 +353,9 @@ where
 	pub(in crate::ln::channel) fn ffor_restored(&mut self) -> Result<(), DecodeError> {
 		self.ffor_validate_receiver_setup()?;
 		self.validate_ffor_fence()?;
+		if self.ffor_receiver_drain_binding().is_some() {
+			self.validate_ffor_drain()?;
+		}
 		if let Some(book) = self.context.ffor_receiver_book.as_mut() {
 			book.abort(FFORReceiverAbortReason::Restarted);
 		}
@@ -375,7 +378,7 @@ where
 			return Err(DecodeError::InvalidValue);
 		}
 		let pending = self.context.pending_inbound_htlcs.iter().any(|htlc| book.owns(htlc.htlc_id));
-		if book.abort_reason.is_none() || pending {
+		if (book.abort_reason.is_none() && !book.is_closed()) || pending {
 			let channel_type = self.funding.get_channel_type();
 			if record.funding_txo
 				!= self.funding.get_funding_txo().ok_or(DecodeError::InvalidValue)?

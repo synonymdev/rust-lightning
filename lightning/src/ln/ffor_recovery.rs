@@ -5,7 +5,7 @@
 //! a borrowed insertion permit so capacity failure cannot leave a channel without its evidence.
 
 mod activation;
-pub(crate) use activation::FFORReceiverActivation;
+pub(crate) use activation::{FFORReceiverActivation, FFORReceiverCloseRecord};
 
 use alloc::vec::Vec;
 use bitcoin::constants::ChainHash;
@@ -23,18 +23,21 @@ const SETUP_ONLY_VERSION: u8 = 0;
 const ACTIVATION_VERSION: u8 = 1;
 // Earlier activation readers do not understand a retained abort or its relaxed monitor binding.
 const ABORTED_ACTIVATION_VERSION: u8 = 2;
+const CLOSE_VERSION: u8 = 3;
 const MAX_RECORDS: usize = 64;
 const MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
 // Two maximum wire messages, a 483-slot canonical book, and fixed admission fields fit here.
 const MAX_SETUP_RECORD_BYTES: usize = 192 * 1024;
-// Four maximum signed messages, the book, destination script and admission context fit here.
-const MAX_RECORD_BYTES: usize = 384 * 1024;
+// Six maximum signed messages, the book, destination and completed drain proof fit here.
+const MAX_RECORD_BYTES: usize = 512 * 1024;
 const HEADER_BYTES: usize = 3;
 const RECORD_LENGTH_BYTES: usize = 4;
 // Includes the maximum acknowledgement plus its vector/TLV framing and growth of the enclosing
 // activation and record length prefixes. The fixed outer record prefix does not grow.
 const ACK_RESERVATION_BYTES: usize = lightning_ffor::wire::MAX_MESSAGE_LEN + 64;
 const ABORT_RESERVATION_BYTES: usize = lightning_ffor::reestablish::VALUE_LEN + 64;
+const CLOSED_RESERVATION_BYTES: usize = 512;
+const CLOSE_RESERVATION_BYTES: usize = 2 * ACK_RESERVATION_BYTES + CLOSED_RESERVATION_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FFORRecoveryKey {
@@ -75,12 +78,19 @@ impl Entry {
 			return Err(FFORRecoveryError::InvalidRecord);
 		}
 		if let Some(activation) = record.activation.as_ref() {
-			activation.validate(&authenticated).map_err(|_| FFORRecoveryError::InvalidRecord)?;
+			let hash = activation
+				.validate(&authenticated)
+				.map_err(|_| FFORRecoveryError::InvalidRecord)?;
+			if let Some(close) = activation.close_record() {
+				close
+					.validate(&record.setup, hash)
+					.map_err(|_| FFORRecoveryError::InvalidRecord)?;
+			}
 		}
 		let header = authenticated.header();
 		let encoded_bytes = record.serialized_length();
-		let reserved_ack_bytes = Self::ack_reservation(&record);
-		if encoded_bytes.saturating_add(reserved_ack_bytes) > MAX_RECORD_BYTES
+		let reserved_transition_bytes = Self::transition_reservation(&record);
+		if encoded_bytes.saturating_add(reserved_transition_bytes) > MAX_RECORD_BYTES
 			|| (record.activation.is_none() && encoded_bytes > MAX_SETUP_RECORD_BYTES)
 		{
 			return Err(FFORRecoveryError::CapacityExceeded);
@@ -101,18 +111,28 @@ impl Entry {
 				&& self.record.setup.funding_txo() == other.record.setup.funding_txo())
 	}
 
-	fn ack_reservation(record: &StoredSetup) -> usize {
-		if record.activation.as_ref().map_or(false, |activation| {
-			!activation.is_active() && activation.aborted_reason().is_none()
-		}) {
-			core::cmp::max(ACK_RESERVATION_BYTES, ABORT_RESERVATION_BYTES)
-		} else {
-			0
-		}
+	fn transition_reservation(record: &StoredSetup) -> usize {
+		let activation = match &record.activation {
+			Some(activation) if !activation.is_aborted() => activation,
+			_ => return 0,
+		};
+		let activation_ack = if activation.is_active() { 0 } else { ACK_RESERVATION_BYTES };
+		let close = match activation.close_record() {
+			None => CLOSE_RESERVATION_BYTES,
+			Some(close) if close.acknowledgement_wire().is_none() => {
+				ACK_RESERVATION_BYTES + CLOSED_RESERVATION_BYTES
+			},
+			Some(close) if !close.is_closed() => CLOSED_RESERVATION_BYTES,
+			Some(_) => 0,
+		};
+		core::cmp::max(
+			activation_ack + close,
+			if activation.is_active() { 0 } else { ABORT_RESERVATION_BYTES },
+		)
 	}
 
-	fn reserved_ack_bytes(&self) -> usize {
-		Self::ack_reservation(&self.record)
+	fn reserved_transition_bytes(&self) -> usize {
+		Self::transition_reservation(&self.record)
 	}
 }
 
@@ -120,7 +140,7 @@ pub(crate) struct FFORRecoveryRegistry {
 	entries: Vec<Entry>,
 	encoded_bytes: usize,
 	// Derived from authenticated phases, never serialized or supplied by a caller.
-	reserved_ack_bytes: usize,
+	reserved_transition_bytes: usize,
 }
 
 /// Exclusive capacity reservation. Dropping it changes nothing; commit cannot fail.
@@ -133,7 +153,7 @@ impl FFORRecoveryInsertion<'_> {
 	pub(crate) fn commit(self) {
 		if let Some(entry) = self.entry {
 			self.registry.encoded_bytes += RECORD_LENGTH_BYTES + entry.encoded_bytes;
-			self.registry.reserved_ack_bytes += entry.reserved_ack_bytes();
+			self.registry.reserved_transition_bytes += entry.reserved_transition_bytes();
 			self.registry.entries.push(entry);
 		}
 	}
@@ -145,20 +165,20 @@ pub(crate) struct FFORRecoveryUpgrade<'a> {
 	index: usize,
 	entry: Entry,
 	total_bytes: usize,
-	reserved_ack_bytes: usize,
+	reserved_transition_bytes: usize,
 }
 
 impl FFORRecoveryUpgrade<'_> {
 	pub(crate) fn commit(self) {
 		self.registry.entries[self.index] = self.entry;
 		self.registry.encoded_bytes = self.total_bytes;
-		self.registry.reserved_ack_bytes = self.reserved_ack_bytes;
+		self.registry.reserved_transition_bytes = self.reserved_transition_bytes;
 	}
 }
 
 impl FFORRecoveryRegistry {
 	pub(crate) fn new() -> Self {
-		Self { entries: Vec::new(), encoded_bytes: HEADER_BYTES, reserved_ack_bytes: 0 }
+		Self { entries: Vec::new(), encoded_bytes: HEADER_BYTES, reserved_transition_bytes: 0 }
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
@@ -201,6 +221,15 @@ impl FFORRecoveryRegistry {
 		&self, setup: &FFORReceiverSetup, fence: Option<(FFORReceiverFencePhase, [u8; 32])>,
 		abort_reason: Option<FFORReceiverAbortReason>,
 	) -> Result<(), DecodeError> {
+		self.validate_channel_lifecycle(setup, fence, abort_reason, None, None, None)
+	}
+
+	/// Check the channel-owned close binding against exact authenticated archived evidence.
+	pub(crate) fn validate_channel_lifecycle(
+		&self, setup: &FFORReceiverSetup, fence: Option<(FFORReceiverFencePhase, [u8; 32])>,
+		abort_reason: Option<FFORReceiverAbortReason>, drain: Option<([u8; 32], Vec<u8>, bool)>,
+		completion_hash: Option<[u8; 32]>, drain_activation_hash: Option<[u8; 32]>,
+	) -> Result<(), DecodeError> {
 		if !self.contains_exact(setup) {
 			return Err(DecodeError::InvalidValue);
 		}
@@ -208,6 +237,31 @@ impl FFORRecoveryRegistry {
 		let header = authenticated.header();
 		let key =
 			FFORRecoveryKey { channel_id: ChannelId(header.channel_id), epoch_id: header.epoch_id };
+		if let Some(record) = self.get_activation(&key) {
+			if record.is_draining() {
+				let close = record.close_record().ok_or(DecodeError::InvalidValue)?;
+				let (ack_hash, settled, closed) = drain.ok_or(DecodeError::InvalidValue)?;
+				let hash = record.validate(&authenticated)?;
+				if abort_reason.is_some()
+					|| Some(ack_hash) != close.acknowledgement_hash()
+					|| settled != close.settled()?
+					|| completion_hash != close.completion_hash()
+					|| drain_activation_hash != Some(hash)
+				{
+					return Err(DecodeError::InvalidValue);
+				}
+				let valid = if record.is_closed() {
+					(fence == Some((FFORReceiverFencePhase::ClosedPendingPersistence, hash))
+						&& !closed) || (fence.is_none() && closed)
+				} else {
+					fence == Some((FFORReceiverFencePhase::Draining, hash)) && !closed
+				};
+				return if valid { Ok(()) } else { Err(DecodeError::InvalidValue) };
+			}
+		}
+		if drain.is_some() || completion_hash.is_some() || drain_activation_hash.is_some() {
+			return Err(DecodeError::InvalidValue);
+		}
 		match (self.get_activation(&key), fence) {
 			(None, None) => Ok(()),
 			(Some(record), fence) if record.aborted_reason().is_some() => {
@@ -254,11 +308,9 @@ impl FFORRecoveryRegistry {
 		self.entries
 			.iter()
 			.filter(|entry| {
-				entry
-					.record
-					.activation
-					.as_ref()
-					.map_or(false, |activation| activation.aborted_reason().is_none())
+				entry.record.activation.as_ref().map_or(false, |activation| {
+					activation.aborted_reason().is_none() && !activation.is_closed()
+				})
 			})
 			.map(|entry| entry.key.channel_id)
 			.collect()
@@ -310,7 +362,7 @@ impl FFORRecoveryRegistry {
 			}
 			return Ok(FFORRecoveryInsertion { registry: self, entry: None });
 		}
-		self.check_capacity(entry.encoded_bytes, entry.reserved_ack_bytes())?;
+		self.check_capacity(entry.encoded_bytes, entry.reserved_transition_bytes())?;
 		Ok(FFORRecoveryInsertion { registry: self, entry: Some(entry) })
 	}
 
@@ -345,22 +397,36 @@ impl FFORRecoveryRegistry {
 			.checked_sub(existing.encoded_bytes)
 			.and_then(|bytes| bytes.checked_add(entry.encoded_bytes))
 			.ok_or(FFORRecoveryError::CapacityExceeded)?;
-		let reserved_ack_bytes = self
-			.reserved_ack_bytes
-			.checked_sub(existing.reserved_ack_bytes())
-			.and_then(|bytes| bytes.checked_add(entry.reserved_ack_bytes()))
+		let reserved_transition_bytes = self
+			.reserved_transition_bytes
+			.checked_sub(existing.reserved_transition_bytes())
+			.and_then(|bytes| bytes.checked_add(entry.reserved_transition_bytes()))
 			.ok_or(FFORRecoveryError::CapacityExceeded)?;
 		if total_bytes
-			.checked_add(reserved_ack_bytes)
+			.checked_add(reserved_transition_bytes)
 			.map_or(true, |bytes| bytes > MAX_ENCODED_BYTES)
 		{
 			return Err(FFORRecoveryError::CapacityExceeded);
 		}
-		Ok(FFORRecoveryUpgrade { registry: self, index, entry, total_bytes, reserved_ack_bytes })
+		Ok(FFORRecoveryUpgrade {
+			registry: self,
+			index,
+			entry,
+			total_bytes,
+			reserved_transition_bytes,
+		})
 	}
 
 	fn version(&self) -> u8 {
 		if self.entries.iter().any(|entry| {
+			entry
+				.record
+				.activation
+				.as_ref()
+				.map_or(false, |activation| activation.close_record().is_some())
+		}) {
+			CLOSE_VERSION
+		} else if self.entries.iter().any(|entry| {
 			entry
 				.record
 				.activation
@@ -376,14 +442,14 @@ impl FFORRecoveryRegistry {
 	}
 
 	fn check_capacity(
-		&self, record_bytes: usize, reserved_ack_bytes: usize,
+		&self, record_bytes: usize, reserved_transition_bytes: usize,
 	) -> Result<(), FFORRecoveryError> {
 		let total = self
 			.encoded_bytes
 			.checked_add(RECORD_LENGTH_BYTES)
 			.and_then(|total| total.checked_add(record_bytes))
-			.and_then(|total| total.checked_add(self.reserved_ack_bytes))
-			.and_then(|total| total.checked_add(reserved_ack_bytes));
+			.and_then(|total| total.checked_add(self.reserved_transition_bytes))
+			.and_then(|total| total.checked_add(reserved_transition_bytes));
 		if self.entries.len() >= MAX_RECORDS
 			|| record_bytes > MAX_RECORD_BYTES
 			|| total.map_or(true, |total| total > MAX_ENCODED_BYTES)
@@ -412,6 +478,7 @@ impl Readable for FFORRecoveryRegistry {
 		if version != SETUP_ONLY_VERSION
 			&& version != ACTIVATION_VERSION
 			&& version != ABORTED_ACTIVATION_VERSION
+			&& version != CLOSE_VERSION
 		{
 			return Err(DecodeError::UnknownRequiredFeature);
 		}
@@ -440,10 +507,10 @@ impl Readable for FFORRecoveryRegistry {
 				return Err(DecodeError::InvalidValue);
 			}
 			registry
-				.check_capacity(length, entry.reserved_ack_bytes())
+				.check_capacity(length, entry.reserved_transition_bytes())
 				.map_err(|_| DecodeError::InvalidValue)?;
 			registry.encoded_bytes += RECORD_LENGTH_BYTES + length;
-			registry.reserved_ack_bytes += entry.reserved_ack_bytes();
+			registry.reserved_transition_bytes += entry.reserved_transition_bytes();
 			registry.entries.push(entry);
 		}
 		if registry.version() != version {

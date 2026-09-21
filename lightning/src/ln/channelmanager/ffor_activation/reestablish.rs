@@ -98,14 +98,21 @@ where
 		}
 		let recovery = self.ffor_recovery.lock().unwrap();
 		recovery
-			.validate_channel_outcome(
+			.validate_channel_lifecycle(
 				&setup,
 				channel.ffor_receiver_fence(),
 				channel.ffor_receiver_abort_reason(),
+				channel.ffor_receiver_drain_binding(),
+				channel.ffor_receiver_closed_completion_hash(),
+				channel.ffor_receiver_drain_activation_hash(),
 			)
 			.map_err(|_| ())?;
 		let activation = recovery.get_activation(&key).ok_or(())?;
+		if activation.is_draining() && !activation.is_closed() {
+			channel.validate_ffor_drain().map_err(|_| ())?;
+		}
 		if channel.context.is_ffor_frozen()
+			&& !activation.is_draining()
 			&& channel.ffor_frozen_commitments(&self.logger).map_err(|_| ())?
 				!= activation.commitments()
 		{
@@ -116,7 +123,32 @@ where
 		if !self.ffor_persistence.lock().unwrap().is_complete(&entry.requirement) {
 			return Ok(None);
 		}
-		let (state, activation_hash) = if activation.is_aborted() {
+		let (state, activation_hash) = if activation.is_closed() {
+			// The peer may resume ordinary updates as soon as it sees Closed. Persistence
+			// alone does not grant that permission to this manager instance after restore.
+			if channel.ffor_receiver_fence().is_some()
+				|| channel.ffor_receiver_drain_binding().map(|(_, _, closed)| closed) != Some(true)
+			{
+				return Ok(None);
+			}
+			(ReportedState::Closed, activation.activation_hash(&setup).map_err(|_| ())?)
+		} else if activation.is_draining() {
+			// A saved peer commitment may follow this report immediately. Retain the
+			// entire queue until the durable release path enables stock removal rounds.
+			let hash = activation.activation_hash(&setup).map_err(|_| ())?;
+			// An exact Active report instead enters control-message-only recovery. The
+			// channel permits retained close replay and requires a fresh reconnect before
+			// any stock round can resume, even after receiving the signed close reply.
+			let close_replay = matches!(channel.ffor_receiver_reconnect_outcome(),
+				Some(FFORReestablishOutcome::CloseReplayRequired { peer_report })
+					if peer_report.epoch_id == key.epoch_id
+						&& peer_report.activation_hash == hash
+						&& peer_report.state == ReportedState::Active);
+			if !channel.ffor_receiver_drain_enabled() && !close_replay {
+				return Ok(None);
+			}
+			(ReportedState::Draining, hash)
+		} else if activation.is_aborted() {
 			(ReportedState::Aborted, [0; 32])
 		} else if activation.is_active() {
 			(ReportedState::Active, activation.activation_hash(&setup).map_err(|_| ())?)
